@@ -586,7 +586,7 @@ mod tests {
         // layer as a spawn of the configured terminal.
         let (mut app, log) = app_with(
             vec![Event::KeyPressed(KeyCombo {
-                mods: 1 << 3,
+                mods: 1 << 6,
                 key: 0xff0d,
             })],
             Config::default(),
@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn command_for_key_maps_the_default_bindings() {
         let cfg = Config::default();
-        let super_ = 1 << 3;
+        let super_ = 1 << 6;
         assert_eq!(
             command_for_key(
                 &cfg,

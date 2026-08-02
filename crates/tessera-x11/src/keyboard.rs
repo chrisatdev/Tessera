@@ -165,8 +165,9 @@ mod tests {
     use super::*;
 
     const ROOT: Window = 0x0000_0010;
-    /// Mod4 (Super) modifier mask, as in the config defaults.
-    const MOD_SUPER: u16 = 1 << 3;
+    /// Mod4 (Super) modifier mask, as in the config defaults. X11 Mod4 is
+    /// bit 6 (`1 << 6` = 64) — `1 << 3` is Mod1/Alt and would never match.
+    const MOD_SUPER: u16 = 1 << 6;
     /// XK_Return keysym (the default terminal binding).
     const KEY_RETURN: u32 = 0xff0d;
 

@@ -8,7 +8,12 @@ use serde::Deserialize;
 use crate::event::KeyCombo;
 
 /// Modifier mask for the "Super" (Mod4) key.
-const MOD_SUPER: u32 = 1 << 3;
+///
+/// NOTE: X11 modifier bits are Shift=1, Lock=2, Control=4, Mod1=8, Mod2=16,
+/// Mod3=32, Mod4=64, Mod5=128 — Mod4 is bit 6, NOT `1 << 3` (that would be
+/// Mod1/Alt). A wrong mask silently breaks every Super binding: the grab
+/// never matches the real Mod4 event state (caught by the Xvfb E2E).
+const MOD_SUPER: u32 = 1 << 6;
 // Keysyms for the default keybindings (X11 keysym table).
 const KEY_RETURN: u32 = 0xff0d;
 const KEY_J: u32 = 0x006a;

@@ -41,13 +41,16 @@ cargo run             # requires an X display; claims WM_S0 and tiles
 Prerequisites (not installed by this repository): `Xvfb` and `xdotool`.
 
 ```sh
-xvfb-run -a -s "-screen 0 1280x1024x24" cargo test --test integration -- --ignored
+xvfb-run -a -s "-screen 0 1280x1024x24" cargo test --test integration -- --ignored --test-threads=1
 ```
 
 The tests are `#[ignore]` so plain `cargo test` stays green headless; the
 pinned screen size (1280x1024x24, deliberately not 1920x1080) makes the
 geometry assertions prove the real-screen wiring. Install `xvfb` and
-`xdotool` with your distribution's package manager first.
+`xdotool` with your distribution's package manager first. `--test-threads=1`
+is required because each test spawns its own WM and `WM_S0` is an exclusive
+root selection: two WMs on the same display would conflict, and the second
+would abort its claim before its assertions start.
 
 ## Architecture
 

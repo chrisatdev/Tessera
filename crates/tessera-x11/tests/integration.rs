@@ -4,10 +4,13 @@
 //! the test client) for the keypresses.
 //!
 //! Every test is `#[ignore]` so plain `cargo test` stays green headless; the
-//! suite runs only on demand:
+//! suite runs only on demand. `--test-threads=1` is REQUIRED: every test
+//! spawns its own WM and WM_S0 is an exclusive root selection — two WMs on
+//! the same Xvfb display cannot coexist, and the second would abort its
+//! claim (SC-x11-04) before its assertions start:
 //!
 //! ```text
-//! xvfb-run -a -s "-screen 0 1280x1024x24" cargo test --test integration -- --ignored
+//! xvfb-run -a -s "-screen 0 1280x1024x24" cargo test --test integration -- --ignored --test-threads=1
 //! ```
 //!
 //! Prerequisites (NOT installed by this change): `Xvfb` and `xdotool`. The
@@ -51,7 +54,7 @@ fn display_name() -> String {
     std::env::var("DISPLAY").unwrap_or_else(|_| {
         panic!(
             "no DISPLAY set — run under `xvfb-run -a -s \"-screen 0 1280x1024x24\" \
-             cargo test --test integration -- --ignored`"
+             cargo test --test integration -- --ignored --test-threads=1`"
         )
     })
 }
