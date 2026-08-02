@@ -16,22 +16,13 @@ const KEY_K: u32 = 0x006b;
 const KEY_Q: u32 = 0x0071;
 const KEY_SPACE: u32 = 0x0020;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub general: GeneralConfig,
     #[serde(default)]
     pub keybindings: Keybindings,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            general: GeneralConfig::default(),
-            keybindings: Keybindings::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
