@@ -2,27 +2,32 @@
 //!
 //! [`X11Display`] owns a live [`RustConnection`] and implements every trait
 //! method over it. Part A (U4-A) implements `connect` (T14), `claim_wm`
-//! (T15) and `next_event` (T16); the frame/EWMH/keyboard methods (T17/T18)
-//! currently return an explicit "not implemented" error so the seam compiles
-//! and fails loudly instead of silently misbehaving.
+//! (T15) and `next_event` (T16); part B (U4-B) wires the frame methods to
+//! [`crate::frames`] (T17), EWMH desktop sync to [`crate::ewmh`] and the
+//! keyboard grab + keysym translation to [`crate::keyboard`] (T18).
 //!
 //! Headless-testability approach (documented per task): failure paths are
 //! tested through the REAL x11rb connect against an unreachable display name
 //! (no server needed — the error mapping is what T14 owns), the WM_S0 claim
-//! flow is scripted behind a small internal [`X11Startup`] seam (T15), and
-//! event translation is a pure module (`crate::translate`, T16). Happy paths
-//! that require a live server are covered by the gated Xvfb integration tests
-//! in U5.
+//! flow is scripted behind a small internal [`X11Startup`] seam (T15), event
+//! translation is a pure module (`crate::translate`, T16), and the frame /
+//! EWMH / keyboard mechanics are scripted behind their own seams (T17/T18).
+//! Happy paths that require a live server are covered by the gated Xvfb
+//! integration tests in U5.
 
-use tessera_core::{DErr, DisplayServer, Event, FrameId, Rect, WindowId};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use tessera_core::{Config, DErr, DisplayServer, Event, FrameId, Rect, WindowId};
 use x11rb::connection::Connection;
 use x11rb::errors::{ConnectError, ConnectionError, ReplyError};
 use x11rb::protocol::xproto::{
-    Atom, ChangeWindowAttributesAux, ConnectionExt as _, EventMask, Window,
+    Atom, ChangeWindowAttributesAux, ConnectionExt as _, EventMask, Visualid, Window,
 };
 use x11rb::rust_connection::RustConnection;
 
 use crate::event_loop::{next_x11_event, root_event_mask};
+use crate::frames;
 
 /// The x11rb display layer: one X connection plus the root window of the
 /// screen it was opened on.
@@ -33,6 +38,15 @@ pub struct X11Display {
     conn: Option<RustConnection>,
     /// Root window of the connected screen (set by `connect`).
     root: Window,
+    /// Root depth of the screen (frame windows use it).
+    depth: u8,
+    /// Root visual of the screen (frame windows use it).
+    visual: Visualid,
+    /// The config the X layer needs: frame border width (T17) and the
+    /// keybindings to grab (T18). Defaults until [`X11Display::set_config`].
+    config: Arc<Config>,
+    /// Frame window id created per managed client (`manage`, T17).
+    frames: HashMap<WindowId, FrameId>,
 }
 
 impl X11Display {
@@ -43,7 +57,26 @@ impl X11Display {
             display_name: display_name.map(str::to_owned),
             conn: None,
             root: 0,
+            depth: 0,
+            visual: 0,
+            config: Arc::new(Config::default()),
+            frames: HashMap::new(),
         }
+    }
+
+    /// Replaces the config the X layer uses: frame border width (T17) and the
+    /// keybindings grabbed during `claim_wm` (T18). Defaults until called.
+    pub fn set_config(&mut self, config: Arc<Config>) {
+        self.config = config;
+    }
+
+    /// The frame of client `w`, or an error when the client was never managed
+    /// (a programming error surfaced as `DErr::X`, never a panic).
+    fn frame_of(&self, w: WindowId) -> Result<FrameId, DErr> {
+        self.frames
+            .get(&w)
+            .copied()
+            .ok_or_else(|| DErr::X(format!("no frame for client {w}; manage() must run first")))
     }
 }
 
@@ -60,12 +93,14 @@ fn map_connect_error(display: Option<&str>, err: ConnectError) -> DErr {
 }
 
 /// Maps a connection-level failure from a request into [`DErr::X`].
-fn map_conn_error(err: ConnectionError) -> DErr {
+/// `pub(crate)`: also used by frames/ewmh/keyboard (U4-B).
+pub(crate) fn map_conn_error(err: ConnectionError) -> DErr {
     DErr::X(format!("x11 request failed: {err}"))
 }
 
 /// Maps a request/reply failure into [`DErr::X`].
-fn map_reply_error(err: ReplyError) -> DErr {
+/// `pub(crate)`: also used by frames/ewmh/keyboard (U4-B).
+pub(crate) fn map_reply_error(err: ReplyError) -> DErr {
     DErr::X(format!("x11 request failed: {err}"))
 }
 
@@ -150,9 +185,11 @@ impl DisplayServer for X11Display {
         let name = self.display_name.as_deref();
         let (conn, screen_num) =
             x11rb::connect(name).map_err(|err| map_connect_error(name, err))?;
-        let root = conn.setup().roots[screen_num].root;
+        let screen = &conn.setup().roots[screen_num];
+        self.root = screen.root;
+        self.depth = screen.root_depth;
+        self.visual = screen.root_visual;
         self.conn = Some(conn);
-        self.root = root;
         Ok(())
     }
 
@@ -178,36 +215,65 @@ impl DisplayServer for X11Display {
         next_x11_event(conn)
     }
 
-    fn manage(&mut self, _w: WindowId) -> Result<FrameId, DErr> {
-        Err(DErr::X("manage: frames are U4 part B (T17)".to_string()))
+    fn manage(&mut self, w: WindowId) -> Result<FrameId, DErr> {
+        // REQ-x11-005 / SC-x11-07: reparent `w` into a fresh border-only frame
+        // and remember the client -> frame mapping (frames.rs, T17).
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| DErr::X("connect() must succeed before manage()".to_string()))?;
+        let border = u16::try_from(self.config.general.border_width).unwrap_or(u16::MAX);
+        let frame = frames::create_frame(conn, self.root, w, border, self.depth, self.visual)?;
+        self.frames.insert(w, frame);
+        Ok(frame)
     }
 
-    fn map_window(&mut self, _w: WindowId) -> Result<(), DErr> {
-        Err(DErr::X(
-            "map_window: frames are U4 part B (T17)".to_string(),
-        ))
+    fn map_window(&mut self, w: WindowId) -> Result<(), DErr> {
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| DErr::X("connect() must succeed before map_window()".to_string()))?;
+        let frame = self.frame_of(w)?;
+        frames::map_frame(conn, frame.0, w)
     }
 
-    fn unmap_window(&mut self, _w: WindowId) -> Result<(), DErr> {
-        Err(DErr::X(
-            "unmap_window: frames are U4 part B (T17)".to_string(),
-        ))
+    fn unmap_window(&mut self, w: WindowId) -> Result<(), DErr> {
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| DErr::X("connect() must succeed before unmap_window()".to_string()))?;
+        let frame = self.frame_of(w)?;
+        frames::unmap_frame(conn, frame.0)
     }
 
-    fn configure(&mut self, _w: WindowId, _r: Rect) -> Result<(), DErr> {
-        Err(DErr::X("configure: frames are U4 part B (T17)".to_string()))
+    fn configure(&mut self, w: WindowId, r: Rect) -> Result<(), DErr> {
+        // REQ-x11-006 / SC-x11-09: the client is re-tiled to its layout
+        // placement — the frame takes `r`, the client the frame interior.
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| DErr::X("connect() must succeed before configure()".to_string()))?;
+        let frame = self.frame_of(w)?;
+        let border = u16::try_from(self.config.general.border_width).unwrap_or(u16::MAX);
+        frames::configure_frame(conn, frame.0, w, r, border)
     }
 
-    fn focus_window(&mut self, _w: WindowId) -> Result<(), DErr> {
-        Err(DErr::X(
-            "focus_window: frames are U4 part B (T17)".to_string(),
-        ))
+    fn focus_window(&mut self, w: WindowId) -> Result<(), DErr> {
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| DErr::X("connect() must succeed before focus_window()".to_string()))?;
+        frames::focus_client(conn, w)
     }
 
-    fn destroy_frame(&mut self, _f: FrameId) -> Result<(), DErr> {
-        Err(DErr::X(
-            "destroy_frame: frames are U4 part B (T17)".to_string(),
-        ))
+    fn destroy_frame(&mut self, f: FrameId) -> Result<(), DErr> {
+        // REQ-x11-007: the client already died (DestroyNotify); destroy the
+        // orphaned frame window.
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| DErr::X("connect() must succeed before destroy_frame()".to_string()))?;
+        frames::destroy_frame(conn, f.0)
     }
 
     fn set_desktops(&mut self, _n: u32, _cur: u32, _names: &[String]) -> Result<(), DErr> {

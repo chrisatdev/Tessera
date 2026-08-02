@@ -1,3 +1,243 @@
+//! Border-only frame windows: reparenting clients into a 2px-bordered frame
+//! and driving that frame (REQ-x11-005/006, SC-x11-07/09).
+//!
+//! v1 frames carry no title bar — the frame is the border, and its only job is
+//! to give the WM a stable parent window to map/unmap/configure so a client's
+//! own geometry never leaks into the tiling. The frame is also the future
+//! seam for title bars (design "frame = seam for title bars").
+//!
+//! Every X side effect goes through the [`FrameOps`] seam so the mechanics are
+//! scriptable headless; [`RustConnection`] implements it directly.
+
+use tessera_core::{DErr, FrameId, Rect, WindowId};
+use x11rb::connection::Connection;
+use x11rb::protocol::xproto::{
+    ConfigureWindowAux, CreateWindowAux, EventMask, InputFocus, Visualid, Window, WindowClass,
+    configure_window, create_window, destroy_window, map_window, reparent_window, set_input_focus,
+    unmap_window,
+};
+use x11rb::rust_connection::RustConnection;
+
+use crate::display_server::{map_conn_error, map_reply_error};
+
+/// Border color of a v1 frame (white). The config has no border color yet —
+/// a fixed pixel value keeps the frame visible on dark and light clients.
+pub(crate) const FRAME_BORDER_PIXEL: u32 = 0xFFFF_FFFF;
+/// Background of the frame window behind the client (black; only visible in
+/// the gap before the first configure).
+pub(crate) const FRAME_BACKGROUND_PIXEL: u32 = 0;
+
+/// The X surface frame management needs, abstracted so frame mechanics are
+/// scriptable headless (same seam shape as [`X11Startup`](crate::display_server::X11Startup)).
+pub(crate) trait FrameOps {
+    /// Allocates a fresh X id for the frame window.
+    fn generate_id(&self) -> Result<Window, DErr>;
+    /// Creates the frame window.
+    #[allow(clippy::too_many_arguments)]
+    fn create_window(
+        &self,
+        depth: u8,
+        wid: Window,
+        parent: Window,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        border_width: u16,
+        class: WindowClass,
+        visual: Visualid,
+        aux: &CreateWindowAux,
+    ) -> Result<(), DErr>;
+    /// Reparents `window` into `parent` at `x`,`y`.
+    fn reparent(&self, window: Window, parent: Window, x: i16, y: i16) -> Result<(), DErr>;
+    /// Maps `window`.
+    fn map_window(&self, window: Window) -> Result<(), DErr>;
+    /// Unmaps `window`.
+    fn unmap_window(&self, window: Window) -> Result<(), DErr>;
+    /// Resizes/moves `window` to `x`,`y`,`width`,`height` with `border_width`.
+    fn configure(
+        &self,
+        window: Window,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        border_width: u32,
+    ) -> Result<(), DErr>;
+    /// Sets input focus to `window`.
+    fn focus(&self, window: Window) -> Result<(), DErr>;
+    /// Destroys `window`.
+    fn destroy(&self, window: Window) -> Result<(), DErr>;
+}
+
+impl FrameOps for RustConnection {
+    fn generate_id(&self) -> Result<Window, DErr> {
+        Connection::generate_id(self)
+            .map_err(|err| DErr::X(format!("cannot allocate an X window id: {err}")))
+    }
+    fn create_window(
+        &self,
+        depth: u8,
+        wid: Window,
+        parent: Window,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        border_width: u16,
+        class: WindowClass,
+        visual: Visualid,
+        aux: &CreateWindowAux,
+    ) -> Result<(), DErr> {
+        let cookie = create_window(
+            self,
+            depth,
+            wid,
+            parent,
+            x,
+            y,
+            width,
+            height,
+            border_width,
+            class,
+            visual,
+            aux,
+        )
+        .map_err(map_conn_error)?;
+        cookie.check().map_err(map_reply_error)
+    }
+    fn reparent(&self, window: Window, parent: Window, x: i16, y: i16) -> Result<(), DErr> {
+        let cookie = reparent_window(self, window, parent, x, y).map_err(map_conn_error)?;
+        cookie.check().map_err(map_reply_error)
+    }
+    fn map_window(&self, window: Window) -> Result<(), DErr> {
+        let cookie = map_window(self, window).map_err(map_conn_error)?;
+        cookie.check().map_err(map_reply_error)
+    }
+    fn unmap_window(&self, window: Window) -> Result<(), DErr> {
+        let cookie = unmap_window(self, window).map_err(map_conn_error)?;
+        cookie.check().map_err(map_reply_error)
+    }
+    fn configure(
+        &self,
+        window: Window,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        border_width: u32,
+    ) -> Result<(), DErr> {
+        let aux = ConfigureWindowAux::default()
+            .x(x)
+            .y(y)
+            .width(width)
+            .height(height)
+            .border_width(border_width);
+        let cookie = configure_window(self, window, &aux).map_err(map_conn_error)?;
+        cookie.check().map_err(map_reply_error)
+    }
+    fn focus(&self, window: Window) -> Result<(), DErr> {
+        let cookie = set_input_focus(self, InputFocus::PARENT, window, x11rb::CURRENT_TIME)
+            .map_err(map_conn_error)?;
+        cookie.check().map_err(map_reply_error)
+    }
+    fn destroy(&self, window: Window) -> Result<(), DErr> {
+        let cookie = destroy_window(self, window).map_err(map_conn_error)?;
+        cookie.check().map_err(map_reply_error)
+    }
+}
+
+/// Creates the border-only frame for `client` and reparents the client into it
+/// (REQ-x11-005, SC-x11-07), returning the frame id.
+///
+/// The frame is created at the origin with a minimal size — the very next
+/// layout pass configures it to its placement, and v1 has no use for the
+/// client's requested geometry before then. The frame selects
+/// SubstructureNotify (the client is no longer a child of root once
+/// reparented, so unmap/destroy tracking must move to the frame) and is
+/// override-redirect so another WM's SubstructureRedirect never manages it.
+pub(crate) fn create_frame(
+    ops: &impl FrameOps,
+    root: Window,
+    client: WindowId,
+    border: u16,
+    depth: u8,
+    visual: Visualid,
+) -> Result<FrameId, DErr> {
+    let frame = ops.generate_id()?;
+    let aux = CreateWindowAux::default()
+        .background_pixel(FRAME_BACKGROUND_PIXEL)
+        .border_pixel(FRAME_BORDER_PIXEL)
+        .event_mask(EventMask::SUBSTRUCTURE_NOTIFY)
+        .override_redirect(1u32);
+    ops.create_window(
+        depth,
+        frame,
+        root,
+        0,
+        0,
+        1,
+        1,
+        border,
+        WindowClass::INPUT_OUTPUT,
+        visual,
+        &aux,
+    )?;
+    let offset = i16::try_from(border).unwrap_or(i16::MAX);
+    ops.reparent(client, frame, offset, offset)?;
+    Ok(FrameId(frame))
+}
+
+/// Maps the frame and then the client (REQ-x11-005 "frame mapped"): the
+/// client may only become visible through its frame.
+pub(crate) fn map_frame(ops: &impl FrameOps, frame: Window, client: WindowId) -> Result<(), DErr> {
+    ops.map_window(frame)?;
+    ops.map_window(client)
+}
+
+/// Unmaps the frame (and with it the client) — one call, SC-ws-06.
+pub(crate) fn unmap_frame(ops: &impl FrameOps, frame: Window) -> Result<(), DErr> {
+    ops.unmap_window(frame)
+}
+
+/// Places `frame` at the layout placement `r` and `client` at the frame
+/// interior (REQ-x11-006, SC-x11-09): the client is inset by `border` on
+/// every side and keeps no border of its own. A frame smaller than twice the
+/// border clamps the client to zero size instead of underflowing.
+pub(crate) fn configure_frame(
+    ops: &impl FrameOps,
+    frame: Window,
+    client: WindowId,
+    r: Rect,
+    border: u16,
+) -> Result<(), DErr> {
+    let b = i32::from(border);
+    let inner_w = (i32::from(r.w) - 2 * b).max(0) as u32;
+    let inner_h = (i32::from(r.h) - 2 * b).max(0) as u32;
+    ops.configure(
+        frame,
+        r.x,
+        r.y,
+        i32::from(r.w) as u32,
+        i32::from(r.h) as u32,
+        i32::from(border) as u32,
+    )?;
+    ops.configure(client, b, b, inner_w, inner_h, 0)
+}
+
+/// Sets input focus to `client` (the core calls `focus_window` with the
+/// client id). Focus reverts to the client's parent (the frame) when the
+/// client is destroyed or unmapped.
+pub(crate) fn focus_client(ops: &impl FrameOps, client: WindowId) -> Result<(), DErr> {
+    ops.focus(client)
+}
+
+/// Destroys the frame window, whose client already died (the display-layer
+/// reaction to `WindowUnmapped`, REQ-x11-007).
+pub(crate) fn destroy_frame(ops: &impl FrameOps, frame: Window) -> Result<(), DErr> {
+    ops.destroy(frame)
+}
+
 #[cfg(test)]
 mod tests {
     //! RED (T17): frame creation, reparenting, mapping and configure must
