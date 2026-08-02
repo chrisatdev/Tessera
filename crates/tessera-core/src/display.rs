@@ -7,6 +7,7 @@
 //! scriptable headless through `MockDisplay`.
 
 use std::fmt;
+use std::process::Stdio;
 
 use crate::event::Event;
 use crate::geometry::{Rect, WindowId};
@@ -70,12 +71,17 @@ pub trait DisplayServer {
 /// Spawns `prog` as a child process (T13, process boundary).
 ///
 /// The program is resolved through `PATH` by [`std::process::Command`] — no
-/// shell, no string interpretation, no argument injection. The child inherits
-/// the WM's stdio and is not waited on. A failure (e.g. a bogus terminal
+/// shell, no string interpretation, no argument injection — and its stdio is
+/// detached (`null`): a spawned GUI terminal must never inherit the WM's (or
+/// a test harness's) pipes, or a leaked descriptor would keep those pipes
+/// open forever. The child is not waited on. A failure (e.g. a bogus terminal
 /// program) is returned as [`DErr::Spawn`] so the caller logs it and the
 /// loop keeps running instead of crashing.
 pub fn spawn_program(prog: &str) -> Result<(), DErr> {
     std::process::Command::new(prog)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .map(|_| ())
         .map_err(|err| DErr::Spawn(err.to_string()))
