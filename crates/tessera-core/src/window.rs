@@ -150,10 +150,8 @@ impl WindowManager {
             return;
         };
         if ws.focus.is_none() && !ws.windows.is_empty() {
-            // attach() sets focus to the window and, because it is already
-            // present, does not re-insert it — pure focus repair.
             let mru = ws.windows[0];
-            self.ws.attach(mru);
+            self.ws.focus_window(mru);
         }
     }
 
