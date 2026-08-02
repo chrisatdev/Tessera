@@ -262,7 +262,10 @@ mod tests {
                 Err(_) => break,
             }
         }
-        assert_eq!(slow_events, (0..SUB_QUEUE_CAPACITY as u32).collect::<Vec<_>>());
+        assert_eq!(
+            slow_events,
+            (0..SUB_QUEUE_CAPACITY as u32).collect::<Vec<_>>()
+        );
     }
 
     #[test]

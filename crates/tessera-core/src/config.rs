@@ -149,8 +149,7 @@ impl Config {
 
     /// Reads and parses the config file at `path`.
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
-        let raw =
-            std::fs::read_to_string(path).map_err(|e| ConfigError::Io(e.to_string()))?;
+        let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(e.to_string()))?;
         Config::parse(&raw)
     }
 
@@ -261,7 +260,10 @@ mod tests {
     #[test]
     fn reload_swaps_in_new_config() {
         let mut shared = Arc::new(Config::default());
-        assert!(Config::reload(&mut shared, "[general]\nborder_width = 12\n"));
+        assert!(Config::reload(
+            &mut shared,
+            "[general]\nborder_width = 12\n"
+        ));
         assert_eq!(shared.general.border_width, 12);
         assert_eq!(shared.general.terminal, "alacritty"); // unset stays default
     }
