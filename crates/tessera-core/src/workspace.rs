@@ -38,46 +38,84 @@ pub struct WorkspaceManager {
 impl WorkspaceManager {
     /// Creates an empty manager that publishes on `bus`.
     pub fn new(bus: Arc<EventBus>) -> Self {
-        todo!("workspace manager not implemented yet")
+        WorkspaceManager {
+            workspaces: HashMap::new(),
+            current: 0,
+            next_id: 1,
+            bus,
+        }
     }
 
     /// Creates a workspace with the next auto name and publishes
     /// `WorkspaceOpened`; the first one becomes current (REQ-ws-001).
     pub fn open(&mut self) -> WorkspaceId {
-        todo!("workspace manager not implemented yet")
+        let id = self.next_id;
+        self.next_id += 1;
+        let ws = Workspace {
+            id,
+            name: id.to_string(),
+            layout: LayoutKind::MasterStack,
+            windows: Vec::new(),
+            focus: None,
+        };
+        self.workspaces.insert(id, ws);
+        if self.current == 0 {
+            self.current = id; // first workspace becomes current
+        }
+        self.bus.publish(Event::WorkspaceOpened(id));
+        id
     }
 
     /// Attaches `w` to the focused workspace, auto-opening one when none
     /// exists (SC-ws-01); the attached window becomes the workspace focus
     /// (SC-ws-07).
     pub fn attach(&mut self, w: WindowId) {
-        todo!("workspace manager not implemented yet")
+        if self.workspaces.is_empty() {
+            self.open();
+        }
+        let ws = self
+            .workspaces
+            .get_mut(&self.current)
+            .expect("a current workspace exists after auto-open");
+        if !ws.windows.contains(&w) {
+            ws.windows.insert(0, w); // most recent first
+        }
+        ws.focus = Some(w);
     }
 
     /// Switches the current workspace to `id`, publishing `WorkspaceChanged`.
     /// Returns false (no-op) when `id` is unknown or already current.
+    ///
+    /// Note: full switch semantics (visibility projection, MRU focus
+    /// establishment) land in the switch work unit; this minimal form only
+    /// moves `current` so attach-to-focused is testable (SC-ws-07).
     pub fn switch(&mut self, id: WorkspaceId) -> bool {
-        todo!("workspace manager not implemented yet")
+        if !self.workspaces.contains_key(&id) || id == self.current {
+            return false;
+        }
+        self.current = id;
+        self.bus.publish(Event::WorkspaceChanged(id));
+        true
     }
 
     /// Id of the current workspace, or 0 when none exists.
     pub fn current_id(&self) -> WorkspaceId {
-        todo!("workspace manager not implemented yet")
+        self.current
     }
 
     /// Number of workspaces.
     pub fn len(&self) -> usize {
-        todo!("workspace manager not implemented yet")
+        self.workspaces.len()
     }
 
     /// True when no workspace exists.
     pub fn is_empty(&self) -> bool {
-        todo!("workspace manager not implemented yet")
+        self.workspaces.is_empty()
     }
 
     /// The workspace `id`, if it exists.
     pub fn workspace(&self, id: WorkspaceId) -> Option<&Workspace> {
-        todo!("workspace manager not implemented yet")
+        self.workspaces.get(&id)
     }
 }
 
