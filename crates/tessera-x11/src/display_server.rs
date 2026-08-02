@@ -518,7 +518,7 @@ mod tests {
         // T21: the tiling area must come from the real root window geometry.
         // Querying it before connect is an error, never a panic on a missing
         // connection (same guard shape as claim_wm/next_event).
-        let mut d = X11Display::new(None);
+        let d = X11Display::new(None);
         let err = d.root_size().unwrap_err();
         assert!(
             matches!(err, DErr::X(ref msg) if msg.contains("connect")),

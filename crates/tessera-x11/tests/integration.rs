@@ -39,6 +39,8 @@ const SUPER_L: u32 = 0xffeb;
 /// Default frame border (`config.general.border_width`), baked into every
 /// layout placement.
 const BORDER: u16 = 2;
+/// A window geometry `(x, y, width, height)` as reported by `get_geometry`.
+type Geom = (i16, i16, u16, u16);
 /// Time budget for every polled assertion.
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -159,7 +161,7 @@ fn map_state(conn: &RustConnection, w: Window) -> MapState {
 }
 
 /// Whether the geometry of `w` matches the expectation exactly.
-fn frame_is(conn: &RustConnection, w: Window, expect: (i16, i16, u16, u16)) -> bool {
+fn frame_is(conn: &RustConnection, w: Window, expect: Geom) -> bool {
     let g = geom(conn, w);
     (g.x, g.y, g.width, g.height) == expect
 }
@@ -169,7 +171,7 @@ fn frame_is(conn: &RustConnection, w: Window, expect: (i16, i16, u16, u16)) -> b
 /// the root-geometry wiring (T21) observable: a WM still tiling the old
 /// hardcoded 1920x1080 area places its frames elsewhere on the pinned
 /// 1280x1024 Xvfb screen.
-fn expected_placements(area_w: u16, area_h: u16) -> ((i16, i16, u16, u16), (i16, i16, u16, u16)) {
+fn expected_placements(area_w: u16, area_h: u16) -> (Geom, Geom) {
     // Mirrors MasterStack::arrange with ratio 0.5: the placements are already
     // border-inset (MasterStack::inset).
     let master_w = ((f64::from(area_w) * 0.5).round() as i32).clamp(0, i32::from(area_w)) as u16;
@@ -194,7 +196,7 @@ fn expected_placements(area_w: u16, area_h: u16) -> ((i16, i16, u16, u16), (i16,
 /// triggers a MapRequest the WM must reparent into a frame (SC-x11-07).
 fn map_client(conn: &RustConnection, root: Window, depth: u8, visual: u32) -> Window {
     let win = conn.generate_id().unwrap();
-    let aux = CreateWindowAux::default().background_pixel(0x4040_40);
+    let aux = CreateWindowAux::default().background_pixel(0x0040_4040);
     conn.create_window(
         depth,
         win,
@@ -280,7 +282,12 @@ fn wm_claims_wm_s0_and_keeps_running() {
     let root = root_of(&conn);
     let wm_s0 = intern(&conn, b"WM_S0");
     wait_until("the WM to own WM_S0", || {
-        conn.get_selection_owner(wm_s0).unwrap().reply().unwrap().owner == root
+        conn.get_selection_owner(wm_s0)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .owner
+            == root
     });
     assert!(wm.alive(), "the WM must keep running after claiming WM_S0");
 }
@@ -303,7 +310,12 @@ fn map_request_tiles_to_real_geometry_and_keys_drive_focus_and_switch() {
     // The WM must own WM_S0 before it manages anything (SC-x11-03/04).
     let wm_s0 = intern(&conn, b"WM_S0");
     wait_until("the WM to own WM_S0", || {
-        conn.get_selection_owner(wm_s0).unwrap().reply().unwrap().owner == root
+        conn.get_selection_owner(wm_s0)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .owner
+            == root
     });
     assert!(wm.alive(), "the WM must keep running after claiming WM_S0");
 
@@ -344,7 +356,10 @@ fn map_request_tiles_to_real_geometry_and_keys_drive_focus_and_switch() {
     let gfa = geom(&conn, fa);
     assert_eq!(
         (ga.x, ga.y),
-        (i16::try_from(BORDER).unwrap(), i16::try_from(BORDER).unwrap()),
+        (
+            i16::try_from(BORDER).unwrap(),
+            i16::try_from(BORDER).unwrap()
+        ),
         "the client must sit at the frame's border offset (SC-x11-07)"
     );
     assert_eq!(
@@ -378,5 +393,8 @@ fn map_request_tiles_to_real_geometry_and_keys_drive_focus_and_switch() {
         "windows must stay mapped when switching to an unknown workspace"
     );
     assert_eq!(map_state(&conn, fb), MapState::VIEWABLE);
-    assert!(wm.alive(), "the WM must survive an unknown-workspace switch");
+    assert!(
+        wm.alive(),
+        "the WM must survive an unknown-workspace switch"
+    );
 }
