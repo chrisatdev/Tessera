@@ -74,7 +74,12 @@ impl WindowManager {
     /// (`UnmanagePending`) window is mapped again — back to `Managed`, its
     /// frame re-mapped, without touching its attachment.
     pub fn map_request(&mut self, w: WindowId) {
-        match self.states.get(&w).copied().unwrap_or(WindowState::Unmanaged) {
+        match self
+            .states
+            .get(&w)
+            .copied()
+            .unwrap_or(WindowState::Unmanaged)
+        {
             WindowState::UnmanagePending => {
                 // Re-map: the iconified window is shown again. It was never
                 // detached, so nothing else changes.
@@ -160,19 +165,84 @@ impl WindowManager {
     /// FocusNext: cycle focus to the next window of the focused workspace in
     /// focus-history (MRU-first) order, wrapping at the end.
     pub fn focus_next(&mut self) -> bool {
-        todo!("focus cycle and command dispatch")
+        self.cycle(1)
     }
 
     /// FocusPrev: mirror of [`Self::focus_next`], wrapping at the start.
     pub fn focus_prev(&mut self) -> bool {
-        todo!("focus cycle and command dispatch")
+        self.cycle(-1)
     }
 
     /// Applies a user [`Command`] to the workspace state and reports what the
-    /// display layer must do next.
+    /// display layer must do next (REQ-x11-008).
+    ///
+    /// Focus and workspace commands are applied here; spawn/close/layout
+    /// commands have no pure-core effect and are handed back to the display
+    /// layer through [`CommandEffect`].
     pub fn apply_command(&mut self, cmd: Command) -> CommandEffect {
-        todo!("focus cycle and command dispatch")
+        match cmd {
+            Command::FocusNext => {
+                if self.cycle(1) {
+                    CommandEffect::Applied
+                } else {
+                    CommandEffect::Ignored
+                }
+            }
+            Command::FocusPrev => {
+                if self.cycle(-1) {
+                    CommandEffect::Applied
+                } else {
+                    CommandEffect::Ignored
+                }
+            }
+            Command::SwitchWorkspace(id) => {
+                if self.ws.switch(id) {
+                    CommandEffect::Applied
+                } else {
+                    CommandEffect::Ignored
+                }
+            }
+            Command::SpawnTerminal => CommandEffect::SpawnTerminal,
+            Command::CloseFocused => CommandEffect::CloseFocused,
+            Command::ToggleLayout => CommandEffect::Unsupported,
+        }
     }
+
+    /// Cycles the focused workspace's focus by `dir` (1 = next, -1 = prev).
+    ///
+    /// Closed decision: FocusNext/Prev walk the workspace's focus-history
+    /// (MRU-first) window list in order and wrap at the ends. The list stays
+    /// fixed — the ring defines the cycle — so the focus moves through it via
+    /// [`WorkspaceManager::focus_window`] without reordering history.
+    fn cycle(&mut self, dir: i8) -> bool {
+        let Some(ws) = self.ws.workspace(self.ws.current_id()) else {
+            return false;
+        };
+        if ws.windows.len() < 2 {
+            return false; // nothing to cycle between
+        }
+        let Some(target) = next_cycle_focus(&ws.windows, ws.focus, dir) else {
+            return false;
+        };
+        self.ws.focus_window(target)
+    }
+}
+
+/// Pure cycle step: the window that gains focus after moving `dir` positions
+/// (1 = next, -1 = prev) through the MRU-first `windows` list, wrapping at the
+/// ends. With no focused window, `next` starts at the front and `prev` at the
+/// back; with fewer than two windows the focus is unchanged.
+fn next_cycle_focus(windows: &[WindowId], focus: Option<WindowId>, dir: i8) -> Option<WindowId> {
+    if windows.len() < 2 {
+        return focus;
+    }
+    let n = windows.len() as i64;
+    let idx = focus
+        .and_then(|f| windows.iter().position(|&w| w == f))
+        .map(|i| i as i64);
+    let start = idx.unwrap_or(if dir > 0 { -1 } else { n });
+    let next = (start + i64::from(dir)).rem_euclid(n);
+    Some(windows[next as usize])
 }
 
 impl Deref for WindowManager {
@@ -446,5 +516,96 @@ mod tests {
             CommandEffect::Ignored
         );
         assert_eq!(wm.focused_window(), Some(1)); // state untouched
+    }
+
+    #[test]
+    fn focus_cycle_keeps_list_order_stable() {
+        // The closed decision walks the fixed MRU ring: cycling must not
+        // reorder the focus-history list, only move the focus pointer.
+        let (_, _, mut wm) = setup();
+        manage(&mut wm, 1);
+        manage(&mut wm, 2);
+        manage(&mut wm, 3); // [3, 2, 1]
+        wm.focus_next();
+        assert_eq!(wm.visible_windows(), vec![3, 2, 1]); // order unchanged
+        assert_eq!(wm.focused_window(), Some(2));
+        wm.focus_next();
+        assert_eq!(wm.visible_windows(), vec![3, 2, 1]);
+        assert_eq!(wm.focused_window(), Some(1));
+    }
+
+    #[test]
+    fn focus_next_from_no_focus_starts_at_mru() {
+        // With no focused window (stale state after a detach), Next starts at
+        // the most recently focused window.
+        let (_, _, mut wm) = setup();
+        manage(&mut wm, 1);
+        manage(&mut wm, 2);
+        manage(&mut wm, 3); // [3, 2, 1]
+        wm.detach(3); // clears focus (U2 detach semantics), list [2, 1]
+        assert_eq!(wm.focused_window(), None);
+        assert!(wm.focus_next());
+        assert_eq!(wm.focused_window(), Some(2)); // MRU end
+        assert_eq!(wm.visible_windows(), vec![2, 1]);
+    }
+
+    #[test]
+    fn focus_prev_from_no_focus_starts_at_lru() {
+        // With no focused window, Prev starts at the least recent end.
+        let (_, _, mut wm) = setup();
+        manage(&mut wm, 1);
+        manage(&mut wm, 2);
+        manage(&mut wm, 3);
+        wm.detach(3); // focus None, list [2, 1]
+        assert!(wm.focus_prev());
+        assert_eq!(wm.focused_window(), Some(1)); // LRU end
+        assert_eq!(wm.visible_windows(), vec![2, 1]);
+    }
+
+    #[test]
+    fn focus_cycle_needs_at_least_two_windows() {
+        // Cycling with fewer than two windows is a no-op, never fatal.
+        let (_, _, mut wm) = setup();
+        assert!(!wm.focus_next()); // no workspace at all
+        assert!(!wm.focus_prev());
+        manage(&mut wm, 1);
+        assert!(!wm.focus_next()); // sole window: nothing to cycle
+        assert!(!wm.focus_prev());
+        assert_eq!(wm.focused_window(), Some(1));
+    }
+
+    #[test]
+    fn focus_cycle_stays_within_current_workspace() {
+        // Cycling only touches the focused workspace: windows on other
+        // workspaces are never brought into the cycle.
+        let (_, _, mut wm) = setup();
+        manage(&mut wm, 1);
+        manage(&mut wm, 2); // [2, 1] on workspace 1
+        let b = wm.open();
+        assert!(wm.switch(b));
+        manage(&mut wm, 9); // [9] on workspace 2
+        wm.switch(1);
+        wm.focus_next(); // cycle on workspace 1: 2 -> 1
+        assert_eq!(wm.focused_window(), Some(1));
+        assert_eq!(wm.workspace(b).unwrap().focus, Some(9)); // untouched
+    }
+
+    #[test]
+    fn dispatch_reports_display_layer_commands() {
+        // Commands with no pure-core effect are reported for the display
+        // layer (T12/T13), never executed or silently swallowed.
+        let (_, _, mut wm) = setup();
+        assert_eq!(
+            wm.apply_command(Command::SpawnTerminal),
+            CommandEffect::SpawnTerminal
+        );
+        assert_eq!(
+            wm.apply_command(Command::CloseFocused),
+            CommandEffect::CloseFocused
+        );
+        assert_eq!(
+            wm.apply_command(Command::ToggleLayout),
+            CommandEffect::Unsupported
+        );
     }
 }

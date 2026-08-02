@@ -171,6 +171,21 @@ impl WorkspaceManager {
         self.workspaces.get(&self.current).and_then(|ws| ws.focus)
     }
 
+    /// Sets `w` as the focused window of its workspace WITHOUT reordering the
+    /// focus-history list, and without publishing (used by focus cycling,
+    /// REQ-x11-008: the cycle walks the fixed MRU ring). Returns false when
+    /// `w` is not managed in any workspace.
+    pub fn focus_window(&mut self, w: WindowId) -> bool {
+        let Some(id) = self.workspace_of(w) else {
+            return false;
+        };
+        self.workspaces
+            .get_mut(&id)
+            .expect("workspace exists")
+            .focus = Some(w);
+        true
+    }
+
     /// Closes `id` only when it is empty, unfocused, and not the sole
     /// workspace (clamp >= 1, single choke point, REQ-ws-002). On success
     /// publishes `WorkspaceClosed`.
