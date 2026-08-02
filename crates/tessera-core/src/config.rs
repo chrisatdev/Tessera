@@ -143,20 +143,34 @@ pub enum ConfigError {
 impl Config {
     /// Parses raw TOML into a [`Config`]; unknown keys and malformed input
     /// are rejected so a bad file can never silently replace a good config.
-    pub fn parse(_raw: &str) -> Result<Config, ConfigError> {
-        todo!()
+    pub fn parse(raw: &str) -> Result<Config, ConfigError> {
+        toml::from_str(raw).map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
     /// Reads and parses the config file at `path`.
-    pub fn load(_path: &Path) -> Result<Config, ConfigError> {
-        todo!()
+    pub fn load(path: &Path) -> Result<Config, ConfigError> {
+        let raw =
+            std::fs::read_to_string(path).map_err(|e| ConfigError::Io(e.to_string()))?;
+        Config::parse(&raw)
     }
 
-    /// Reloads from raw TOML, swapping via `Arc::swap` on success (D6).
+    /// Reloads from raw TOML, replacing the shared config on success (D6).
+    /// `Arc::swap` no longer exists in std, so the caller's `&mut Arc` slot is
+    /// reassigned instead — equivalent for the single-threaded design, and
+    /// every other holder of the old `Arc` keeps working with the old config.
     /// On a parse error the old config is kept (and logged); returns whether
     /// the shared config was replaced.
-    pub fn reload(_shared: &mut Arc<Config>, _raw: &str) -> bool {
-        todo!()
+    pub fn reload(shared: &mut Arc<Config>, raw: &str) -> bool {
+        match Config::parse(raw) {
+            Ok(new) => {
+                *shared = Arc::new(new);
+                true
+            }
+            Err(err) => {
+                eprintln!("tessera: config reload failed, keeping old config: {err:?}");
+                false
+            }
+        }
     }
 }
 
