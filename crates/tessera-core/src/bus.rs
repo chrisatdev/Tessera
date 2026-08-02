@@ -193,4 +193,58 @@ mod tests {
         assert_eq!(rx1.recv(), Ok(Event::WindowManaged(3)));
         assert_eq!(rx2.recv(), Ok(Event::WindowManaged(3)));
     }
+
+    #[test]
+    fn full_queue_drops_events_and_publish_never_blocks() {
+        let bus = Arc::new(bus());
+        let slow = bus.subscribe_all(); // never drained until the end
+        let fast = bus.subscribe_all();
+
+        // Drain `fast` concurrently; count events until Shutdown.
+        let fast_count = {
+            let rx = fast.clone();
+            std::thread::spawn(move || {
+                let mut n = 0;
+                loop {
+                    match rx.recv() {
+                        Ok(Event::Shutdown) => return n,
+                        Ok(_) => n += 1,
+                        Err(_) => return n,
+                    }
+                }
+            })
+        };
+
+        // Publish far more than one queue holds; must return without blocking.
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let publisher = {
+            let bus = Arc::clone(&bus);
+            std::thread::spawn(move || {
+                for i in 0..40u32 {
+                    bus.publish(Event::WindowManaged(i));
+                }
+                let _ = done_tx.send(());
+            })
+        };
+
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("publish blocked the publisher thread");
+
+        bus.publish(Event::Shutdown);
+        publisher.join().unwrap();
+        assert_eq!(fast_count.join().unwrap(), 40);
+
+        // The never-draining subscriber kept exactly its queue capacity,
+        // in publication order; the rest were dropped for it.
+        let mut slow_events = Vec::new();
+        loop {
+            match slow.recv_timeout(Duration::from_millis(100)) {
+                Ok(Event::WindowManaged(w)) => slow_events.push(w),
+                Ok(other) => panic!("unexpected {other:?}"),
+                Err(_) => break,
+            }
+        }
+        assert_eq!(slow_events, (0..SUB_QUEUE_CAPACITY as u32).collect::<Vec<_>>());
+    }
 }
