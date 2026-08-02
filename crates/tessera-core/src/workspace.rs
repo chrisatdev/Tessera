@@ -117,11 +117,28 @@ impl WorkspaceManager {
     pub fn workspace(&self, id: WorkspaceId) -> Option<&Workspace> {
         self.workspaces.get(&id)
     }
+
+    /// Closes `id` only when it is empty, unfocused, and not the sole
+    /// workspace (clamp >= 1, single choke point, REQ-ws-002). On success
+    /// publishes `WorkspaceClosed`.
+    pub fn close(&mut self, id: WorkspaceId) -> bool {
+        todo!("workspace manager not implemented yet")
+    }
+
+    /// Removes `w` from its workspace (SC-ws-02..04). An empty unfocused
+    /// workspace is destroyed; an emptied focused workspace moves focus to the
+    /// nearest remaining workspace (or stays with no focus when it is the
+    /// sole one). EWMH `set_desktops` sync is deferred to the EWMH work unit.
+    pub fn detach(&mut self, w: WindowId) {
+        todo!("workspace manager not implemented yet")
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crossbeam_channel::Receiver;
+    use std::time::Duration;
+
+    use crossbeam_channel::{Receiver, RecvTimeoutError};
 
     use crate::config::Config;
     use crate::event::Event;
@@ -167,5 +184,96 @@ mod tests {
         assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(1)));
         assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(2)));
         assert_eq!(rx.recv(), Ok(Event::WorkspaceChanged(2)));
+    }
+
+    #[test]
+    fn detaching_last_window_destroys_empty_unfocused_workspace() {
+        // SC-ws-02: a non-focused workspace that becomes empty is destroyed
+        // and WorkspaceClosed is published.
+        let (_, rx, mut wm) = setup();
+        let a = wm.open();
+        let b = wm.open();
+        wm.switch(b);
+        wm.attach(5);
+        wm.switch(a);
+        wm.attach(6);
+        wm.detach(5); // last window of the non-focused workspace b
+        assert_eq!(wm.len(), 1);
+        assert_eq!(wm.workspace(b), None);
+        assert_eq!(wm.workspace(a).unwrap().windows, vec![6]);
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(1)));
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(2)));
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceChanged(2)));
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceChanged(1)));
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceClosed(2)));
+    }
+
+    #[test]
+    fn sole_workspace_survives_last_window_close() {
+        // SC-ws-03: the only workspace is never destroyed; it stays
+        // empty-but-present with no focused window.
+        let (_, rx, mut wm) = setup();
+        wm.attach(1); // sole workspace 1, focused
+        wm.detach(1); // its last window closes
+        assert_eq!(wm.len(), 1);
+        assert_eq!(wm.current_id(), 1);
+        let ws = wm.workspace(1).unwrap();
+        assert_eq!(ws.windows, Vec::<WindowId>::new());
+        assert_eq!(ws.focus, None);
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(1)));
+        // clamp: no WorkspaceClosed is published for the sole workspace.
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        );
+    }
+
+    #[test]
+    fn close_rejects_sole_and_focused_workspaces() {
+        // The clamp >= 1 lives in close(), the single choke point (REQ-ws-002).
+        let (_, rx, mut wm) = setup();
+        wm.attach(1); // sole + focused workspace
+        assert!(!wm.close(1)); // sole -> rejected by the clamp
+        assert_eq!(wm.len(), 1);
+        assert!(wm.workspace(1).is_some());
+        wm.open(); // now two workspaces, current is still 1 (focused)
+        assert!(!wm.close(1)); // focused -> rejected
+        assert_eq!(wm.len(), 2);
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(1)));
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(2)));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        );
+    }
+
+    #[test]
+    fn emptying_focused_workspace_moves_to_nearest_remaining() {
+        // SC-ws-04: when the focused workspace empties, focus moves to the
+        // most recently used remaining workspace.
+        let (_, rx, mut wm) = setup();
+        let a = wm.open();
+        let b = wm.open();
+        wm.switch(b);
+        wm.attach(5);
+        wm.switch(a);
+        wm.attach(6);
+        wm.attach(7);
+        wm.detach(7); // focus drops, but a still has a window
+        wm.detach(6); // a is empty and focused -> move to nearest (b)
+        assert_eq!(wm.current_id(), b);
+        assert_eq!(wm.workspace(b).unwrap().windows, vec![5]);
+        assert_eq!(wm.workspace(a).unwrap().windows, Vec::<WindowId>::new());
+        let events: Vec<_> = (0..5).map(|_| rx.recv()).collect::<Result<_, _>>().unwrap();
+        assert_eq!(
+            events,
+            vec![
+                Event::WorkspaceOpened(1),
+                Event::WorkspaceOpened(2),
+                Event::WorkspaceChanged(2),
+                Event::WorkspaceChanged(1),
+                Event::WorkspaceChanged(2),
+            ]
+        );
     }
 }
