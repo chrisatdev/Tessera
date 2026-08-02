@@ -6,5 +6,7 @@
 //! U4 part B.
 
 pub mod display_server;
+pub mod event_loop;
+pub mod translate;
 
 pub use display_server::X11Display;

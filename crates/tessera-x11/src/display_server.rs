@@ -17,7 +17,7 @@
 use tessera_core::{DErr, DisplayServer, Event, FrameId, Rect, WindowId};
 use x11rb::connection::Connection;
 use x11rb::errors::ConnectError;
-use x11rb::protocol::xproto::Window;
+use x11rb::protocol::xproto::{Atom, Window};
 use x11rb::rust_connection::RustConnection;
 
 /// The x11rb display layer: one X connection plus the root window of the
@@ -49,10 +49,35 @@ impl X11Display {
 fn map_connect_error(display: Option<&str>, err: ConnectError) -> DErr {
     match display {
         Some(name) => DErr::X(format!("cannot connect to display '{name}': {err}")),
-        None => DErr::X(format!(
-            "cannot connect to X display (check $DISPLAY): {err}"
-        )),
+        None => DErr::X(format!("cannot connect to X display (check $DISPLAY): {err}")),
     }
+}
+
+/// The minimal X surface the WM_S0 claim needs (REQ-x11-002), abstracted so
+/// the claim flow is scriptable headless. [`RustConnection`] implements it
+/// directly; tests use a recording fake.
+pub(crate) trait X11Startup {
+    /// Interns a named atom and returns its id.
+    fn intern(&self, name: &str) -> Result<Atom, DErr>;
+    /// Returns the current owner of `atom` (`0` = unowned).
+    fn owner_of(&self, atom: Atom) -> Result<Window, DErr>;
+    /// Sets `owner` as the owner of `atom` at time `time` (`0` = CurrentTime).
+    fn take_ownership(&self, owner: Window, atom: Atom, time: u32) -> Result<(), DErr>;
+    /// Selects the event `mask` on `root`.
+    fn select_root_events(&self, root: Window, mask: u32) -> Result<(), DErr>;
+}
+
+/// Claims `WM_S0` for this WM and selects the root event mask (REQ-x11-002,
+/// REQ-x11-003). `root` acts as the selection owner — a WM has no other
+/// dedicated window at this stage of startup.
+///
+/// Order matters (SC-x11-03/04): abort BEFORE taking ownership when another
+/// WM owns the selection (so startup never manages a window), then claim, then
+/// re-check that the claim survived the round trip (a concurrent WM that
+/// raced us now owns it — abort), and only then select root events.
+pub(crate) fn startup_claim(conn: &impl X11Startup, root: Window) -> Result<(), DErr> {
+    let _ = (conn, root);
+    todo!("T15: WM_S0 claim + root event selection")
 }
 
 impl DisplayServer for X11Display {
@@ -120,7 +145,162 @@ impl DisplayServer for X11Display {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+
+    use crate::event_loop::root_event_mask;
+
     use super::*;
+
+    /// Scripted `WM_S0` server state backing the claim flow tests: records
+    /// every call in order and answers `owner_of` from a simulated owner.
+    struct FakeStartup {
+        calls: RefCell<Vec<FakeCall>>,
+        /// The owner `owner_of` reports (`0` = nobody owns the selection).
+        owner: Cell<Window>,
+        /// When set, `take_ownership` makes `owner` become this value instead
+        /// of the requested owner — simulates losing the claim to a
+        /// concurrent WM between the claim and the verification round trip.
+        claim_lost_to: Option<Window>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum FakeCall {
+        Intern(String),
+        OwnerOf(Atom),
+        TakeOwnership(Window, Atom, u32),
+        SelectEvents(Window, u32),
+    }
+
+    impl FakeStartup {
+        fn free() -> Self {
+            FakeStartup {
+                calls: RefCell::new(Vec::new()),
+                owner: Cell::new(0),
+                claim_lost_to: None,
+            }
+        }
+
+        fn owned_by(other: Window) -> Self {
+            FakeStartup {
+                calls: RefCell::new(Vec::new()),
+                owner: Cell::new(other),
+                claim_lost_to: None,
+            }
+        }
+
+        fn calls(&self) -> Vec<FakeCall> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl X11Startup for FakeStartup {
+        fn intern(&self, name: &str) -> Result<Atom, DErr> {
+            self.calls.borrow_mut().push(FakeCall::Intern(name.to_string()));
+            Ok(WM_S0_ATOM)
+        }
+        fn owner_of(&self, atom: Atom) -> Result<Window, DErr> {
+            self.calls.borrow_mut().push(FakeCall::OwnerOf(atom));
+            Ok(self.owner.get())
+        }
+        fn take_ownership(&self, owner: Window, atom: Atom, time: u32) -> Result<(), DErr> {
+            self.calls
+                .borrow_mut()
+                .push(FakeCall::TakeOwnership(owner, atom, time));
+            self.owner.set(self.claim_lost_to.unwrap_or(owner));
+            Ok(())
+        }
+        fn select_root_events(&self, root: Window, mask: u32) -> Result<(), DErr> {
+            self.calls.borrow_mut().push(FakeCall::SelectEvents(root, mask));
+            Ok(())
+        }
+    }
+
+    const WM_S0_ATOM: Atom = 0x1000;
+    const ROOT: Window = 0x0000_0010;
+
+    #[test]
+    fn startup_claim_claims_free_selection_then_selects_root_events() {
+        // SC-x11-03 + SC-x11-05: free WM_S0 → ownership acquired (claim +
+        // verification round trip) and the SubstructureRedirect|Notify mask is
+        // selected on the root window, in that order.
+        let fake = FakeStartup::free();
+        startup_claim(&fake, ROOT).unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![
+                FakeCall::Intern("WM_S0".to_string()),
+                FakeCall::OwnerOf(WM_S0_ATOM),
+                FakeCall::TakeOwnership(ROOT, WM_S0_ATOM, 0), // CurrentTime
+                FakeCall::OwnerOf(WM_S0_ATOM), // verify the claim survived
+                FakeCall::SelectEvents(ROOT, root_event_mask()),
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_claim_aborts_when_selection_already_owned() {
+        // SC-x11-04: another WM owns WM_S0 → abort BEFORE taking ownership and
+        // before selecting anything, so startup never manages a window.
+        let fake = FakeStartup::owned_by(0x0020_0001);
+        let err = startup_claim(&fake, ROOT).unwrap_err();
+        assert!(
+            matches!(err, DErr::X(ref msg) if msg.contains("WM_S0")),
+            "expected an error naming WM_S0, got {err:?}"
+        );
+        assert!(
+            !fake
+                .calls()
+                .iter()
+                .any(|c| matches!(c, FakeCall::TakeOwnership(..))),
+            "must not claim a selection another WM already owns"
+        );
+        assert!(
+            !fake
+                .calls()
+                .iter()
+                .any(|c| matches!(c, FakeCall::SelectEvents(..))),
+            "must not select root events when startup aborts"
+        );
+    }
+
+    #[test]
+    fn startup_claim_aborts_when_claim_is_lost_to_a_race() {
+        // The post-claim verification catches a concurrent WM that steals
+        // WM_S0 between our claim and the check: abort, and never select.
+        let fake = FakeStartup {
+            calls: RefCell::new(Vec::new()),
+            owner: Cell::new(0),
+            claim_lost_to: Some(0x0030_0000),
+        };
+        let err = startup_claim(&fake, ROOT).unwrap_err();
+        assert!(matches!(err, DErr::X(_)), "got {err:?}");
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|c| matches!(c, FakeCall::TakeOwnership(..))),
+            "the claim must have been attempted before the race was detected"
+        );
+        assert!(
+            !fake
+                .calls()
+                .iter()
+                .any(|c| matches!(c, FakeCall::SelectEvents(..))),
+            "must not select root events when the claim failed"
+        );
+    }
+
+    #[test]
+    fn claim_wm_requires_a_connection_first() {
+        // The trait entry point must not dereference a missing connection:
+        // calling claim_wm before connect is a programming error surfaced as
+        // DErr::X, never a panic.
+        let mut d = X11Display::new(None);
+        let err = d.claim_wm().unwrap_err();
+        assert!(
+            matches!(err, DErr::X(ref msg) if msg.contains("connect")),
+            "expected an error mentioning connect, got {err:?}"
+        );
+    }
 
     #[test]
     fn connect_fails_with_x_error_for_unreachable_display() {
