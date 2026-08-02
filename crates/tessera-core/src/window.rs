@@ -67,28 +67,94 @@ impl WindowManager {
     }
 
     /// Handles a MapRequest for `w`.
+    ///
+    /// A fresh window is attached to the focused workspace and enters
+    /// `Managing`; the display layer then creates and maps the frame and calls
+    /// [`Self::managed`] to complete the transition. An iconified
+    /// (`UnmanagePending`) window is mapped again — back to `Managed`, its
+    /// frame re-mapped, without touching its attachment.
     pub fn map_request(&mut self, w: WindowId) {
-        todo!("window lifecycle state machine")
+        match self.states.get(&w).copied().unwrap_or(WindowState::Unmanaged) {
+            WindowState::UnmanagePending => {
+                // Re-map: the iconified window is shown again. It was never
+                // detached, so nothing else changes.
+                self.states.insert(w, WindowState::Managed);
+            }
+            WindowState::Unmanaged => {
+                // Fresh MapRequest: attach (auto-opens a workspace) and enter
+                // Managing until the frame is up.
+                self.ws.attach(w);
+                self.states.insert(w, WindowState::Managing);
+            }
+            _ => {} // duplicate MapRequest while Managing/Managed: ignore
+        }
     }
 
-    /// Marks `w` fully managed, publishing `WindowManaged` exactly once.
+    /// Marks `w` fully managed — the display layer mapped its frame — and
+    /// publishes `WindowManaged` exactly once (SC-x11-07).
     pub fn managed(&mut self, w: WindowId) {
-        todo!("window lifecycle state machine")
+        if self.states.get(&w) == Some(&WindowState::Managing) {
+            self.states.insert(w, WindowState::Managed);
+            self.bus.publish(Event::WindowManaged(w));
+        }
     }
 
-    /// Handles an UnmapNotify for `w` (iconify path).
+    /// Handles an UnmapNotify for `w` (iconify path, SC-x11-11).
+    ///
+    /// A managed window becomes `UnmanagePending`: hidden but NOT removed. A
+    /// later DestroyNotify still removes it; a MapRequest brings it back.
     pub fn unmap_notify(&mut self, w: WindowId) {
-        todo!("window lifecycle state machine")
+        if self.states.get(&w) == Some(&WindowState::Managed) {
+            self.states.insert(w, WindowState::UnmanagePending);
+        }
     }
 
-    /// Handles a DestroyNotify for `w` (the authority for removal).
+    /// Handles a DestroyNotify for `w` — the authority for removal
+    /// (SC-x11-10). Only `Managed` or `UnmanagePending` windows are removed;
+    /// anything else (already `Unmanaged`, or unknown) is ignored, which is
+    /// what makes unmanaging at-most-once.
     pub fn destroy_notify(&mut self, w: WindowId) {
-        todo!("window lifecycle state machine")
+        if matches!(
+            self.states.get(&w),
+            Some(WindowState::Managed) | Some(WindowState::UnmanagePending)
+        ) {
+            self.remove(w);
+        }
+    }
+
+    /// Removes `w` exactly once: detach from its workspace, publish
+    /// `WindowUnmapped`, and repair focus when the focused window died.
+    ///
+    /// Frame destruction is the display layer's reaction to `WindowUnmapped`
+    /// (display seam, T12); the core owns the pure part of the removal.
+    fn remove(&mut self, w: WindowId) {
+        self.states.insert(w, WindowState::Unmanaged);
+        let removed_focused = self.ws.focused_window() == Some(w);
+        self.ws.detach(w);
+        self.bus.publish(Event::WindowUnmapped(w));
+        if removed_focused {
+            self.repair_focus();
+        }
+    }
+
+    /// After the focused window died, re-establish focus on the current
+    /// workspace's MRU window when it still has windows (the detach may have
+    /// switched workspaces when the focused workspace emptied).
+    fn repair_focus(&mut self) {
+        let Some(ws) = self.ws.workspace(self.ws.current_id()) else {
+            return;
+        };
+        if ws.focus.is_none() && !ws.windows.is_empty() {
+            // attach() sets focus to the window and, because it is already
+            // present, does not re-insert it — pure focus repair.
+            let mru = ws.windows[0];
+            self.ws.attach(mru);
+        }
     }
 
     /// Current lifecycle state of `w`, if it is known.
     pub fn state_of(&self, w: WindowId) -> Option<WindowState> {
-        todo!("window lifecycle state machine")
+        self.states.get(&w).copied()
     }
 }
 
@@ -139,6 +205,7 @@ mod tests {
         manage(&mut wm, 1);
         wm.unmap_notify(1); // Managed -> UnmanagePending (iconify)
         wm.destroy_notify(1); // UnmanagePending -> remove()
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(1))); // auto-open (SC-ws-01)
         assert_eq!(rx.recv(), Ok(Event::WindowManaged(1)));
         assert_eq!(rx.recv(), Ok(Event::WindowUnmapped(1)));
         assert_eq!(
@@ -154,6 +221,7 @@ mod tests {
         let (_, rx, mut wm) = setup();
         manage(&mut wm, 1);
         wm.destroy_notify(1);
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(1))); // auto-open (SC-ws-01)
         assert_eq!(rx.recv(), Ok(Event::WindowManaged(1)));
         assert_eq!(rx.recv(), Ok(Event::WindowUnmapped(1)));
         assert_eq!(
@@ -170,6 +238,7 @@ mod tests {
         manage(&mut wm, 1);
         wm.destroy_notify(1);
         wm.destroy_notify(1); // Unmanaged -> ignored
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(1))); // auto-open (SC-ws-01)
         assert_eq!(rx.recv(), Ok(Event::WindowManaged(1)));
         assert_eq!(rx.recv(), Ok(Event::WindowUnmapped(1)));
         assert_eq!(
@@ -187,5 +256,114 @@ mod tests {
             rx.recv_timeout(Duration::from_millis(50)),
             Err(RecvTimeoutError::Timeout)
         );
+    }
+
+    #[test]
+    fn map_request_starts_window_in_managing_state() {
+        // A fresh MapRequest attaches the window but does not publish
+        // WindowManaged until the frame is confirmed via `managed()`.
+        let (_, rx, mut wm) = setup();
+        wm.map_request(1);
+        assert_eq!(wm.state_of(1), Some(WindowState::Managing));
+        assert_eq!(wm.visible_windows(), vec![1]); // attached (auto-open)
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(1)));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        wm.managed(1);
+        assert_eq!(wm.state_of(1), Some(WindowState::Managed));
+        assert_eq!(rx.recv(), Ok(Event::WindowManaged(1)));
+    }
+
+    #[test]
+    fn unmap_only_iconifies_without_removing() {
+        // UnmapNotify alone leaves the window managed but pending: it stays
+        // attached; only a later DestroyNotify removes it (SC-x11-11).
+        let (_, rx, mut wm) = setup();
+        manage(&mut wm, 1);
+        wm.unmap_notify(1);
+        assert_eq!(wm.state_of(1), Some(WindowState::UnmanagePending));
+        assert_eq!(wm.visible_windows(), vec![1]); // still attached, just hidden
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(1)));
+        assert_eq!(rx.recv(), Ok(Event::WindowManaged(1)));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout) // not removed yet
+        );
+        wm.destroy_notify(1);
+        assert_eq!(wm.state_of(1), Some(WindowState::Unmanaged));
+        assert_eq!(rx.recv(), Ok(Event::WindowUnmapped(1)));
+    }
+
+    #[test]
+    fn map_request_on_pending_window_remaps_without_reattaching() {
+        // MapRequest while UnmanagePending -> Managed (frame re-mapped); the
+        // window was never detached so it is not re-attached and no second
+        // WindowManaged is published.
+        let (_, rx, mut wm) = setup();
+        manage(&mut wm, 1);
+        wm.unmap_notify(1);
+        wm.map_request(1);
+        assert_eq!(wm.state_of(1), Some(WindowState::Managed));
+        assert_eq!(wm.visible_windows(), vec![1]);
+        wm.destroy_notify(1);
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(1)));
+        assert_eq!(rx.recv(), Ok(Event::WindowManaged(1)));
+        assert_eq!(rx.recv(), Ok(Event::WindowUnmapped(1)));
+    }
+
+    #[test]
+    fn removing_focused_window_repairs_focus_to_next_mru() {
+        // remove(): detach + publish WindowUnmapped once + repair focus to the
+        // workspace's new MRU window when the removed window was focused.
+        let (_, rx, mut wm) = setup();
+        manage(&mut wm, 1);
+        manage(&mut wm, 2); // windows [2, 1], focus 2
+        assert_eq!(wm.focused_window(), Some(2));
+        wm.destroy_notify(2);
+        assert_eq!(wm.focused_window(), Some(1)); // repaired, not dangling
+        assert_eq!(wm.visible_windows(), vec![1]);
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(1)));
+        assert_eq!(rx.recv(), Ok(Event::WindowManaged(1)));
+        assert_eq!(rx.recv(), Ok(Event::WindowManaged(2)));
+        assert_eq!(rx.recv(), Ok(Event::WindowUnmapped(2)));
+    }
+
+    #[test]
+    fn removing_unfocused_window_keeps_focus() {
+        // Destroying a non-focused window leaves the current focus untouched.
+        let (_, rx, mut wm) = setup();
+        manage(&mut wm, 1);
+        manage(&mut wm, 2); // [2, 1], focus 2
+        wm.destroy_notify(1); // 1 is not the focused window
+        assert_eq!(wm.focused_window(), Some(2));
+        assert_eq!(wm.visible_windows(), vec![2]);
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(1)));
+        assert_eq!(rx.recv(), Ok(Event::WindowManaged(1)));
+        assert_eq!(rx.recv(), Ok(Event::WindowManaged(2)));
+        assert_eq!(rx.recv(), Ok(Event::WindowUnmapped(1)));
+    }
+
+    #[test]
+    fn destroying_window_on_unfocused_workspace_closes_it() {
+        // SC-ws-02: when the removed window empties a non-focused workspace it
+        // is destroyed; WorkspaceClosed precedes WindowUnmapped (design:
+        // detach first, then publish the removal).
+        let (_, rx, mut wm) = setup();
+        let a = wm.open();
+        let b = wm.open();
+        assert!(wm.switch(b));
+        manage(&mut wm, 1); // lands on the focused workspace b
+        assert!(wm.switch(a));
+        wm.destroy_notify(1); // window on the unfocused workspace b
+        assert_eq!(wm.workspace(b), None); // empty + unfocused -> destroyed
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(1)));
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(2)));
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceChanged(2)));
+        assert_eq!(rx.recv(), Ok(Event::WindowManaged(1)));
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceChanged(1)));
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceClosed(2)));
+        assert_eq!(rx.recv(), Ok(Event::WindowUnmapped(1)));
     }
 }
