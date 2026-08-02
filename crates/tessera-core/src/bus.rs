@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
 use crate::config::Config;
 use crate::event::Event;
@@ -120,10 +120,15 @@ impl EventBus {
     }
 
     /// Publishes `ev` to every matching subscriber, in registration order.
+    /// A full queue drops and logs the event; publishing never blocks
+    /// (REQ-bus-003).
     pub fn publish(&self, ev: Event) {
         for (mask, tx) in self.subs.lock().unwrap().iter() {
-            if mask.matches(&ev) {
-                let _ = tx.send(ev.clone());
+            if !mask.matches(&ev) {
+                continue;
+            }
+            if let Err(TrySendError::Full(ev)) = tx.try_send(ev.clone()) {
+                eprintln!("tessera: subscriber queue full, dropping event {ev:?}");
             }
         }
     }
@@ -197,43 +202,46 @@ mod tests {
     #[test]
     fn full_queue_drops_events_and_publish_never_blocks() {
         let bus = Arc::new(bus());
-        let slow = bus.subscribe_all(); // never drained until the end
+        let slow = bus.subscribe_all(); // never drained while publishing
         let fast = bus.subscribe_all();
 
-        // Drain `fast` concurrently; count events until Shutdown.
-        let fast_count = {
-            let rx = fast.clone();
-            std::thread::spawn(move || {
-                let mut n = 0;
-                loop {
-                    match rx.recv() {
-                        Ok(Event::Shutdown) => return n,
-                        Ok(_) => n += 1,
-                        Err(_) => return n,
-                    }
-                }
-            })
-        };
-
-        // Publish far more than one queue holds; must return without blocking.
+        // Handshake per published event: the publisher only proceeds after
+        // `fast` drained the previous one, so `fast` can never overflow and
+        // the only full queue is `slow` (deterministic drop accounting).
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         let publisher = {
             let bus = Arc::clone(&bus);
             std::thread::spawn(move || {
                 for i in 0..40u32 {
                     bus.publish(Event::WindowManaged(i));
+                    let _ = ack_rx.recv_timeout(Duration::from_secs(2));
                 }
                 let _ = done_tx.send(());
             })
         };
+        let drainer = {
+            let rx = fast.clone();
+            std::thread::spawn(move || {
+                let mut n = 0u32;
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(500)) {
+                        Ok(Event::WindowManaged(_)) => {
+                            n += 1;
+                            let _ = ack_tx.send(());
+                        }
+                        Ok(Event::Shutdown) | Err(_) => return n,
+                        Ok(other) => panic!("unexpected {other:?}"),
+                    }
+                }
+            })
+        };
 
         done_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(5))
             .expect("publish blocked the publisher thread");
-
         bus.publish(Event::Shutdown);
-        publisher.join().unwrap();
-        assert_eq!(fast_count.join().unwrap(), 40);
+        assert_eq!(drainer.join().unwrap(), 40);
 
         // The never-draining subscriber kept exactly its queue capacity,
         // in publication order; the rest were dropped for it.
