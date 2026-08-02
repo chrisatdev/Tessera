@@ -4,19 +4,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tessera_core::{App, Config, DErr, DisplayServer, Rect};
+use tessera_core::{App, Config, DErr, DisplayServer};
 use tessera_x11::X11Display;
 
 use crate::bar::Bar;
-
-/// Tiling area until T21 wires the real screen geometry (the X layer does not
-/// expose root dimensions yet).
-const AREA: Rect = Rect {
-    x: 0,
-    y: 0,
-    w: 1920,
-    h: 1080,
-};
 
 /// Minimal CLI: `tessera [--config <path>] [--display <name>]`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -86,8 +77,11 @@ pub fn run(args: &CliArgs) -> Result<(), DErr> {
     x11.connect()?;
     // REQ-x11-002: another WM owning WM_S0 aborts startup (SC-x11-04).
     x11.claim_wm()?;
+    // T21: the tiling area is the real screen geometry, queried from the root
+    // window after connect (replaces the hardcoded 1920x1080 const).
+    let area = x11.root_size()?;
     // SC-x11-01: connected and claimed -> the core loop runs.
-    let mut app = App::new(Box::new(x11), config, AREA);
+    let mut app = App::new(Box::new(x11), config, area);
     // T19: the bar subscribes to the WmState watch and catches up to the
     // complete current snapshot (SC-bus-04). The watch is live during run();
     // refresh() after the loop reads the final snapshot it carried.

@@ -81,6 +81,24 @@ impl X11Display {
             .copied()
             .ok_or_else(|| DErr::X(format!("no frame for client {w}; manage() must run first")))
     }
+
+    /// Queries the root window's current geometry (T21): the tiling area the
+    /// binary passes to the core is the REAL screen size, not a hardcoded
+    /// constant. Called after `connect` (guarded like every method here).
+    pub fn root_size(&self) -> Result<Rect, DErr> {
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| DErr::X("connect() must succeed before root_size()".to_string()))?;
+        let cookie = conn.get_geometry(self.root).map_err(map_conn_error)?;
+        let geom = cookie.reply().map_err(map_reply_error)?;
+        Ok(Rect {
+            x: 0,
+            y: 0,
+            w: geom.width,
+            h: geom.height,
+        })
+    }
 }
 
 /// Maps an [`x11rb::connect`] failure into the abort error [`DErr::X`],
