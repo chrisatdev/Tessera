@@ -1,5 +1,9 @@
 [workspace]
 members = ["crates/tessera-core", "crates/tessera-x11"]
+# With a root package, `cargo test` would otherwise run only the binary; the
+# project contract is plain `cargo test` = the whole workspace (core + x11 +
+# binary), so the default members are pinned explicitly.
+default-members = [".", "crates/tessera-core", "crates/tessera-x11"]
 resolver = "2"
 
 [workspace.package]
@@ -7,3 +11,17 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
+
+# The binary crate (root package): the Tessera WM itself. The workspace keeps
+# the pure core (tessera-core) and the x11rb display layer (tessera-x11)
+# separately so both stay headless-testable (design D1).
+[package]
+name = "tessera"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tessera-core = { path = "crates/tessera-core" }
+tessera-x11 = { path = "crates/tessera-x11" }

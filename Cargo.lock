@@ -362,6 +362,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera"
+version = "0.1.0"
+dependencies = [
+ "tessera-core",
+ "tessera-x11",
+]
+
+[[package]]
 name = "tessera-core"
 version = "0.1.0"
 dependencies = [
