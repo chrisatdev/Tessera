@@ -75,7 +75,10 @@ pub trait DisplayServer {
 /// program) is returned as [`DErr::Spawn`] so the caller logs it and the
 /// loop keeps running instead of crashing.
 pub fn spawn_program(prog: &str) -> Result<(), DErr> {
-    todo!("T13 spawn")
+    std::process::Command::new(prog)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| DErr::Spawn(err.to_string()))
 }
 
 #[cfg(test)]
