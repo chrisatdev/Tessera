@@ -117,7 +117,12 @@ mod tests {
 
     use super::*;
 
-    const AREA: Rect = Rect { x: 0, y: 0, w: 800, h: 600 };
+    const AREA: Rect = Rect {
+        x: 0,
+        y: 0,
+        w: 800,
+        h: 600,
+    };
 
     fn ms() -> MasterStack {
         MasterStack::new(0.5, 2)
@@ -154,10 +159,7 @@ mod tests {
     fn golden_two_windows_master_and_stack() {
         // SC-lay-02: focused window left half, rest stack on the right.
         let out = ms().arrange(&[1, 2], AREA, 0);
-        assert_eq!(
-            out,
-            vec![p(1, 2, 2, 396, 596), p(2, 402, 2, 396, 596)]
-        );
+        assert_eq!(out, vec![p(1, 2, 2, 396, 596), p(2, 402, 2, 396, 596)]);
     }
 
     #[test]

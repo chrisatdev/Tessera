@@ -119,14 +119,19 @@ impl WorkspaceManager {
     /// Switches the current workspace to `id`, publishing `WorkspaceChanged`.
     /// Returns false (no-op) when `id` is unknown or already current.
     ///
-    /// Note: full switch semantics (visibility projection, MRU focus
-    /// establishment) land in the switch work unit; this minimal form only
-    /// moves `current` so attach-to-focused is testable (SC-ws-07).
+    /// Full switch semantics (REQ-ws-004): the old workspace's windows are no
+    /// longer visible, the new one's become visible, and the new workspace's
+    /// MRU window regains focus — repairing any stale focus left by a detach.
     pub fn switch(&mut self, id: WorkspaceId) -> bool {
         if !self.workspaces.contains_key(&id) || id == self.current {
             return false;
         }
         self.current = id;
+        self.bump_mru(id);
+        // focus new.mru[0]: windows are in focus-history order, so the MRU
+        // window is windows[0] (None when the workspace is empty).
+        let ws = self.workspaces.get_mut(&id).expect("workspace exists");
+        ws.focus = ws.windows.first().copied();
         self.bus.publish(Event::WorkspaceChanged(id));
         true
     }
@@ -155,12 +160,15 @@ impl WorkspaceManager {
     /// list in focus-history order. Switching changes this set, which is the
     /// pure-core "unmap old, map new" contract (SC-ws-06).
     pub fn visible_windows(&self) -> Vec<WindowId> {
-        todo!("workspace manager not implemented yet")
+        self.workspaces
+            .get(&self.current)
+            .map(|ws| ws.windows.clone())
+            .unwrap_or_default()
     }
 
     /// The currently focused window: the focused workspace's MRU window.
     pub fn focused_window(&self) -> Option<WindowId> {
-        todo!("workspace manager not implemented yet")
+        self.workspaces.get(&self.current).and_then(|ws| ws.focus)
     }
 
     /// Closes `id` only when it is empty, unfocused, and not the sole
