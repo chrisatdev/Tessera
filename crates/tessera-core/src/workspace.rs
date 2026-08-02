@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::bus::EventBus;
+use crate::bus::{EventBus, WorkspaceState};
 use crate::event::Event;
 use crate::geometry::{LayoutKind, WindowId, WorkspaceId};
 
@@ -169,6 +169,22 @@ impl WorkspaceManager {
     /// The currently focused window: the focused workspace's MRU window.
     pub fn focused_window(&self) -> Option<WindowId> {
         self.workspaces.get(&self.current).and_then(|ws| ws.focus)
+    }
+
+    /// Snapshot of every workspace in creation order, for the `WmState` watch
+    /// (T12: watch consumers such as the bar need the full workspace set).
+    pub fn state_snapshots(&self) -> Vec<WorkspaceState> {
+        self.order
+            .iter()
+            .filter_map(|id| self.workspaces.get(id))
+            .map(|ws| WorkspaceState {
+                id: ws.id,
+                name: ws.name.clone(),
+                layout: ws.layout,
+                windows: ws.windows.clone(),
+                focus: ws.focus,
+            })
+            .collect()
     }
 
     /// Sets `w` as the focused window of its workspace WITHOUT reordering the

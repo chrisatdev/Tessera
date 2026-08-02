@@ -15,7 +15,7 @@ pub mod watch;
 pub mod window;
 pub mod workspace;
 
-pub use app::{command_for_key, App};
+pub use app::{App, command_for_key};
 pub use bus::{EventBus, EventMask, WmState, WorkspaceState};
 pub use command::Command;
 pub use config::{Config, GeneralConfig, Keybindings};

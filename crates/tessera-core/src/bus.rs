@@ -93,9 +93,14 @@ const SUB_QUEUE_CAPACITY: usize = 16;
 
 impl EventBus {
     /// Creates a bus with an initial empty [`WmState`] snapshot.
+    ///
+    /// The initial current workspace is `0` = "no workspace yet", the same
+    /// sentinel as [`WorkspaceManager::current_id`] (reconciled in T12; U1
+    /// shipped `current: 1` as a placeholder). Once the first window
+    /// auto-opens a workspace, both report the real id (>= 1).
     pub fn new(config: Arc<Config>) -> Self {
         let initial = WmState {
-            current: 1,
+            current: 0,
             focused: None,
             workspaces: Vec::new(),
             config,

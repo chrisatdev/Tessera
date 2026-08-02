@@ -158,7 +158,10 @@ pub(crate) mod test_double {
             Ok(())
         }
         fn configure(&mut self, w: WindowId, r: Rect) -> Result<(), DErr> {
-            self.calls.lock().unwrap().push(DisplayCall::Configure(w, r));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(DisplayCall::Configure(w, r));
             Ok(())
         }
         fn focus_window(&mut self, w: WindowId) -> Result<(), DErr> {
@@ -166,7 +169,10 @@ pub(crate) mod test_double {
             Ok(())
         }
         fn destroy_frame(&mut self, f: FrameId) -> Result<(), DErr> {
-            self.calls.lock().unwrap().push(DisplayCall::DestroyFrame(f));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(DisplayCall::DestroyFrame(f));
             Ok(())
         }
         fn set_desktops(&mut self, n: u32, cur: u32, names: &[String]) -> Result<(), DErr> {
@@ -177,7 +183,10 @@ pub(crate) mod test_double {
             Ok(())
         }
         fn spawn(&self, prog: &str) -> Result<(), DErr> {
-            self.calls.lock().unwrap().push(DisplayCall::Spawn(prog.to_string()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(DisplayCall::Spawn(prog.to_string()));
             Ok(())
         }
     }
@@ -215,7 +224,10 @@ mod tests {
         assert_eq!(d.frame_of(10), Some(f1));
         assert_eq!(d.frame_of(20), Some(f2));
         assert_ne!(f1, f2);
-        assert_eq!(d.calls(), vec![DisplayCall::Manage(10), DisplayCall::Manage(20)]);
+        assert_eq!(
+            d.calls(),
+            vec![DisplayCall::Manage(10), DisplayCall::Manage(20)]
+        );
     }
 
     #[test]
