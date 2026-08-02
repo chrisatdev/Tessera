@@ -30,6 +30,12 @@ pub struct Workspace {
 /// single choke point [`WorkspaceManager::close`].
 pub struct WorkspaceManager {
     workspaces: HashMap<WorkspaceId, Workspace>,
+    /// Workspaces in creation order (drives EWMH desktop naming in the EWMH
+    /// work unit).
+    order: Vec<WorkspaceId>,
+    /// Workspaces in touch-recency order, front = most recently touched; the
+    /// focus-repair fallback (SC-ws-04) picks the nearest remaining one.
+    mru: Vec<WorkspaceId>,
     current: WorkspaceId,
     next_id: u32,
     bus: Arc<EventBus>,
@@ -40,10 +46,34 @@ impl WorkspaceManager {
     pub fn new(bus: Arc<EventBus>) -> Self {
         WorkspaceManager {
             workspaces: HashMap::new(),
+            order: Vec::new(),
+            mru: Vec::new(),
             current: 0,
             next_id: 1,
             bus,
         }
+    }
+
+    /// Records `id` as the most recently touched workspace.
+    fn bump_mru(&mut self, id: WorkspaceId) {
+        self.mru.retain(|&m| m != id);
+        self.mru.insert(0, id);
+    }
+
+    /// The workspace currently holding window `w`, if any.
+    fn workspace_of(&self, w: WindowId) -> Option<WorkspaceId> {
+        self.workspaces
+            .iter()
+            .find(|(_, ws)| ws.windows.contains(&w))
+            .map(|(&id, _)| id)
+    }
+
+    /// The most recently used workspace other than `id`.
+    fn nearest_remaining(&self, id: WorkspaceId) -> Option<WorkspaceId> {
+        self.mru
+            .iter()
+            .copied()
+            .find(|&m| m != id && self.workspaces.contains_key(&m))
     }
 
     /// Creates a workspace with the next auto name and publishes
@@ -59,6 +89,8 @@ impl WorkspaceManager {
             focus: None,
         };
         self.workspaces.insert(id, ws);
+        self.order.push(id);
+        self.bump_mru(id);
         if self.current == 0 {
             self.current = id; // first workspace becomes current
         }
@@ -81,6 +113,7 @@ impl WorkspaceManager {
             ws.windows.insert(0, w); // most recent first
         }
         ws.focus = Some(w);
+        self.bump_mru(self.current);
     }
 
     /// Switches the current workspace to `id`, publishing `WorkspaceChanged`.
@@ -122,7 +155,20 @@ impl WorkspaceManager {
     /// workspace (clamp >= 1, single choke point, REQ-ws-002). On success
     /// publishes `WorkspaceClosed`.
     pub fn close(&mut self, id: WorkspaceId) -> bool {
-        todo!("workspace manager not implemented yet")
+        let closable = self.workspaces.len() > 1
+            && id != self.current
+            && self
+                .workspaces
+                .get(&id)
+                .is_some_and(|ws| ws.windows.is_empty());
+        if !closable {
+            return false; // clamp >= 1 (and not closeable) choke point
+        }
+        self.workspaces.remove(&id);
+        self.order.retain(|&w| w != id);
+        self.mru.retain(|&w| w != id);
+        self.bus.publish(Event::WorkspaceClosed(id));
+        true
     }
 
     /// Removes `w` from its workspace (SC-ws-02..04). An empty unfocused
@@ -130,7 +176,28 @@ impl WorkspaceManager {
     /// nearest remaining workspace (or stays with no focus when it is the
     /// sole one). EWMH `set_desktops` sync is deferred to the EWMH work unit.
     pub fn detach(&mut self, w: WindowId) {
-        todo!("workspace manager not implemented yet")
+        let Some(id) = self.workspace_of(w) else {
+            return;
+        };
+        let ws = self.workspaces.get_mut(&id).expect("workspace exists");
+        ws.windows.retain(|&x| x != w);
+        if ws.focus == Some(w) {
+            ws.focus = None;
+        }
+        if !ws.windows.is_empty() {
+            return;
+        }
+        if id == self.current {
+            // SC-ws-04: the focused workspace emptied. Prefer the nearest
+            // remaining workspace; when this is the sole one it simply keeps
+            // no focused window.
+            if let Some(next) = self.nearest_remaining(id) {
+                self.switch(next);
+            }
+        } else {
+            // SC-ws-02: empty + unfocused -> destroy (clamp enforced inside).
+            self.close(id);
+        }
     }
 }
 
