@@ -140,7 +140,7 @@ impl EventBus {
 
     /// Replaces the published [`WmState`] snapshot (REQ-bus-004).
     pub fn set_state(&self, s: WmState) {
-        let _ = s;
+        self.watch.set(s);
     }
 }
 
