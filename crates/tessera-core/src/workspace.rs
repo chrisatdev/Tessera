@@ -151,6 +151,18 @@ impl WorkspaceManager {
         self.workspaces.get(&id)
     }
 
+    /// Windows that should currently be mapped: the focused workspace's window
+    /// list in focus-history order. Switching changes this set, which is the
+    /// pure-core "unmap old, map new" contract (SC-ws-06).
+    pub fn visible_windows(&self) -> Vec<WindowId> {
+        todo!("workspace manager not implemented yet")
+    }
+
+    /// The currently focused window: the focused workspace's MRU window.
+    pub fn focused_window(&self) -> Option<WindowId> {
+        todo!("workspace manager not implemented yet")
+    }
+
     /// Closes `id` only when it is empty, unfocused, and not the sole
     /// workspace (clamp >= 1, single choke point, REQ-ws-002). On success
     /// publishes `WorkspaceClosed`.
@@ -251,6 +263,63 @@ mod tests {
         assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(1)));
         assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(2)));
         assert_eq!(rx.recv(), Ok(Event::WorkspaceChanged(2)));
+    }
+
+    #[test]
+    fn switch_remaps_visible_windows_and_focuses_mru() {
+        // SC-ws-06: switching unmaps the old workspace's windows, maps the
+        // new one's, and focuses its MRU window.
+        let (_, rx, mut wm) = setup();
+        let a = wm.open();
+        let b = wm.open();
+        wm.switch(b);
+        wm.attach(5);
+        wm.attach(8);
+        wm.switch(a);
+        wm.attach(6);
+        // Before switching, only a's windows are visible.
+        assert_eq!(wm.visible_windows(), vec![6]);
+        assert_eq!(wm.focused_window(), Some(6));
+        assert!(wm.switch(b));
+        // Old windows unmapped, new ones mapped, MRU window (8) focused.
+        assert_eq!(wm.visible_windows(), vec![8, 5]);
+        assert_eq!(wm.focused_window(), Some(8));
+        assert_eq!(wm.current_id(), b);
+        // Switching back restores a's visibility and focus.
+        assert!(wm.switch(a));
+        assert_eq!(wm.visible_windows(), vec![6]);
+        assert_eq!(wm.focused_window(), Some(6));
+        let events: Vec<_> = (0..5).map(|_| rx.recv()).collect::<Result<_, _>>().unwrap();
+        assert_eq!(
+            events,
+            vec![
+                Event::WorkspaceOpened(1),
+                Event::WorkspaceOpened(2),
+                Event::WorkspaceChanged(2),
+                Event::WorkspaceChanged(1),
+                Event::WorkspaceChanged(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn switch_reestablishes_stale_focus_to_mru_window() {
+        // A detach clears the workspace focus while windows remain; switching
+        // back must restore focus to the workspace's MRU window ("focus
+        // new.mru[0]", REQ-ws-004) instead of leaving it stale.
+        let (_, _, mut wm) = setup();
+        let a = wm.open();
+        let b = wm.open();
+        wm.switch(b);
+        wm.attach(5);
+        wm.attach(8);
+        wm.detach(8); // b keeps window 5 but its focus becomes None
+        wm.switch(a);
+        assert_eq!(wm.focused_window(), None); // a is still empty
+        wm.attach(6);
+        assert!(wm.switch(b));
+        assert_eq!(wm.focused_window(), Some(5)); // repaired to b's MRU window
+        assert_eq!(wm.visible_windows(), vec![5]);
     }
 
     #[test]
