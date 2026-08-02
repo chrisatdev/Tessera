@@ -16,7 +16,9 @@ pub fn translate_event(raw: &x11rb::protocol::Event) -> Option<Event> {
 /// Translates a batch of raw events in arrival order, dropping the ones the
 /// core ignores (REQ-x11-004 / SC-x11-06: each X event is translated and
 /// published in the order it arrived).
-pub fn translate_events<'a>(raw: impl IntoIterator<Item = &'a x11rb::protocol::Event>) -> Vec<Event> {
+pub fn translate_events<'a>(
+    raw: impl IntoIterator<Item = &'a x11rb::protocol::Event>,
+) -> Vec<Event> {
     let _ = raw;
     todo!("T16: ordered batch translation")
 }

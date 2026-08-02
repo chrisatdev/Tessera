@@ -16,9 +16,13 @@
 
 use tessera_core::{DErr, DisplayServer, Event, FrameId, Rect, WindowId};
 use x11rb::connection::Connection;
-use x11rb::errors::ConnectError;
-use x11rb::protocol::xproto::{Atom, Window};
+use x11rb::errors::{ConnectError, ConnectionError, ReplyError};
+use x11rb::protocol::xproto::{
+    Atom, ChangeWindowAttributesAux, ConnectionExt as _, EventMask, Window,
+};
 use x11rb::rust_connection::RustConnection;
+
+use crate::event_loop::root_event_mask;
 
 /// The x11rb display layer: one X connection plus the root window of the
 /// screen it was opened on.
@@ -49,8 +53,20 @@ impl X11Display {
 fn map_connect_error(display: Option<&str>, err: ConnectError) -> DErr {
     match display {
         Some(name) => DErr::X(format!("cannot connect to display '{name}': {err}")),
-        None => DErr::X(format!("cannot connect to X display (check $DISPLAY): {err}")),
+        None => DErr::X(format!(
+            "cannot connect to X display (check $DISPLAY): {err}"
+        )),
     }
+}
+
+/// Maps a connection-level failure from a request into [`DErr::X`].
+fn map_conn_error(err: ConnectionError) -> DErr {
+    DErr::X(format!("x11 request failed: {err}"))
+}
+
+/// Maps a request/reply failure into [`DErr::X`].
+fn map_reply_error(err: ReplyError) -> DErr {
+    DErr::X(format!("x11 request failed: {err}"))
 }
 
 /// The minimal X surface the WM_S0 claim needs (REQ-x11-002), abstracted so
@@ -67,6 +83,38 @@ pub(crate) trait X11Startup {
     fn select_root_events(&self, root: Window, mask: u32) -> Result<(), DErr>;
 }
 
+impl X11Startup for RustConnection {
+    fn intern(&self, name: &str) -> Result<Atom, DErr> {
+        let cookie = self
+            .intern_atom(false, name.as_bytes())
+            .map_err(map_conn_error)?;
+        cookie
+            .reply()
+            .map(|reply| reply.atom)
+            .map_err(map_reply_error)
+    }
+    fn owner_of(&self, atom: Atom) -> Result<Window, DErr> {
+        let cookie = self.get_selection_owner(atom).map_err(map_conn_error)?;
+        cookie
+            .reply()
+            .map(|reply| reply.owner)
+            .map_err(map_reply_error)
+    }
+    fn take_ownership(&self, owner: Window, atom: Atom, time: u32) -> Result<(), DErr> {
+        let cookie = self
+            .set_selection_owner(owner, atom, time)
+            .map_err(map_conn_error)?;
+        cookie.check().map_err(map_reply_error)
+    }
+    fn select_root_events(&self, root: Window, mask: u32) -> Result<(), DErr> {
+        let aux = ChangeWindowAttributesAux::default().event_mask(EventMask::from(mask));
+        let cookie = self
+            .change_window_attributes(root, &aux)
+            .map_err(map_conn_error)?;
+        cookie.check().map_err(map_reply_error)
+    }
+}
+
 /// Claims `WM_S0` for this WM and selects the root event mask (REQ-x11-002,
 /// REQ-x11-003). `root` acts as the selection owner — a WM has no other
 /// dedicated window at this stage of startup.
@@ -76,8 +124,22 @@ pub(crate) trait X11Startup {
 /// re-check that the claim survived the round trip (a concurrent WM that
 /// raced us now owns it — abort), and only then select root events.
 pub(crate) fn startup_claim(conn: &impl X11Startup, root: Window) -> Result<(), DErr> {
-    let _ = (conn, root);
-    todo!("T15: WM_S0 claim + root event selection")
+    let wm_s0 = conn.intern("WM_S0")?;
+    let current = conn.owner_of(wm_s0)?;
+    if current != 0 {
+        return Err(DErr::X(format!(
+            "another window manager already owns WM_S0 (owner {current:#x}); aborting"
+        )));
+    }
+    conn.take_ownership(root, wm_s0, x11rb::CURRENT_TIME)?;
+    let after = conn.owner_of(wm_s0)?;
+    if after != root {
+        return Err(DErr::X(
+            "WM_S0 claim lost to a concurrent window manager; aborting".to_string(),
+        ));
+    }
+    conn.select_root_events(root, root_event_mask())?;
+    Ok(())
 }
 
 impl DisplayServer for X11Display {
@@ -95,7 +157,14 @@ impl DisplayServer for X11Display {
     }
 
     fn claim_wm(&mut self) -> Result<(), DErr> {
-        todo!("T15: WM_S0 claim + root event selection")
+        // REQ-x11-002: claim WM_S0 (abort on conflict, SC-x11-04) and select
+        // the root event mask (REQ-x11-003, SC-x11-05) before any window is
+        // managed. The claim itself is scripted headless through startup_claim.
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| DErr::X("connect() must succeed before claim_wm()".to_string()))?;
+        startup_claim(conn, self.root)
     }
 
     fn next_event(&mut self) -> Result<Option<Event>, DErr> {
@@ -195,7 +264,9 @@ mod tests {
 
     impl X11Startup for FakeStartup {
         fn intern(&self, name: &str) -> Result<Atom, DErr> {
-            self.calls.borrow_mut().push(FakeCall::Intern(name.to_string()));
+            self.calls
+                .borrow_mut()
+                .push(FakeCall::Intern(name.to_string()));
             Ok(WM_S0_ATOM)
         }
         fn owner_of(&self, atom: Atom) -> Result<Window, DErr> {
@@ -210,7 +281,9 @@ mod tests {
             Ok(())
         }
         fn select_root_events(&self, root: Window, mask: u32) -> Result<(), DErr> {
-            self.calls.borrow_mut().push(FakeCall::SelectEvents(root, mask));
+            self.calls
+                .borrow_mut()
+                .push(FakeCall::SelectEvents(root, mask));
             Ok(())
         }
     }
@@ -231,7 +304,7 @@ mod tests {
                 FakeCall::Intern("WM_S0".to_string()),
                 FakeCall::OwnerOf(WM_S0_ATOM),
                 FakeCall::TakeOwnership(ROOT, WM_S0_ATOM, 0), // CurrentTime
-                FakeCall::OwnerOf(WM_S0_ATOM), // verify the claim survived
+                FakeCall::OwnerOf(WM_S0_ATOM),                // verify the claim survived
                 FakeCall::SelectEvents(ROOT, root_event_mask()),
             ]
         );
