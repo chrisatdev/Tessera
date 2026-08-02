@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 use crate::config::Config;
 use crate::event::Event;
@@ -120,9 +120,12 @@ impl EventBus {
     }
 
     /// Publishes `ev` to every matching subscriber, in registration order.
-    /// A full queue drops and logs the event; publishing never blocks.
     pub fn publish(&self, ev: Event) {
-        todo!()
+        for (mask, tx) in self.subs.lock().unwrap().iter() {
+            if mask.matches(&ev) {
+                let _ = tx.send(ev.clone());
+            }
+        }
     }
 
     /// Watch receiver carrying the latest [`WmState`] (REQ-bus-004).
