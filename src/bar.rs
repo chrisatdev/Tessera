@@ -6,8 +6,8 @@
 //! it consumes [`WmState`] only, so it can be promoted to its own crate later
 //! (design: a `src/bar.rs` module in the binary crate for now).
 
-use tessera_core::bus::StateReceiver;
 use tessera_core::WmState;
+use tessera_core::bus::StateReceiver;
 
 /// Snapshot consumer for the status bar (REQ-bus-004 / SC-bus-04).
 ///
@@ -30,8 +30,11 @@ impl Bar {
         Bar { state_rx, latest }
     }
 
-    /// The complete current snapshot the bar holds.
-    pub fn latest(&self) -> &WmState {
+    /// The complete current snapshot the bar holds. Test-facing today: the
+    /// placeholder's output path is [`Bar::render`]; the real bar's read path
+    /// will promote this accessor.
+    #[cfg(test)]
+    pub(crate) fn latest(&self) -> &WmState {
         &self.latest
     }
 
@@ -84,7 +87,7 @@ mod tests {
     use std::sync::Arc;
 
     use tessera_core::bus::EventBus;
-    use tessera_core::{Config, LayoutKind, WorkspaceState, WmState};
+    use tessera_core::{Config, LayoutKind, WmState, WorkspaceState};
 
     use super::*;
 
@@ -116,10 +119,7 @@ mod tests {
         let latest = state(
             2,
             Some(9),
-            vec![
-                ws(1, "1", vec![5], Some(5)),
-                ws(2, "2", vec![9], Some(9)),
-            ],
+            vec![ws(1, "1", vec![5], Some(5)), ws(2, "2", vec![9], Some(9))],
         );
         bus.set_state(latest.clone());
         let bar = Bar::new(bus.state_rx());

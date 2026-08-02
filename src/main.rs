@@ -9,7 +9,14 @@ mod app;
 mod bar;
 
 fn main() {
-    let args = app::CliArgs::default();
+    let args = match app::CliArgs::parse(std::env::args().skip(1)) {
+        Ok(args) => args,
+        Err(msg) => {
+            eprintln!("tessera: {msg}");
+            eprintln!("usage: tessera [--config <path>] [--display <name>]");
+            std::process::exit(2);
+        }
+    };
     if let Err(err) = app::run(&args) {
         eprintln!("tessera: {err}");
         std::process::exit(1);

@@ -1,9 +1,22 @@
 //! Binary wiring (T20): assemble the X display layer, the core [`App`] and
 //! the bar placeholder, then run the loop (REQ-x11-001/002, SC-x11-01).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use tessera_core::{DErr, EventBus};
+use tessera_core::{App, Config, DErr, DisplayServer, Rect};
+use tessera_x11::X11Display;
+
+use crate::bar::Bar;
+
+/// Tiling area until T21 wires the real screen geometry (the X layer does not
+/// expose root dimensions yet).
+const AREA: Rect = Rect {
+    x: 0,
+    y: 0,
+    w: 1920,
+    h: 1080,
+};
 
 /// Minimal CLI: `tessera [--config <path>] [--display <name>]`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -14,18 +27,75 @@ pub struct CliArgs {
     pub display: Option<String>,
 }
 
-/// Wires core + x11 and runs the loop (T20).
+impl CliArgs {
+    /// Parses the CLI arguments (`--config <path>`, `--display <name>`).
+    /// Unknown flags and missing values are rejected.
+    pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<CliArgs, String> {
+        let mut args = args.into_iter();
+        let mut config_path = None;
+        let mut display = None;
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--config" => {
+                    let value = args.next().ok_or("--config needs a config file path")?;
+                    config_path = Some(PathBuf::from(value));
+                }
+                "--display" => {
+                    let value = args.next().ok_or("--display needs a display name")?;
+                    display = Some(value);
+                }
+                other => return Err(format!("unknown argument '{other}'")),
+            }
+        }
+        Ok(CliArgs {
+            config_path,
+            display,
+        })
+    }
+}
+
+/// Loads the config from `path`, or the defaults when no path is given.
+///
+/// A config file that cannot be read or parsed aborts startup: at boot there
+/// is no previous config to fall back on (D6's keep-old-on-error applies to
+/// reloads, not to the first load).
+pub fn load_config(path: Option<&Path>) -> Result<Config, String> {
+    match path {
+        Some(path) => Config::load(path).map_err(|err| format!("cannot load config: {err:?}")),
+        None => Ok(Config::default()),
+    }
+}
+
+/// Wires core + x11 (+ the bar placeholder) and runs the loop (SC-x11-01).
+///
+/// Startup aborts with `Err` when the display is unreachable (REQ-x11-001,
+/// SC-x11-02) or the WM_S0 claim fails (REQ-x11-002, SC-x11-04); [`main`]
+/// maps that to a non-zero exit. The bar consumes the WmState watch
+/// (REQ-bus-004, T19); its live per-iteration rendering lands with the real
+/// bar (later change).
 pub fn run(args: &CliArgs) -> Result<(), DErr> {
-    // T20: assemble X11Display + EventBus + App. T19 seam proof: a Bar built
-    // from a live bus consumes the WmState watch (REQ-bus-004) — the real
-    // wiring replaces this throwaway bus with the App's bus.
-    let _ = args.config_path.as_deref();
-    let _ = args.display.as_deref();
-    let bus = EventBus::new(Default::default());
-    let mut bar = crate::bar::Bar::new(bus.state_rx());
+    // Config: explicit file, or defaults. A bad file aborts startup (there is
+    // no previous config at boot to keep — D6 covers reloads only).
+    let config = Arc::new(load_config(args.config_path.as_deref()).map_err(DErr::X)?);
+    // The X layer needs the real keybindings (and border) BEFORE claim_wm
+    // grabs them (U4-B note); defaults match anyway, but an explicit config
+    // must win.
+    let mut x11 = X11Display::new(args.display.as_deref());
+    x11.set_config(Arc::clone(&config));
+    // REQ-x11-001: an unreachable display aborts startup (SC-x11-02).
+    x11.connect()?;
+    // REQ-x11-002: another WM owning WM_S0 aborts startup (SC-x11-04).
+    x11.claim_wm()?;
+    // SC-x11-01: connected and claimed -> the core loop runs.
+    let mut app = App::new(Box::new(x11), config, AREA);
+    // T19: the bar subscribes to the WmState watch and catches up to the
+    // complete current snapshot (SC-bus-04). The watch is live during run();
+    // refresh() after the loop reads the final snapshot it carried.
+    let mut bar = Bar::new(app.bus().state_rx());
+    app.run();
     bar.refresh();
-    let _ = (bar.latest(), bar.render());
-    todo!("T20: assemble X11Display + EventBus + App")
+    eprintln!("tessera: bar: {}", bar.render());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -64,10 +134,8 @@ mod tests {
 
     #[test]
     fn load_config_aborts_on_a_missing_file() {
-        let err = load_config(Some(Path::new(
-            "/nonexistent/tessera-does-not-exist.toml",
-        )))
-        .unwrap_err();
+        let err =
+            load_config(Some(Path::new("/nonexistent/tessera-does-not-exist.toml"))).unwrap_err();
         assert!(err.contains("config"), "expected a config error, got {err}");
     }
 
