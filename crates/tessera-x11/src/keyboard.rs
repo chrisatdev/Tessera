@@ -1,8 +1,156 @@
 //! Keyboard: keycode → keysym mapping and grabbing of the configured
 //! keybindings (T18, REQ-x11-008, SC-x11-12).
 //!
-//! RED: tests only — the production `KeyboardOps` seam, `RustConnection` impl,
-//! `Keymap` and the two functions arrive with the green commit.
+//! Raw `KeyPress` events carry a keyCODE; the core's `KeyCombo.key` is a
+//! keysym. [`Keymap`] holds the server's keycode → keysym table so
+//! [`translate_key_press`] can resolve a raw press into an
+//! [`Event::KeyPressed`] the core's `command_for_key` understands, and
+//! [`grab_keybindings`] can convert the config's keysym bindings into
+//! keycode grabs on the root window. Every X side effect goes through the
+//! [`KeyboardOps`] seam so both directions are scriptable headless.
+
+use tessera_core::{Config, DErr, Event, KeyCombo};
+use x11rb::connection::Connection;
+use x11rb::protocol::xproto::{GrabMode, ModMask, Window, get_keyboard_mapping, grab_key};
+use x11rb::rust_connection::RustConnection;
+
+use crate::display_server::{map_conn_error, map_reply_error};
+
+/// The X surface keyboard handling needs, abstracted so translation and
+/// grabbing are scriptable headless (same seam shape as
+/// [`X11Startup`](crate::display_server::X11Startup)).
+pub(crate) trait KeyboardOps {
+    /// `(min_keycode, max_keycode)` of the keyboard, from the server setup.
+    fn keycode_range(&self) -> (u8, u8);
+    /// Fetches the keysym table for `count` keycodes starting at
+    /// `first_keycode` as `(keysyms_per_keycode, keysyms)`.
+    fn keyboard_mapping(&self, first_keycode: u8, count: u8) -> Result<(u8, Vec<u32>), DErr>;
+    /// Grabs `keycode` with `modifiers` on `window` (owner_events = false,
+    /// async pointer/keyboard modes — the press is consumed by the grab).
+    fn grab_key(&self, window: Window, modifiers: u16, keycode: u8) -> Result<(), DErr>;
+}
+
+impl KeyboardOps for RustConnection {
+    fn keycode_range(&self) -> (u8, u8) {
+        (self.setup().min_keycode, self.setup().max_keycode)
+    }
+    fn keyboard_mapping(&self, first_keycode: u8, count: u8) -> Result<(u8, Vec<u32>), DErr> {
+        let cookie = get_keyboard_mapping(self, first_keycode, count).map_err(map_conn_error)?;
+        let reply = cookie.reply().map_err(map_reply_error)?;
+        Ok((reply.keysyms_per_keycode, reply.keysyms))
+    }
+    fn grab_key(&self, window: Window, modifiers: u16, keycode: u8) -> Result<(), DErr> {
+        let cookie = grab_key(
+            self,
+            false,
+            window,
+            ModMask::from(modifiers),
+            keycode,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )
+        .map_err(map_conn_error)?;
+        cookie.check().map_err(map_reply_error)
+    }
+}
+
+/// The server's keycode → keysym table, loaded during `claim_wm` and cached
+/// (v1 ignores `MappingNotify` — a keyboard map change needs a regrab, which
+/// is out of scope).
+pub(crate) struct Keymap {
+    min_keycode: u8,
+    keysyms_per_keycode: u8,
+    keysyms: Vec<u32>,
+}
+
+impl Keymap {
+    /// Builds a keymap from a raw (min_keycode, keysyms_per_keycode, keysyms)
+    /// triple — the shape `get_keyboard_mapping` replies with.
+    pub(crate) fn new(min_keycode: u8, keysyms_per_keycode: u8, keysyms: Vec<u32>) -> Self {
+        Keymap {
+            min_keycode,
+            keysyms_per_keycode,
+            keysyms,
+        }
+    }
+
+    /// Fetches the mapping through `ops` over the full keycode range the
+    /// server setup reports.
+    pub(crate) fn load(ops: &impl KeyboardOps) -> Result<Keymap, DErr> {
+        let (min, max) = ops.keycode_range();
+        let count = max.saturating_sub(min).saturating_add(1);
+        let (keysyms_per_keycode, keysyms) = ops.keyboard_mapping(min, count)?;
+        Ok(Keymap::new(min, keysyms_per_keycode, keysyms))
+    }
+
+    /// The primary keysym for `keycode` (REQ-x11-008): `0` (NoSymbol) for a
+    /// keycode below the minimum, beyond the table, or with an empty slot.
+    pub(crate) fn keysym(&self, keycode: u8) -> u32 {
+        if self.keysyms_per_keycode == 0 || keycode < self.min_keycode {
+            return 0;
+        }
+        let index = usize::from(keycode - self.min_keycode) * usize::from(self.keysyms_per_keycode);
+        self.keysyms.get(index).copied().unwrap_or(0)
+    }
+
+    /// Every keycode that currently maps to `keysym`, ascending — the reverse
+    /// lookup `grab_keybindings` needs to turn config keysyms into grabs.
+    pub(crate) fn keycodes_for_keysym(&self, keysym: u32) -> Vec<u8> {
+        let max = self.min_keycode.saturating_add(
+            (self.keysyms.len() / usize::from(self.keysyms_per_keycode.max(1))) as u8,
+        );
+        (self.min_keycode..=max)
+            .filter(|&keycode| self.keysym(keycode) == keysym)
+            .collect()
+    }
+}
+
+/// Resolves a raw `KeyPressed` (whose `key` is a keyCODE, as translated by
+/// `crate::translate`) into one carrying the keysym the core's
+/// `command_for_key` matches against (SC-x11-12). `None` for a key with no
+/// keysym — unbound keys are not published.
+pub(crate) fn translate_key_press(keymap: &Keymap, raw: KeyCombo) -> Option<Event> {
+    let keysym = keymap.keysym(raw.key as u8);
+    if keysym == 0 {
+        return None;
+    }
+    Some(Event::KeyPressed(KeyCombo {
+        mods: raw.mods,
+        key: keysym,
+    }))
+}
+
+/// Grabs every configured keybinding on `root` (REQ-x11-008): each binding's
+/// keysym is resolved to its keycode(s) through `keymap` and grabbed with the
+/// binding's modifier mask. Bindings whose keysym exists nowhere in the
+/// mapping are skipped, and a (mods, keycode) pair is only grabbed once.
+/// Returns how many grabs took effect.
+pub(crate) fn grab_keybindings(
+    ops: &impl KeyboardOps,
+    keymap: &Keymap,
+    root: Window,
+    cfg: &Config,
+) -> Result<usize, DErr> {
+    let k = &cfg.keybindings;
+    let fixed = [
+        k.terminal,
+        k.focus_next,
+        k.focus_prev,
+        k.close,
+        k.toggle_layout,
+    ];
+    let mut grabbed: Vec<(u16, u8)> = Vec::new();
+    for combo in fixed.iter().chain(k.workspace.iter()) {
+        for keycode in keymap.keycodes_for_keysym(combo.key) {
+            let pair = (combo.mods as u16, keycode);
+            if !grabbed.contains(&pair) {
+                ops.grab_key(root, pair.0, pair.1)?;
+                grabbed.push(pair);
+            }
+        }
+    }
+    Ok(grabbed.len())
+}
 
 #[cfg(test)]
 mod tests {

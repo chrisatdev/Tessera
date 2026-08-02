@@ -27,7 +27,7 @@ use x11rb::protocol::xproto::{
 use x11rb::rust_connection::RustConnection;
 
 use crate::event_loop::{next_x11_event, root_event_mask};
-use crate::frames;
+use crate::{ewmh, frames, keyboard};
 
 /// The x11rb display layer: one X connection plus the root window of the
 /// screen it was opened on.
@@ -47,6 +47,8 @@ pub struct X11Display {
     config: Arc<Config>,
     /// Frame window id created per managed client (`manage`, T17).
     frames: HashMap<WindowId, FrameId>,
+    /// Cached keycode → keysym mapping, loaded during `claim_wm` (T18).
+    keyboard: Option<keyboard::Keymap>,
 }
 
 impl X11Display {
@@ -61,6 +63,7 @@ impl X11Display {
             visual: 0,
             config: Arc::new(Config::default()),
             frames: HashMap::new(),
+            keyboard: None,
         }
     }
 
@@ -201,7 +204,19 @@ impl DisplayServer for X11Display {
             .conn
             .as_ref()
             .ok_or_else(|| DErr::X("connect() must succeed before claim_wm()".to_string()))?;
-        startup_claim(conn, self.root)
+        startup_claim(conn, self.root)?;
+        // REQ-x11-008: becoming the WM also means grabbing the configured
+        // keybindings on the root and caching the keycode -> keysym mapping so
+        // next_event can translate raw KeyPress events (T18, SC-x11-12). A
+        // failed grab aborts startup loudly rather than silently dropping a
+        // binding.
+        let keymap = keyboard::Keymap::load(conn)?;
+        let grabbed = keyboard::grab_keybindings(conn, &keymap, self.root, &self.config)?;
+        self.keyboard = Some(keymap);
+        if grabbed == 0 {
+            eprintln!("tessera: no keybinding grabbed from config");
+        }
+        Ok(())
     }
 
     fn next_event(&mut self) -> Result<Option<Event>, DErr> {
@@ -212,7 +227,23 @@ impl DisplayServer for X11Display {
             .conn
             .as_ref()
             .ok_or_else(|| DErr::X("connect() must succeed before next_event()".to_string()))?;
-        next_x11_event(conn)
+        loop {
+            match next_x11_event(conn)? {
+                Some(Event::KeyPressed(raw)) => match &self.keyboard {
+                    // translate.rs carries the raw keyCODE (T16); resolve it
+                    // to the bound keysym through the cached keymap so the
+                    // core's command_for_key can match it (T18, SC-x11-12).
+                    Some(keymap) => {
+                        if let Some(ev) = keyboard::translate_key_press(keymap, raw) {
+                            return Ok(Some(ev));
+                        }
+                        // NoSymbol (unbound) key: skip it, keep waiting.
+                    }
+                    None => return Ok(Some(Event::KeyPressed(raw))),
+                },
+                other => return Ok(other),
+            }
+        }
     }
 
     fn manage(&mut self, w: WindowId) -> Result<FrameId, DErr> {
@@ -276,8 +307,14 @@ impl DisplayServer for X11Display {
         frames::destroy_frame(conn, f.0)
     }
 
-    fn set_desktops(&mut self, _n: u32, _cur: u32, _names: &[String]) -> Result<(), DErr> {
-        Err(DErr::X("set_desktops: EWMH is U4 part B (T18)".to_string()))
+    fn set_desktops(&mut self, n: u32, cur: u32, names: &[String]) -> Result<(), DErr> {
+        // REQ-ws-003 / SC-ws-05: sync the three _NET_* desktop root
+        // properties through ewmh.rs (T18).
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| DErr::X("connect() must succeed before set_desktops()".to_string()))?;
+        ewmh::set_desktops(conn, self.root, n, cur, names)
     }
 
     fn spawn(&self, prog: &str) -> Result<(), DErr> {

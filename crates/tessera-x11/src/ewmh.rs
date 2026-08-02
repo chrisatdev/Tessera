@@ -1,7 +1,116 @@
-//! EWMH desktop state sync on the root window (T18, REQ-ws-003, SC-ws-05).
+//! EWMH root-property sync (T18, REQ-ws-003/005, SC-ws-05).
 //!
-//! RED: tests only — the production `EwmhOps` seam, `RustConnection` impl and
-//! `set_desktops` arrive with the green commit (REQ-ws-003/005).
+//! `_NET_NUMBER_OF_DESKTOPS` / `_NET_CURRENT_DESKTOP` are 32-bit CARDINAL
+//! properties on the root window; `_NET_DESKTOP_NAMES` is a UTF8_STRING
+//! property holding the workspace names concatenated, each NUL-terminated.
+//! Every X side effect goes through the [`EwmhOps`] seam so the sync is
+//! scriptable headless; [`RustConnection`] implements it directly.
+
+use tessera_core::DErr;
+use x11rb::protocol::xproto::{Atom, AtomEnum, PropMode, Window, intern_atom};
+use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt;
+
+use crate::display_server::{map_conn_error, map_reply_error};
+
+/// The EWMH surface [`set_desktops`] needs, abstracted so the property sync
+/// is scriptable headless (same seam shape as
+/// [`X11Startup`](crate::display_server::X11Startup)).
+pub(crate) trait EwmhOps {
+    /// Interns a named atom and returns its id.
+    fn intern(&self, name: &str) -> Result<Atom, DErr>;
+    /// Writes a format-32 property (CARDINAL desktop counts).
+    fn change_property32(
+        &self,
+        window: Window,
+        property: Atom,
+        type_: Atom,
+        data: &[u32],
+    ) -> Result<(), DErr>;
+    /// Writes a format-8 property (UTF8_STRING desktop names).
+    fn change_property8(
+        &self,
+        window: Window,
+        property: Atom,
+        type_: Atom,
+        data: &[u8],
+    ) -> Result<(), DErr>;
+}
+
+impl EwmhOps for RustConnection {
+    fn intern(&self, name: &str) -> Result<Atom, DErr> {
+        let cookie = intern_atom(self, false, name.as_bytes()).map_err(map_conn_error)?;
+        cookie
+            .reply()
+            .map(|reply| reply.atom)
+            .map_err(map_reply_error)
+    }
+    fn change_property32(
+        &self,
+        window: Window,
+        property: Atom,
+        type_: Atom,
+        data: &[u32],
+    ) -> Result<(), DErr> {
+        let cookie = <Self as ConnectionExt>::change_property32(
+            self,
+            PropMode::REPLACE,
+            window,
+            property,
+            type_,
+            data,
+        )
+        .map_err(map_conn_error)?;
+        cookie.check().map_err(map_reply_error)
+    }
+    fn change_property8(
+        &self,
+        window: Window,
+        property: Atom,
+        type_: Atom,
+        data: &[u8],
+    ) -> Result<(), DErr> {
+        let cookie = <Self as ConnectionExt>::change_property8(
+            self,
+            PropMode::REPLACE,
+            window,
+            property,
+            type_,
+            data,
+        )
+        .map_err(map_conn_error)?;
+        cookie.check().map_err(map_reply_error)
+    }
+}
+
+/// Syncs the three EWMH desktop root properties (REQ-ws-003 / SC-ws-05):
+/// the desktop count and the current desktop as CARDINAL u32s, and the names
+/// as one UTF8_STRING of NUL-terminated names. `CARDINAL` is a standard atom
+/// (no intern round trip); the `_NET_*` names and `UTF8_STRING` are interned
+/// first in a fixed order.
+pub(crate) fn set_desktops(
+    ops: &impl EwmhOps,
+    root: Window,
+    n: u32,
+    cur: u32,
+    names: &[String],
+) -> Result<(), DErr> {
+    let net_number = ops.intern("_NET_NUMBER_OF_DESKTOPS")?;
+    let net_current = ops.intern("_NET_CURRENT_DESKTOP")?;
+    let net_names = ops.intern("_NET_DESKTOP_NAMES")?;
+    let utf8_string = ops.intern("UTF8_STRING")?;
+    let cardinal = u32::from(AtomEnum::CARDINAL);
+
+    ops.change_property32(root, net_number, cardinal, &[n])?;
+    ops.change_property32(root, net_current, cardinal, &[cur])?;
+    let mut names_bytes = Vec::with_capacity(names.iter().map(|s| s.len() + 1).sum());
+    for name in names {
+        names_bytes.extend_from_slice(name.as_bytes());
+        names_bytes.push(0);
+    }
+    ops.change_property8(root, net_names, utf8_string, &names_bytes)?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
