@@ -15,17 +15,95 @@ impl MasterStack {
     /// Creates a master-stack layout with the given master `ratio` (default
     /// 0.5) and `border` width baked into every placement (D5, REQ-lay-002).
     pub fn new(ratio: f64, border: u16) -> Self {
-        todo!("arrange is not implemented yet")
+        MasterStack { ratio, border }
+    }
+
+    /// Shrinks `r` by the frame border on every side, clamped to zero size.
+    fn inset(&self, r: Rect) -> Rect {
+        let b = self.border as i32;
+        Rect {
+            x: r.x + b,
+            y: r.y + b,
+            w: (r.w as i32 - 2 * b).max(0) as u16,
+            h: (r.h as i32 - 2 * b).max(0) as u16,
+        }
+    }
+}
+
+impl Default for MasterStack {
+    /// Default master ratio 0.5 and border 2 (design "default 0.5", matches
+    /// the config default `general.border_width`).
+    fn default() -> Self {
+        MasterStack::new(0.5, 2)
     }
 }
 
 impl Layout for MasterStack {
     fn name(&self) -> &'static str {
-        todo!("arrange is not implemented yet")
+        "master-stack"
     }
 
     fn arrange(&self, windows: &[WindowId], area: Rect, focus: usize) -> Vec<Placement> {
-        todo!("arrange is not implemented yet")
+        if windows.is_empty() {
+            return Vec::new();
+        }
+        // The focus index selects the master (REQ-lay-003); an out-of-range
+        // index (stale focus after a window was removed) clamps to 0.
+        let focus = if focus < windows.len() { focus } else { 0 };
+        // A lone window spans the full area (cover-fully, REQ-lay-004); the
+        // ratio split only shapes the master when a stack exists.
+        let master_w = if windows.len() > 1 {
+            ((area.w as f64 * self.ratio).round() as i32).clamp(0, area.w as i32) as u16
+        } else {
+            area.w
+        };
+
+        let mut out = Vec::with_capacity(windows.len());
+        let master_rect = Rect {
+            x: area.x,
+            y: area.y,
+            w: master_w,
+            h: area.h,
+        };
+        out.push(Placement {
+            window: windows[focus],
+            rect: self.inset(master_rect),
+            border: self.border,
+        });
+
+        // Stack: the remaining windows tile vertically in the right slice.
+        let stack_n = windows.len() - 1;
+        if stack_n > 0 {
+            let stack_w = area.w - master_w;
+            let stack_x = area.x + master_w as i32;
+            let slice_h = area.h / stack_n as u16;
+            let mut idx = 0usize;
+            for (i, w) in windows.iter().enumerate() {
+                if i == focus {
+                    continue;
+                }
+                // The last stack window absorbs the remainder so the stack
+                // covers the slice fully (REQ-lay-004).
+                let h = if idx == stack_n - 1 {
+                    area.h - slice_h * (stack_n as u16 - 1)
+                } else {
+                    slice_h
+                };
+                let rect = Rect {
+                    x: stack_x,
+                    y: area.y + (idx as i32 * slice_h as i32),
+                    w: stack_w,
+                    h,
+                };
+                out.push(Placement {
+                    window: *w,
+                    rect: self.inset(rect),
+                    border: self.border,
+                });
+                idx += 1;
+            }
+        }
+        out
     }
 }
 
@@ -66,8 +144,10 @@ mod tests {
 
     #[test]
     fn golden_one_window_fills_master() {
+        // A single window covers the whole area (REQ-lay-004 cover-fully);
+        // the master/stack split only applies with 2+ windows (SC-lay-02).
         let out = ms().arrange(&[1], AREA, 0);
-        assert_eq!(out, vec![p(1, 2, 2, 396, 596)]);
+        assert_eq!(out, vec![p(1, 2, 2, 796, 596)]);
     }
 
     #[test]
