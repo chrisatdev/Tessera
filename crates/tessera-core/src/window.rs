@@ -156,6 +156,23 @@ impl WindowManager {
     pub fn state_of(&self, w: WindowId) -> Option<WindowState> {
         self.states.get(&w).copied()
     }
+
+    /// FocusNext: cycle focus to the next window of the focused workspace in
+    /// focus-history (MRU-first) order, wrapping at the end.
+    pub fn focus_next(&mut self) -> bool {
+        todo!("focus cycle and command dispatch")
+    }
+
+    /// FocusPrev: mirror of [`Self::focus_next`], wrapping at the start.
+    pub fn focus_prev(&mut self) -> bool {
+        todo!("focus cycle and command dispatch")
+    }
+
+    /// Applies a user [`Command`] to the workspace state and reports what the
+    /// display layer must do next.
+    pub fn apply_command(&mut self, cmd: Command) -> CommandEffect {
+        todo!("focus cycle and command dispatch")
+    }
 }
 
 impl Deref for WindowManager {
@@ -179,6 +196,7 @@ mod tests {
 
     use crossbeam_channel::{Receiver, RecvTimeoutError};
 
+    use crate::command::Command;
     use crate::config::Config;
     use crate::event::Event;
 
@@ -365,5 +383,68 @@ mod tests {
         assert_eq!(rx.recv(), Ok(Event::WorkspaceChanged(1)));
         assert_eq!(rx.recv(), Ok(Event::WorkspaceClosed(2)));
         assert_eq!(rx.recv(), Ok(Event::WindowUnmapped(1)));
+    }
+
+    #[test]
+    fn focus_next_cycles_in_mru_order_and_wraps() {
+        // Closed decision: FocusNext walks the focused workspace's MRU-first
+        // list (3 is most recent), wrapping at the end back to the front.
+        let (_, _, mut wm) = setup();
+        manage(&mut wm, 1);
+        manage(&mut wm, 2);
+        manage(&mut wm, 3); // windows [3, 2, 1], focus 3
+        assert!(wm.focus_next());
+        assert_eq!(wm.focused_window(), Some(2));
+        assert!(wm.focus_next());
+        assert_eq!(wm.focused_window(), Some(1));
+        assert!(wm.focus_next()); // wrap to the front
+        assert_eq!(wm.focused_window(), Some(3));
+    }
+
+    #[test]
+    fn focus_prev_cycles_backwards_and_wraps() {
+        // FocusPrev is the mirror cycle, wrapping at the start back to the end.
+        let (_, _, mut wm) = setup();
+        manage(&mut wm, 1);
+        manage(&mut wm, 2);
+        manage(&mut wm, 3); // [3, 2, 1], focus 3
+        assert!(wm.focus_prev());
+        assert_eq!(wm.focused_window(), Some(1));
+        assert!(wm.focus_prev());
+        assert_eq!(wm.focused_window(), Some(2));
+        assert!(wm.focus_prev()); // wrap to the end
+        assert_eq!(wm.focused_window(), Some(3));
+    }
+
+    #[test]
+    fn dispatch_applies_focus_and_switch_commands() {
+        // The dispatch wires Command::FocusNext/FocusPrev to the cycle and
+        // Command::SwitchWorkspace to the workspace switch (REQ-x11-008).
+        let (_, _, mut wm) = setup();
+        manage(&mut wm, 1);
+        manage(&mut wm, 2); // [2, 1], focus 2
+        assert_eq!(wm.apply_command(Command::FocusNext), CommandEffect::Applied);
+        assert_eq!(wm.focused_window(), Some(1));
+        let b = wm.open(); // workspace 2; current stays 1
+        assert_eq!(
+            wm.apply_command(Command::SwitchWorkspace(b)),
+            CommandEffect::Applied
+        );
+        assert_eq!(wm.current_id(), b);
+    }
+
+    #[test]
+    fn dispatch_ignores_noop_commands() {
+        // Commands with no target are ignored, never fatal: no windows to
+        // cycle, a sole window, or an unknown workspace.
+        let (_, _, mut wm) = setup();
+        assert_eq!(wm.apply_command(Command::FocusNext), CommandEffect::Ignored);
+        manage(&mut wm, 1);
+        assert_eq!(wm.apply_command(Command::FocusPrev), CommandEffect::Ignored);
+        assert_eq!(
+            wm.apply_command(Command::SwitchWorkspace(9)),
+            CommandEffect::Ignored
+        );
+        assert_eq!(wm.focused_window(), Some(1)); // state untouched
     }
 }
