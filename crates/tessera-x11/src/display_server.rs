@@ -376,6 +376,18 @@ mod tests {
     }
 
     #[test]
+    fn next_event_requires_a_connection_first() {
+        // Same guard for the event loop: next_event before connect is an
+        // error, never a panic on a missing connection.
+        let mut d = X11Display::new(None);
+        let err = d.next_event().unwrap_err();
+        assert!(
+            matches!(err, DErr::X(ref msg) if msg.contains("connect")),
+            "expected an error mentioning connect, got {err:?}"
+        );
+    }
+
+    #[test]
     fn connect_fails_with_x_error_for_unreachable_display() {
         // SC-x11-02 seam: a display number with no server behind it fails the
         // REAL x11rb connect (instant socket error, no X server needed), and
