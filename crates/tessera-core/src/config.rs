@@ -143,19 +143,112 @@ pub enum ConfigError {
 impl Config {
     /// Parses raw TOML into a [`Config`]; unknown keys and malformed input
     /// are rejected so a bad file can never silently replace a good config.
-    pub fn parse(raw: &str) -> Result<Config, ConfigError> {
+    pub fn parse(_raw: &str) -> Result<Config, ConfigError> {
         todo!()
     }
 
     /// Reads and parses the config file at `path`.
-    pub fn load(path: &Path) -> Result<Config, ConfigError> {
+    pub fn load(_path: &Path) -> Result<Config, ConfigError> {
         todo!()
     }
 
     /// Reloads from raw TOML, swapping via `Arc::swap` on success (D6).
     /// On a parse error the old config is kept (and logged); returns whether
     /// the shared config was replaced.
-    pub fn reload(shared: &mut Arc<Config>, raw: &str) -> bool {
+    pub fn reload(_shared: &mut Arc<Config>, _raw: &str) -> bool {
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn defaults_are_border_2_gaps_0_alacritty() {
+        let c = Config::default();
+        assert_eq!(c.general.border_width, 2);
+        assert_eq!(c.general.gaps, 0);
+        assert_eq!(c.general.terminal, "alacritty");
+    }
+
+    #[test]
+    fn default_keybindings_cover_super_combos() {
+        let c = Config::default();
+        assert_eq!(
+            c.keybindings.terminal,
+            KeyCombo {
+                mods: MOD_SUPER,
+                key: KEY_RETURN,
+            }
+        );
+        assert_eq!(
+            c.keybindings.focus_next,
+            KeyCombo {
+                mods: MOD_SUPER,
+                key: KEY_J,
+            }
+        );
+        assert_eq!(
+            c.keybindings.workspace[0],
+            KeyCombo {
+                mods: MOD_SUPER,
+                key: 0x0031,
+            }
+        );
+        assert_eq!(
+            c.keybindings.workspace[9],
+            KeyCombo {
+                mods: MOD_SUPER,
+                key: 0x0030,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_valid_toml_overriding_defaults() {
+        let raw = "[general]\nborder_width = 4\ngaps = 6\nterminal = \"foot\"\n";
+        let c = Config::parse(raw).expect("valid toml");
+        assert_eq!(c.general.border_width, 4);
+        assert_eq!(c.general.gaps, 6);
+        assert_eq!(c.general.terminal, "foot");
+        // Unspecified sections keep their defaults.
+        assert_eq!(
+            c.keybindings.terminal,
+            KeyCombo {
+                mods: MOD_SUPER,
+                key: KEY_RETURN,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_toml() {
+        assert!(Config::parse("general = { border_width = ").is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_fields() {
+        assert!(Config::parse("[general]\nbogus = 1\n").is_err());
+        assert!(Config::parse("bogus_section = 1\n").is_err());
+    }
+
+    #[test]
+    fn reload_keeps_old_config_on_parse_error() {
+        let mut shared = Arc::new(Config::default());
+        let before = Arc::clone(&shared);
+        assert!(!Config::reload(&mut shared, "not [valid toml"));
+        assert!(Arc::ptr_eq(&shared, &before));
+        assert_eq!(shared.general.border_width, 2);
+    }
+
+    #[test]
+    fn reload_swaps_in_new_config() {
+        let mut shared = Arc::new(Config::default());
+        assert!(Config::reload(&mut shared, "[general]\nborder_width = 12\n"));
+        assert_eq!(shared.general.border_width, 12);
+        assert_eq!(shared.general.terminal, "alacritty"); // unset stays default
     }
 }

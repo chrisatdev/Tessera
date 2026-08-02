@@ -219,7 +219,7 @@ mod tests {
         // the only full queue is `slow` (deterministic drop accounting).
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-        let publisher = {
+        let _publisher = {
             let bus = Arc::clone(&bus);
             std::thread::spawn(move || {
                 for i in 0..40u32 {
