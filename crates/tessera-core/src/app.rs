@@ -700,4 +700,50 @@ mod tests {
         let state_rx = app.bus().state_rx();
         assert!(Arc::ptr_eq(&state_rx.borrow().config, &new_cfg));
     }
+
+    #[test]
+    fn spawn_failure_is_logged_and_the_loop_survives() {
+        // T13: a bogus terminal program must not take the WM down. Both
+        // spawn attempts are made, each failure is logged, and the loop runs
+        // to completion.
+        let mut cfg = Config::default();
+        cfg.general.terminal = "tessera-no-such-program-xyz".to_string();
+        let (mut app, log) = app_with(
+            vec![
+                Event::Command(Command::SpawnTerminal),
+                Event::Command(Command::SpawnTerminal),
+            ],
+            cfg,
+        );
+        app.run();
+        assert_eq!(
+            calls(&log),
+            vec![
+                DisplayCall::Spawn("tessera-no-such-program-xyz".to_string()),
+                DisplayCall::Spawn("tessera-no-such-program-xyz".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn spawn_success_does_not_stop_the_loop() {
+        // A successful spawn is a side effect, not a state change: the loop
+        // keeps processing the events that follow it.
+        let mut cfg = Config::default();
+        cfg.general.terminal = "/bin/true".to_string();
+        let (mut app, log) = app_with(
+            vec![
+                Event::Command(Command::SpawnTerminal),
+                Event::WindowMapRequested(1),
+            ],
+            cfg,
+        );
+        app.run();
+        let calls = calls(&log);
+        assert_eq!(
+            calls.first(),
+            Some(&DisplayCall::Spawn("/bin/true".to_string()))
+        );
+        assert!(calls.contains(&DisplayCall::Manage(1)));
+    }
 }

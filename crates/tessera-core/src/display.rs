@@ -67,13 +67,24 @@ pub trait DisplayServer {
     fn spawn(&self, prog: &str) -> Result<(), DErr>;
 }
 
+/// Spawns `prog` as a child process (T13, process boundary).
+///
+/// The program is resolved through `PATH` by [`std::process::Command`] — no
+/// shell, no string interpretation, no argument injection. The child inherits
+/// the WM's stdio and is not waited on. A failure (e.g. a bogus terminal
+/// program) is returned as [`DErr::Spawn`] so the caller logs it and the
+/// loop keeps running instead of crashing.
+pub fn spawn_program(prog: &str) -> Result<(), DErr> {
+    todo!("T13 spawn")
+}
+
 #[cfg(test)]
 pub(crate) mod test_double {
     //! Headless [`DisplayServer`] for loop tests (the U3 harness).
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
 
-    use super::{DErr, DisplayServer, FrameId};
+    use super::{DErr, DisplayServer, FrameId, spawn_program};
     use crate::event::Event;
     use crate::geometry::{Rect, WindowId};
 
@@ -187,7 +198,7 @@ pub(crate) mod test_double {
                 .lock()
                 .unwrap()
                 .push(DisplayCall::Spawn(prog.to_string()));
-            Ok(())
+            spawn_program(prog)
         }
     }
 }
@@ -235,5 +246,32 @@ mod tests {
         let (mut d, _log) = MockDisplay::new(vec![Event::WindowMapRequested(1)]);
         assert_eq!(d.next_event().unwrap(), Some(Event::WindowMapRequested(1)));
         assert_eq!(d.next_event().unwrap(), None);
+    }
+
+    #[test]
+    fn spawn_program_runs_an_absolute_path_without_a_shell() {
+        // A known binary via absolute path: spawned directly, no shell.
+        assert!(spawn_program("/bin/true").is_ok());
+    }
+
+    #[test]
+    fn spawn_program_uses_path_only_lookup() {
+        // A program that does not exist on PATH fails cleanly.
+        assert!(matches!(
+            spawn_program("tessera-no-such-program-xyz"),
+            Err(DErr::Spawn(_))
+        ));
+    }
+
+    #[test]
+    fn spawn_program_never_uses_a_shell() {
+        // Shell metacharacters are treated as a program NAME, never executed:
+        // the spawn must fail and nothing may be created. This proves there
+        // is no shell interpretation of the string.
+        let payload = "/tmp/opencode/tessera-no-shell-pwned";
+        let _ = std::fs::remove_file(payload);
+        let cmd = format!("echo hi > {payload}");
+        assert!(matches!(spawn_program(&cmd), Err(DErr::Spawn(_))));
+        assert!(!std::path::Path::new(payload).exists());
     }
 }
