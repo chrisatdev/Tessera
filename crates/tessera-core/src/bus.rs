@@ -159,6 +159,15 @@ mod tests {
         EventBus::new(Arc::new(Config::default()))
     }
 
+    fn state(current: WorkspaceId, focused: Option<WindowId>) -> WmState {
+        WmState {
+            current,
+            focused,
+            workspaces: Vec::new(),
+            config: Arc::new(Config::default()),
+        }
+    }
+
     #[test]
     fn subscribe_all_receives_every_event_in_order() {
         let bus = bus();
@@ -254,5 +263,25 @@ mod tests {
             }
         }
         assert_eq!(slow_events, (0..SUB_QUEUE_CAPACITY as u32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn state_rx_catches_up_to_latest_snapshot() {
+        let bus = bus();
+        bus.set_state(state(1, None));
+        let latest = state(2, Some(9));
+        bus.set_state(latest.clone());
+        // A late consumer sees the full current state, not the history.
+        let rx = bus.state_rx();
+        assert_eq!(rx.borrow(), latest);
+    }
+
+    #[test]
+    fn state_rx_follows_updates_for_existing_consumers() {
+        let bus = bus();
+        let rx = bus.state_rx();
+        let s = state(3, Some(5));
+        bus.set_state(s.clone());
+        assert_eq!(rx.borrow(), s);
     }
 }
