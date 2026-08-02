@@ -6,8 +6,78 @@
 //! it consumes [`WmState`] only, so it can be promoted to its own crate later
 //! (design: a `src/bar.rs` module in the binary crate for now).
 
-/// Snapshot consumer for the status bar (placeholder; T19).
-pub struct Bar;
+use tessera_core::bus::StateReceiver;
+use tessera_core::WmState;
+
+/// Snapshot consumer for the status bar (REQ-bus-004 / SC-bus-04).
+///
+/// Holds the latest [`WmState`] published on the watch and renders it as
+/// plain text. The actual X drawing is a later change; this placeholder owns
+/// the seam — it must NOT depend on X specifics, only consume [`WmState`].
+pub struct Bar {
+    /// The watch receiver; [`Bar::refresh`] pulls the newest snapshot from it.
+    state_rx: StateReceiver,
+    /// The complete current snapshot (SC-bus-04).
+    latest: WmState,
+}
+
+impl Bar {
+    /// Subscribes to the WmState watch and immediately captures the complete
+    /// current snapshot (SC-bus-04: a new consumer catches up to the full
+    /// current state, not the event history).
+    pub fn new(state_rx: StateReceiver) -> Self {
+        let latest = state_rx.borrow();
+        Bar { state_rx, latest }
+    }
+
+    /// The complete current snapshot the bar holds.
+    pub fn latest(&self) -> &WmState {
+        &self.latest
+    }
+
+    /// Pulls the newest snapshot from the watch. The core republishes state
+    /// after every placement change (`recompute` -> `publish_state`); in the
+    /// single-threaded binary this is called when the app re-reads state. A
+    /// blocking `changed()` consumer belongs to the real bar (later change).
+    pub fn refresh(&mut self) {
+        self.latest = self.state_rx.borrow();
+    }
+
+    /// A plain-text, render-ready line for the snapshot, e.g. `*1[2]:2,3 2:4`
+    /// (current workspace 1 focused on window 2 with windows 2,3, then
+    /// workspace 2 focused on window 4). The X drawing is a later change.
+    pub fn render(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for ws in &self.latest.workspaces {
+            let mut part = String::new();
+            if ws.id == self.latest.current {
+                part.push('*');
+            }
+            part.push_str(&ws.name);
+            if let Some(focus) = ws.focus {
+                part.push('[');
+                part.push_str(&focus.to_string());
+                part.push(']');
+            }
+            if !ws.windows.is_empty() {
+                part.push(':');
+                part.push_str(
+                    &ws.windows
+                        .iter()
+                        .map(|w| w.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            }
+            parts.push(part);
+        }
+        if parts.is_empty() {
+            "no workspaces".to_string()
+        } else {
+            parts.join(" ")
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

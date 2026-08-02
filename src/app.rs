@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use tessera_core::DErr;
+use tessera_core::{DErr, EventBus};
 
 /// Minimal CLI: `tessera [--config <path>] [--display <name>]`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -16,10 +16,14 @@ pub struct CliArgs {
 
 /// Wires core + x11 and runs the loop (T20).
 pub fn run(args: &CliArgs) -> Result<(), DErr> {
-    // T20: assemble X11Display + EventBus + App. The bar placeholder (T19)
-    // is referenced so its module stays live until the wiring lands.
+    // T20: assemble X11Display + EventBus + App. T19 seam proof: a Bar built
+    // from a live bus consumes the WmState watch (REQ-bus-004) — the real
+    // wiring replaces this throwaway bus with the App's bus.
     let _ = args.config_path.as_deref();
     let _ = args.display.as_deref();
-    let _ = std::mem::size_of::<crate::bar::Bar>();
+    let bus = EventBus::new(Default::default());
+    let mut bar = crate::bar::Bar::new(bus.state_rx());
+    bar.refresh();
+    let _ = (bar.latest(), bar.render());
     todo!("T20: assemble X11Display + EventBus + App")
 }
