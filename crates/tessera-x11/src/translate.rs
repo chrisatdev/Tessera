@@ -5,33 +5,64 @@
 //! deliberately connection-free (a pure function) so the full mapping is
 //! testable headless.
 
-use tessera_core::Event;
+use tessera_core::{Event, KeyCombo, Rect};
 
 /// Translates one raw X event, or `None` when the core has no use for it yet.
+///
+/// Mapped: MapRequest, ConfigureRequest, DestroyNotify, UnmapNotify (the
+/// lifecycle inputs of REQ-x11-005/006/007) and KeyPress (REQ-x11-008, with
+/// the raw keyCODE in [`KeyCombo::key`] — the keycode → keysym step belongs to
+/// keyboard.rs, T18). Recognized but deferred until U4-B (property titles,
+/// client messages, WM_S0 loss, keyboard map changes) are returned `None` and
+/// stay visible here instead of being swallowed by the wildcard arm.
 pub fn translate_event(raw: &x11rb::protocol::Event) -> Option<Event> {
-    let _ = raw;
-    todo!("T16: raw x11rb event -> core Event mapping")
+    match raw {
+        x11rb::protocol::Event::MapRequest(ev) => Some(Event::WindowMapRequested(ev.window)),
+        x11rb::protocol::Event::ConfigureRequest(ev) => Some(Event::WindowConfigureRequested(
+            ev.window,
+            Rect {
+                x: i32::from(ev.x),
+                y: i32::from(ev.y),
+                w: ev.width,
+                h: ev.height,
+            },
+        )),
+        x11rb::protocol::Event::DestroyNotify(ev) => Some(Event::WindowDestroyNotify(ev.window)),
+        x11rb::protocol::Event::UnmapNotify(ev) => Some(Event::WindowUnmapNotify(ev.window)),
+        x11rb::protocol::Event::KeyPress(ev) => Some(Event::KeyPressed(KeyCombo {
+            mods: u32::from(ev.state),
+            key: u32::from(ev.detail),
+        })),
+        // Recognized, deferred to U4-B (T18/T20): see the doc comment above.
+        x11rb::protocol::Event::PropertyNotify(_)
+        | x11rb::protocol::Event::ClientMessage(_)
+        | x11rb::protocol::Event::SelectionClear(_)
+        | x11rb::protocol::Event::MappingNotify(_) => None,
+        // Everything else (pointer, expose, notify, errors, ...): ignored.
+        _ => None,
+    }
 }
 
 /// Translates a batch of raw events in arrival order, dropping the ones the
 /// core ignores (REQ-x11-004 / SC-x11-06: each X event is translated and
 /// published in the order it arrived).
-pub fn translate_events<'a>(raw: impl IntoIterator<Item = &'a x11rb::protocol::Event>) -> Vec<Event> {
-    let _ = raw;
-    todo!("T16: ordered batch translation")
+pub fn translate_events<'a>(
+    raw: impl IntoIterator<Item = &'a x11rb::protocol::Event>,
+) -> Vec<Event> {
+    raw.into_iter().filter_map(translate_event).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use tessera_core::{Event, KeyCombo, Rect};
+    use x11rb::protocol::Event as RawEvent;
     use x11rb::protocol::xproto::{
         ButtonPressEvent, ClientMessageData, ClientMessageEvent, ConfigWindow,
-        ConfigureNotifyEvent, ConfigureRequestEvent, DestroyNotifyEvent, ExposeEvent,
-        KeyButMask, KeyPressEvent, MapNotifyEvent, MapRequestEvent, Mapping, MappingNotifyEvent,
-        Motion, MotionNotifyEvent, Property, PropertyNotifyEvent, ReparentNotifyEvent,
-        SelectionClearEvent, StackMode, UnmapNotifyEvent,
+        ConfigureNotifyEvent, ConfigureRequestEvent, DestroyNotifyEvent, ExposeEvent, KeyButMask,
+        KeyPressEvent, MapNotifyEvent, MapRequestEvent, Mapping, MappingNotifyEvent, Motion,
+        MotionNotifyEvent, Property, PropertyNotifyEvent, ReparentNotifyEvent, SelectionClearEvent,
+        StackMode, UnmapNotifyEvent,
     };
-    use x11rb::protocol::Event as RawEvent;
 
     use super::{translate_event, translate_events};
 
@@ -114,7 +145,12 @@ mod tests {
             translate_event(&configure_request(7, -5, 10, 800, 600)),
             Some(Event::WindowConfigureRequested(
                 7,
-                Rect { x: -5, y: 10, w: 800, h: 600 }
+                Rect {
+                    x: -5,
+                    y: 10,
+                    w: 800,
+                    h: 600
+                }
             ))
         );
     }
@@ -223,7 +259,11 @@ mod tests {
             }),
         ];
         for raw in &raw {
-            assert_eq!(translate_event(raw), None, "unrelated event must be skipped");
+            assert_eq!(
+                translate_event(raw),
+                None,
+                "unrelated event must be skipped"
+            );
         }
     }
 
@@ -268,7 +308,11 @@ mod tests {
             }),
         ];
         for raw in &raw {
-            assert_eq!(translate_event(raw), None, "deferred event must be skipped in v1");
+            assert_eq!(
+                translate_event(raw),
+                None,
+                "deferred event must be skipped in v1"
+            );
         }
     }
 
@@ -298,7 +342,15 @@ mod tests {
             translate_events(&batch),
             vec![
                 Event::WindowMapRequested(1),
-                Event::WindowConfigureRequested(2, Rect { x: 0, y: 0, w: 320, h: 240 }),
+                Event::WindowConfigureRequested(
+                    2,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        w: 320,
+                        h: 240
+                    }
+                ),
                 Event::WindowDestroyNotify(3),
                 Event::KeyPressed(KeyCombo { mods: 64, key: 38 }),
                 Event::WindowUnmapNotify(4),

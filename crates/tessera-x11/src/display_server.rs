@@ -22,7 +22,7 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::rust_connection::RustConnection;
 
-use crate::event_loop::root_event_mask;
+use crate::event_loop::{next_x11_event, root_event_mask};
 
 /// The x11rb display layer: one X connection plus the root window of the
 /// screen it was opened on.
@@ -168,7 +168,14 @@ impl DisplayServer for X11Display {
     }
 
     fn next_event(&mut self) -> Result<Option<Event>, DErr> {
-        todo!("T16: event loop over the x11rb connection")
+        // REQ-x11-004: a single-threaded loop over the X connection; D2 — raw
+        // events are translated here (event_loop + translate), so the core
+        // only ever sees typed Events. Ok(None) = connection closed.
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| DErr::X("connect() must succeed before next_event()".to_string()))?;
+        next_x11_event(conn)
     }
 
     fn manage(&mut self, _w: WindowId) -> Result<FrameId, DErr> {
@@ -215,8 +222,6 @@ impl DisplayServer for X11Display {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
-
-    use crate::event_loop::root_event_mask;
 
     use super::*;
 

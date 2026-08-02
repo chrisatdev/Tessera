@@ -25,17 +25,36 @@ pub fn root_event_mask() -> u32 {
 /// Classifies a `wait_for_event` failure: `Ok(())` means the connection
 /// closed (a clean end of loop, surfaced as `Ok(None)` by
 /// [`DisplayServer::next_event`]); `Err` is a fatal error to report.
+///
+/// A dead server surfaces as an I/O error on the blocked read (EOF/reset) —
+/// that is the trait's "connection closed" signal. Every other
+/// `ConnectionError` kind is a real failure the caller must log.
 pub(crate) fn classify_wait_error(err: ConnectionError) -> Result<(), DErr> {
-    let _ = err;
-    todo!("T16: closed-connection detection")
+    match err {
+        ConnectionError::IoError(_) => Ok(()),
+        other => Err(DErr::X(format!("x11 connection error: {other}"))),
+    }
 }
 
 /// Blocks for the next translated event. Raw events the core ignores are
 /// skipped and the loop keeps waiting; a dead connection ends the loop
 /// cleanly with `Ok(None)` (REQ-x11-004 / SC-x11-06).
 pub(crate) fn next_x11_event(conn: &RustConnection) -> Result<Option<Event>, DErr> {
-    let _ = conn;
-    todo!("T16: wait_for_event loop")
+    loop {
+        match conn.wait_for_event() {
+            Ok(raw) => {
+                if let Some(translated) = translate_event(&raw) {
+                    return Ok(Some(translated));
+                }
+                // An event the core does not act on: skip it and keep
+                // waiting for the next one.
+            }
+            Err(err) => {
+                classify_wait_error(err)?;
+                return Ok(None);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -49,8 +68,8 @@ mod tests {
         // SC-x11-05: the mask must contain BOTH bits — losing either one
         // breaks the WM (no MapRequest for new clients, or no destroy
         // tracking). Asserting the exact value guards both at once.
-        let expected = u32::from(EventMask::SUBSTRUCTURE_REDIRECT)
-            | u32::from(EventMask::SUBSTRUCTURE_NOTIFY);
+        let expected =
+            u32::from(EventMask::SUBSTRUCTURE_REDIRECT) | u32::from(EventMask::SUBSTRUCTURE_NOTIFY);
         assert_eq!(root_event_mask(), expected);
     }
 
