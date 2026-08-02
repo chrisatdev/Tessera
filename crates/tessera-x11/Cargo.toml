@@ -6,3 +6,5 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+tessera-core = { path = "../tessera-core" }
+x11rb = "0.14"
