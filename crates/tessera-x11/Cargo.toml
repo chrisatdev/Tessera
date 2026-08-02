@@ -7,4 +7,6 @@ license.workspace = true
 
 [dependencies]
 tessera-core = { path = "../tessera-core" }
-x11rb = "0.14"
+# "xtest" is only used by the gated integration test (T21) for the XTEST
+# keypress fallback; the library itself never touches the extension.
+x11rb = { version = "0.14", features = ["xtest"] }

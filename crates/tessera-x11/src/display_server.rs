@@ -496,6 +496,19 @@ mod tests {
     }
 
     #[test]
+    fn root_size_requires_a_connection_first() {
+        // T21: the tiling area must come from the real root window geometry.
+        // Querying it before connect is an error, never a panic on a missing
+        // connection (same guard shape as claim_wm/next_event).
+        let mut d = X11Display::new(None);
+        let err = d.root_size().unwrap_err();
+        assert!(
+            matches!(err, DErr::X(ref msg) if msg.contains("connect")),
+            "expected an error mentioning connect, got {err:?}"
+        );
+    }
+
+    #[test]
     fn connect_fails_with_x_error_for_unreachable_display() {
         // SC-x11-02 seam: a display number with no server behind it fails the
         // REAL x11rb connect (instant socket error, no X server needed), and
