@@ -15,6 +15,7 @@
 //! in U5.
 
 use tessera_core::{DErr, DisplayServer, Event, FrameId, Rect, WindowId};
+use x11rb::connection::Connection;
 use x11rb::errors::ConnectError;
 use x11rb::protocol::xproto::Window;
 use x11rb::rust_connection::RustConnection;
@@ -48,13 +49,24 @@ impl X11Display {
 fn map_connect_error(display: Option<&str>, err: ConnectError) -> DErr {
     match display {
         Some(name) => DErr::X(format!("cannot connect to display '{name}': {err}")),
-        None => DErr::X(format!("cannot connect to X display (check $DISPLAY): {err}")),
+        None => DErr::X(format!(
+            "cannot connect to X display (check $DISPLAY): {err}"
+        )),
     }
 }
 
 impl DisplayServer for X11Display {
     fn connect(&mut self) -> Result<(), DErr> {
-        todo!("T14: x11rb connect + error mapping")
+        // REQ-x11-001: open the display; an unreachable display maps every
+        // ConnectError kind into DErr::X (SC-x11-02) so startup aborts with a
+        // non-zero exit instead of proceeding without a display.
+        let name = self.display_name.as_deref();
+        let (conn, screen_num) =
+            x11rb::connect(name).map_err(|err| map_connect_error(name, err))?;
+        let root = conn.setup().roots[screen_num].root;
+        self.conn = Some(conn);
+        self.root = root;
+        Ok(())
     }
 
     fn claim_wm(&mut self) -> Result<(), DErr> {
@@ -66,9 +78,7 @@ impl DisplayServer for X11Display {
     }
 
     fn manage(&mut self, _w: WindowId) -> Result<FrameId, DErr> {
-        Err(DErr::X(
-            "manage: frames are U4 part B (T17)".to_string(),
-        ))
+        Err(DErr::X("manage: frames are U4 part B (T17)".to_string()))
     }
 
     fn map_window(&mut self, _w: WindowId) -> Result<(), DErr> {
@@ -84,9 +94,7 @@ impl DisplayServer for X11Display {
     }
 
     fn configure(&mut self, _w: WindowId, _r: Rect) -> Result<(), DErr> {
-        Err(DErr::X(
-            "configure: frames are U4 part B (T17)".to_string(),
-        ))
+        Err(DErr::X("configure: frames are U4 part B (T17)".to_string()))
     }
 
     fn focus_window(&mut self, _w: WindowId) -> Result<(), DErr> {
@@ -102,9 +110,7 @@ impl DisplayServer for X11Display {
     }
 
     fn set_desktops(&mut self, _n: u32, _cur: u32, _names: &[String]) -> Result<(), DErr> {
-        Err(DErr::X(
-            "set_desktops: EWMH is U4 part B (T18)".to_string(),
-        ))
+        Err(DErr::X("set_desktops: EWMH is U4 part B (T18)".to_string()))
     }
 
     fn spawn(&self, prog: &str) -> Result<(), DErr> {
@@ -121,10 +127,12 @@ mod tests {
         // SC-x11-02 seam: a display number with no server behind it fails the
         // REAL x11rb connect (instant socket error, no X server needed), and
         // connect() must map that into DErr::X — the abort signal for startup.
-        let mut d = X11Display::new(Some(":65534"));
+        // NOTE: the display number stays < 59536 so x11rb's `6000 + display`
+        // port arithmetic cannot overflow u16.
+        let mut d = X11Display::new(Some(":59534"));
         let err = d.connect().unwrap_err();
         assert!(
-            matches!(err, DErr::X(ref msg) if msg.contains(":65534")),
+            matches!(err, DErr::X(ref msg) if msg.contains(":59534")),
             "expected DErr::X naming the display, got {err:?}"
         );
     }
