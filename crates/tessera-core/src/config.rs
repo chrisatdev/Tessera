@@ -39,6 +39,10 @@ pub struct GeneralConfig {
     pub gaps: u32,
     #[serde(default = "default_terminal")]
     pub terminal: String,
+    /// Optional path to a `theme.toml` (REQ-thm-003). `None` -> embedded
+    /// ayu_dark, no file read; `Some(path)` is resolved at startup.
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 impl Default for GeneralConfig {
@@ -47,6 +51,7 @@ impl Default for GeneralConfig {
             border_width: default_border_width(),
             gaps: default_gaps(),
             terminal: default_terminal(),
+            theme: None,
         }
     }
 }
