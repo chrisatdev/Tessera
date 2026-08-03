@@ -61,17 +61,21 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, String> {
 ///
 /// `None` -> the embedded ayu_dark palette, and no theme file is read
 /// (SC-thm-06). `Some(path)` -> the file at `path` is loaded and its values
-/// take effect (SC-thm-07). A missing or unparseable file is the T9 seam:
-/// the ratified policy (decision #1281) falls back to ayu_dark with a
-/// warning instead of aborting startup.
+/// take effect (SC-thm-07). A missing or unparseable file NEVER aborts
+/// startup: the WM warns and falls back to the embedded ayu_dark palette
+/// (ratified decision #1281 — overrides SC-thm-08/D6 abort semantics).
 pub fn resolve_theme(config: &Config) -> Theme {
     match config.general.theme.as_deref() {
         None => Theme::default(),
         Some(path) => match Theme::load(Path::new(path)) {
             Ok(theme) => theme,
-            // T9 replaces this placeholder with the fallback + warning
-            // policy ratified in decision #1281 (no startup abort).
-            Err(err) => panic!("cannot load theme {path:?}: {err:?}"),
+            Err(err) => {
+                eprintln!(
+                    "tessera: warning: cannot load theme {path:?} ({err:?}); \
+                     falling back to the embedded ayu_dark theme"
+                );
+                Theme::default()
+            }
         },
     }
 }
@@ -87,11 +91,19 @@ pub fn run(args: &CliArgs) -> Result<(), DErr> {
     // Config: explicit file, or defaults. A bad file aborts startup (there is
     // no previous config at boot to keep — D6 covers reloads only).
     let config = Arc::new(load_config(args.config_path.as_deref()).map_err(DErr::X)?);
+    // REQ-thm-003: the theme is resolved ONCE at startup (T8). A custom
+    // `theme = "path"` that is missing or unparseable falls back to the
+    // embedded ayu_dark with a warning — startup never aborts (T9, ratified
+    // decision #1281, overrides SC-thm-08).
+    let theme = Arc::new(resolve_theme(&config));
     // The X layer needs the real keybindings (and border) BEFORE claim_wm
     // grabs them (U4-B note); defaults match anyway, but an explicit config
     // must win.
     let mut x11 = X11Display::new(args.display.as_deref());
     x11.set_config(Arc::clone(&config));
+    // The X layer paints the resolved theme's borders (T9, D4): set_theme
+    // must run before claim_wm so managed frames use the right pixels.
+    x11.set_theme(Arc::clone(&theme));
     // REQ-x11-001: an unreachable display aborts startup (SC-x11-02).
     x11.connect()?;
     // REQ-x11-002: another WM owning WM_S0 aborts startup (SC-x11-04).
@@ -100,10 +112,9 @@ pub fn run(args: &CliArgs) -> Result<(), DErr> {
     // window after connect (replaces the hardcoded 1920x1080 const).
     let area = x11.root_size()?;
     // SC-x11-01: connected and claimed -> the core loop runs.
-    // T4 seam (D4): the theme rides through App::new into the WmState watch.
-    // T9 replaces the default with `config.general.theme` resolution
-    // (fallback + warning per decision #1281) before claim_wm.
-    let mut app = App::new(Box::new(x11), config, Arc::new(Theme::default()), area);
+    // T4 seam (D4): the resolved theme rides through App::new into the
+    // WmState watch; the X layer already holds the same Arc (dual injection).
+    let mut app = App::new(Box::new(x11), config, theme, area);
     // T19: the bar subscribes to the WmState watch and catches up to the
     // complete current snapshot (SC-bus-04). The watch is live during run();
     // refresh() after the loop reads the final snapshot it carried.
@@ -288,7 +299,11 @@ mod tests {
         let _ = std::fs::remove_file(&theme_file);
         assert_eq!(theme, Theme::default());
         assert_eq!(
-            (theme.active_border().r, theme.active_border().g, theme.active_border().b),
+            (
+                theme.active_border().r,
+                theme.active_border().g,
+                theme.active_border().b
+            ),
             (0xFF, 0x8F, 0x40),
             "the fallback must keep the ayu derived borders"
         );
