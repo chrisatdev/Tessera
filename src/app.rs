@@ -57,6 +57,25 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, String> {
     }
 }
 
+/// Resolves the startup theme from `config.general.theme` (REQ-thm-003).
+///
+/// `None` -> the embedded ayu_dark palette, and no theme file is read
+/// (SC-thm-06). `Some(path)` -> the file at `path` is loaded and its values
+/// take effect (SC-thm-07). A missing or unparseable file is the T9 seam:
+/// the ratified policy (decision #1281) falls back to ayu_dark with a
+/// warning instead of aborting startup.
+pub fn resolve_theme(config: &Config) -> Theme {
+    match config.general.theme.as_deref() {
+        None => Theme::default(),
+        Some(path) => match Theme::load(Path::new(path)) {
+            Ok(theme) => theme,
+            // T9 replaces this placeholder with the fallback + warning
+            // policy ratified in decision #1281 (no startup abort).
+            Err(err) => panic!("cannot load theme {path:?}: {err:?}"),
+        },
+    }
+}
+
 /// Wires core + x11 (+ the bar placeholder) and runs the loop (SC-x11-01).
 ///
 /// Startup aborts with `Err` when the display is unreachable (REQ-x11-001,
