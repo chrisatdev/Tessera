@@ -1,0 +1,29 @@
+# Canonical ayu_dark palette — the embedded default theme, as a reference file.
+#
+# Point config.toml at it (or at a copy with your overrides):
+#
+#   [general]
+#   theme = "themes/ayu_dark.toml"
+#
+# Every key is optional. A missing key falls back to the embedded ayu_dark
+# value for that field (lenient per-field fallback); unknown keys are
+# rejected. A file that is missing or cannot be parsed never aborts startup:
+# the WM prints a warning and falls back to the whole embedded ayu_dark
+# palette.
+
+background = "#0A0E14"
+foreground = "#B3B1AD"
+comment = "#626A73"
+accent = "#FF8F40"
+yellow = "#E6B450"
+blue = "#39BAE6"
+cyan = "#95E6CB"
+green = "#AAD94C"
+magenta = "#D2A6FF"
+red = "#F25358"
+
+# Frame border colours: focused frames paint `active_border`, unfocused
+# frames paint `inactive_border`. When absent they derive from `accent` and
+# `comment` respectively.
+active_border = "#FF8F40"
+inactive_border = "#626A73"
