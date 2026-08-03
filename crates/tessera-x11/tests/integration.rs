@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    Atom, ConnectionExt, CreateWindowAux, GetGeometryReply, MapState, Window, WindowClass,
+    Atom, ConnectionExt, CreateWindowAux, GetGeometryReply, ImageFormat, MapState, Window,
+    WindowClass,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
@@ -42,6 +43,11 @@ const SUPER_L: u32 = 0xffeb;
 /// Default frame border (`config.general.border_width`), baked into every
 /// layout placement.
 const BORDER: u16 = 2;
+/// ayu_dark (the embedded default theme): focused-frame border pixel =
+/// accent `#FF8F40`, unfocused = comment `#626A73`, packed into the low
+/// 24 bits (SC-thm-09).
+const AYU_ACTIVE_PIXEL: u32 = 0x00FF_8F40;
+const AYU_INACTIVE_PIXEL: u32 = 0x0062_6A73;
 /// A window geometry `(x, y, width, height)` as reported by `get_geometry`.
 type Geom = (i16, i16, u16, u16);
 /// Time budget for every polled assertion.
@@ -167,6 +173,24 @@ fn map_state(conn: &RustConnection, w: Window) -> MapState {
 fn frame_is(conn: &RustConnection, w: Window, expect: Geom) -> bool {
     let g = geom(conn, w);
     (g.x, g.y, g.width, g.height) == expect
+}
+
+/// The border pixel of `frame` as it is actually drawn on the root — the
+/// true "themed border visible on screen" check (REQ-x11-005 modified). The
+/// X11 GetWindowAttributes reply does not carry the border colour, and a
+/// window's border is not part of its own drawable image, so the root image
+/// is sampled at the frame's outer corner (frames are direct root children,
+/// so their geometry is root-relative). ZPixmap at 24-bit depth is 32bpp,
+/// LSB-first `[B, G, R, pad]`.
+fn border_pixel(conn: &RustConnection, frame: Window) -> u32 {
+    let g = geom(conn, frame);
+    let img = conn
+        .get_image(ImageFormat::Z_PIXMAP, root_of(conn), g.x, g.y, 1, 1, 0xFFFF_FFFF)
+        .unwrap()
+        .reply()
+        .unwrap();
+    let (b, g_, r) = (img.data[0] as u32, img.data[1] as u32, img.data[2] as u32);
+    (r << 16) | (g_ << 8) | b
 }
 
 /// Expected master/stack placement rects under the default layout (ratio 0.5,
@@ -400,4 +424,122 @@ fn map_request_tiles_to_real_geometry_and_keys_drive_focus_and_switch() {
         wm.alive(),
         "the WM must survive an unknown-workspace switch"
     );
+}
+
+#[test]
+#[ignore]
+fn themed_borders_paint_active_and_inactive_and_repaint_on_focus() {
+    // SC-thm-09 + SC-x11-13 at the real X server: with the embedded ayu_dark
+    // default (no --config), the focused frame's border is the accent pixel
+    // and the unfocused frame's is the comment pixel; moving focus repaints
+    // the old frame inactive and the new frame active — the pixels swap.
+    let display = display_name();
+    let mut wm = WmChild::spawn(&display);
+    let conn = connect(&display);
+    let root = root_of(&conn);
+    let screen = &conn.setup().roots[0];
+
+    // The WM must own WM_S0 before it manages anything (SC-x11-03/04).
+    let wm_s0 = intern(&conn, b"WM_S0");
+    wait_until("the WM to own WM_S0", || {
+        conn.get_selection_owner(wm_s0)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .owner
+            == root
+    });
+    assert!(wm.alive(), "the WM must keep running after claiming WM_S0");
+
+    // The most recently mapped window is focused, so B's frame is the active
+    // one and A's is inactive (REQ-x11-005 modified).
+    let a = map_client(&conn, root, screen.root_depth, screen.root_visual);
+    let b = map_client(&conn, root, screen.root_depth, screen.root_visual);
+    wait_until("both clients to be reparented into frames", || {
+        parent_of(&conn, a) != root
+            && parent_of(&conn, b) != root
+            && parent_of(&conn, a) != parent_of(&conn, b)
+    });
+    let fa = parent_of(&conn, a);
+    let fb = parent_of(&conn, b);
+
+    // The default ayu_dark borders reach the server: focused = accent,
+    // unfocused = comment, and they differ (SC-thm-09).
+    wait_until("the frames to carry the themed border pixels", || {
+        border_pixel(&conn, fb) == AYU_ACTIVE_PIXEL
+            && border_pixel(&conn, fa) == AYU_INACTIVE_PIXEL
+    });
+
+    // Super+J moves focus to A: A's frame repaints active and B's inactive
+    // (SC-x11-13 through the real keypress + grab + repaint path).
+    press_super(&conn, KEY_J, "j", "focus_next");
+    wait_until("the focus change to repaint both border pixels", || {
+        border_pixel(&conn, fa) == AYU_ACTIVE_PIXEL
+            && border_pixel(&conn, fb) == AYU_INACTIVE_PIXEL
+    });
+}
+
+#[test]
+#[ignore]
+fn custom_theme_file_overrides_frame_border_pixels() {
+    // SC-thm-07/10 at the real X server: a config `theme = "path"` makes the
+    // WM paint the explicit border keys from that file, replacing the
+    // ayu_dark derived defaults (focused = #FF0000, unfocused = #00FF00).
+    let display = display_name();
+    let theme = std::env::temp_dir().join(format!(
+        "tessera-e2e-custom-theme-{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &theme,
+        "active_border = \"#FF0000\"\ninactive_border = \"#00FF00\"\n",
+    )
+    .expect("write the custom theme file");
+    let config = std::env::temp_dir().join(format!(
+        "tessera-e2e-custom-config-{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &config,
+        format!("[general]\ntheme = {:?}\n", theme.to_string_lossy()),
+    )
+    .expect("write the config referencing the custom theme");
+
+    let mut wm = WmChild::spawn_with_config(&display, Some(&config));
+    let conn = connect(&display);
+    let root = root_of(&conn);
+    let screen = &conn.setup().roots[0];
+
+    let wm_s0 = intern(&conn, b"WM_S0");
+    wait_until("the WM to own WM_S0", || {
+        conn.get_selection_owner(wm_s0)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .owner
+            == root
+    });
+    assert!(wm.alive(), "the WM must keep running after claiming WM_S0");
+
+    let a = map_client(&conn, root, screen.root_depth, screen.root_visual);
+    let b = map_client(&conn, root, screen.root_depth, screen.root_visual);
+    wait_until("both clients to be reparented into frames", || {
+        parent_of(&conn, a) != root && parent_of(&conn, b) != root
+    });
+    let fa = parent_of(&conn, a);
+    let fb = parent_of(&conn, b);
+
+    // The custom theme's explicit border keys replace the derived defaults
+    // (SC-thm-10): focused = #FF0000, unfocused = #00FF00 — NOT the ayu
+    // accent/comment pixels.
+    wait_until("the frames to carry the custom border pixels", || {
+        border_pixel(&conn, fb) == 0x00FF_0000 && border_pixel(&conn, fa) == 0x0000_FF00
+    });
+    assert!(
+        border_pixel(&conn, fb) != AYU_ACTIVE_PIXEL,
+        "the custom active border must replace the ayu default"
+    );
+
+    let _ = std::fs::remove_file(&theme);
+    let _ = std::fs::remove_file(&config);
 }
