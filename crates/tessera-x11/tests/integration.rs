@@ -88,18 +88,31 @@ fn wm_binary() -> PathBuf {
 struct WmChild(Child);
 
 impl WmChild {
-    /// Spawns the binary on `display` with detached stdio (its eprintln
-    /// chatter must not share the test harness pipes).
+    /// Spawns the binary on `display` with the default config.
     fn spawn(display: &str) -> WmChild {
+        Self::spawn_with_config(display, None)
+    }
+
+    /// Spawns the binary on `display`, optionally passing `--config <path>`
+    /// (T10: the themed-border tests drive a custom theme through a config
+    /// file). Detached stdio keeps the WM's eprintln chatter out of the test
+    /// harness pipes.
+    fn spawn_with_config(display: &str, config: Option<&Path>) -> WmChild {
+        // The previous test's WM must have released WM_S0 before a new WM
+        // claims it (the server clears the selection asynchronously).
+        wait_for_wm_s0_release(display);
         let bin = wm_binary();
         assert!(
             bin.exists(),
             "build the binary first: cargo build (missing {})",
             bin.display()
         );
-        let child = ProcCommand::new(&bin)
-            .arg("--display")
-            .arg(display)
+        let mut cmd = ProcCommand::new(&bin);
+        cmd.arg("--display").arg(display);
+        if let Some(path) = config {
+            cmd.arg("--config").arg(path);
+        }
+        let child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -134,10 +147,42 @@ fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
 }
 
 /// A second x11rb test client connection to the same X server.
+///
+/// Retried with a short backoff: Xvfb can transiently reset a fresh
+/// connection while it is still tearing down the previous test's killed WM
+/// (a pre-existing gated-suite flake — the handshake succeeds on retry).
 fn connect(display: &str) -> RustConnection {
-    x11rb::connect(Some(display))
-        .unwrap_or_else(|err| panic!("test client cannot connect to {display}: {err}"))
-        .0
+    let mut last_error = None;
+    for _ in 0..5 {
+        match x11rb::connect(Some(display)) {
+            Ok((conn, _)) => return conn,
+            Err(err) => {
+                last_error = Some(err);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    panic!("test client cannot connect to {display}: {last_error:?}");
+}
+
+/// Waits until no client owns WM_S0 — i.e. the previous test's WM has been
+/// fully torn down. The server clears a killed client's selection
+/// asynchronously with its connection close, and a WM spawned into that
+/// window would abort its claim (SC-x11-04) and exit before its assertions
+/// start (a pre-existing gated-suite flake: "timed out waiting for the WM
+/// to own WM_S0").
+fn wait_for_wm_s0_release(display: &str) {
+    let probe = connect(display);
+    let wm_s0 = intern(&probe, b"WM_S0");
+    wait_until("the previous WM to release WM_S0", || {
+        probe
+            .get_selection_owner(wm_s0)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .owner
+            == 0
+    });
 }
 
 /// The root window of the connected screen.
@@ -185,7 +230,15 @@ fn frame_is(conn: &RustConnection, w: Window, expect: Geom) -> bool {
 fn border_pixel(conn: &RustConnection, frame: Window) -> u32 {
     let g = geom(conn, frame);
     let img = conn
-        .get_image(ImageFormat::Z_PIXMAP, root_of(conn), g.x, g.y, 1, 1, 0xFFFF_FFFF)
+        .get_image(
+            ImageFormat::Z_PIXMAP,
+            root_of(conn),
+            g.x,
+            g.y,
+            1,
+            1,
+            0xFFFF_FFFF,
+        )
         .unwrap()
         .reply()
         .unwrap();
@@ -466,16 +519,14 @@ fn themed_borders_paint_active_and_inactive_and_repaint_on_focus() {
     // The default ayu_dark borders reach the server: focused = accent,
     // unfocused = comment, and they differ (SC-thm-09).
     wait_until("the frames to carry the themed border pixels", || {
-        border_pixel(&conn, fb) == AYU_ACTIVE_PIXEL
-            && border_pixel(&conn, fa) == AYU_INACTIVE_PIXEL
+        border_pixel(&conn, fb) == AYU_ACTIVE_PIXEL && border_pixel(&conn, fa) == AYU_INACTIVE_PIXEL
     });
 
     // Super+J moves focus to A: A's frame repaints active and B's inactive
     // (SC-x11-13 through the real keypress + grab + repaint path).
     press_super(&conn, KEY_J, "j", "focus_next");
     wait_until("the focus change to repaint both border pixels", || {
-        border_pixel(&conn, fa) == AYU_ACTIVE_PIXEL
-            && border_pixel(&conn, fb) == AYU_INACTIVE_PIXEL
+        border_pixel(&conn, fa) == AYU_ACTIVE_PIXEL && border_pixel(&conn, fb) == AYU_INACTIVE_PIXEL
     });
 }
 
