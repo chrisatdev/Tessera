@@ -45,8 +45,15 @@ pub struct X11Display {
     /// The config the X layer needs: frame border width (T17) and the
     /// keybindings to grab (T18). Defaults until [`X11Display::set_config`].
     config: Arc<Config>,
+    /// The theme the frame layer paints from (T6/T7): active/inactive border
+    /// pixels. Defaults to the embedded ayu_dark until
+    /// [`X11Display::set_theme`] (REQ-x11-005 modified).
+    theme: Arc<Theme>,
     /// Frame window id created per managed client (`manage`, T17).
     frames: HashMap<WindowId, FrameId>,
+    /// The currently focused client, if any — repaint target for the
+    /// previous frame when focus moves (D5, SC-x11-13).
+    focused: Option<WindowId>,
     /// Cached keycode → keysym mapping, loaded during `claim_wm` (T18).
     keyboard: Option<keyboard::Keymap>,
 }
@@ -62,7 +69,9 @@ impl X11Display {
             depth: 0,
             visual: 0,
             config: Arc::new(Config::default()),
+            theme: Arc::new(Theme::default()),
             frames: HashMap::new(),
+            focused: None,
             keyboard: None,
         }
     }
@@ -71,6 +80,26 @@ impl X11Display {
     /// keybindings grabbed during `claim_wm` (T18). Defaults until called.
     pub fn set_config(&mut self, config: Arc<Config>) {
         self.config = config;
+    }
+
+    /// Replaces the theme the X layer paints from (T7): the active/inactive
+    /// border pixels for frame creation and focus repaints (D4 — mirrors
+    /// [`X11Display::set_config`]; the [`DisplayServer`] trait stays theme-free
+    /// so the pure core never depends on X). Defaults to ayu_dark until called.
+    pub fn set_theme(&mut self, theme: Arc<Theme>) {
+        self.theme = theme;
+    }
+
+    /// The X pixel of the focused-frame border (REQ-x11-005 modified):
+    /// the theme's active border colour packed into the low 24 bits (D2).
+    fn active_border_pixel(&self) -> u32 {
+        frames::pixel(self.theme.active_border())
+    }
+
+    /// The X pixel of the unfocused-frame border (REQ-x11-005 modified):
+    /// the theme's inactive border colour packed into the low 24 bits (D2).
+    fn inactive_border_pixel(&self) -> u32 {
+        frames::pixel(self.theme.inactive_border())
     }
 
     /// The frame of client `w`, or an error when the client was never managed
@@ -267,15 +296,14 @@ impl DisplayServer for X11Display {
     fn manage(&mut self, w: WindowId) -> Result<FrameId, DErr> {
         // REQ-x11-005 / SC-x11-07: reparent `w` into a fresh border-only frame
         // and remember the client -> frame mapping (frames.rs, T17). The frame
-        // is created with the theme's active border pixel (T6/T7: pixel
-        // threading lives in frames.rs; the stored theme replaces the default
-        // below in T7 via active_border_pixel()).
+        // is created with the theme's active border pixel (REQ-x11-005
+        // modified) so a freshly managed client starts focused-coloured.
         let conn = self
             .conn
             .as_ref()
             .ok_or_else(|| DErr::X("connect() must succeed before manage()".to_string()))?;
         let border = u16::try_from(self.config.general.border_width).unwrap_or(u16::MAX);
-        let active_pixel = frames::pixel(Theme::default().active_border());
+        let active_pixel = self.active_border_pixel();
         let frame = frames::create_frame(
             conn,
             self.root,
@@ -320,10 +348,19 @@ impl DisplayServer for X11Display {
     }
 
     fn focus_window(&mut self, w: WindowId) -> Result<(), DErr> {
+        // REQ-x11-005 (modified) / SC-x11-13: on a focus change the previously
+        // focused frame repaints inactive and the newly focused frame repaints
+        // active, then input focus moves to the client (D5 — X11Display owns
+        // `focused`, so the repaint is local, no trait/bus change).
         let conn = self
             .conn
             .as_ref()
             .ok_or_else(|| DErr::X("connect() must succeed before focus_window()".to_string()))?;
+        let previous = self.focused;
+        let active = self.active_border_pixel();
+        let inactive = self.inactive_border_pixel();
+        frames::repaint_focus(conn, &self.frames, previous, w, active, inactive)?;
+        self.focused = Some(w);
         frames::focus_client(conn, w)
     }
 
