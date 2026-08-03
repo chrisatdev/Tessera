@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tessera_core::{App, Config, DErr, DisplayServer};
+use tessera_core::{App, Config, DErr, DisplayServer, Theme};
 use tessera_x11::X11Display;
 
 use crate::bar::Bar;
@@ -81,7 +81,10 @@ pub fn run(args: &CliArgs) -> Result<(), DErr> {
     // window after connect (replaces the hardcoded 1920x1080 const).
     let area = x11.root_size()?;
     // SC-x11-01: connected and claimed -> the core loop runs.
-    let mut app = App::new(Box::new(x11), config, area);
+    // T4 seam (D4): the theme rides through App::new into the WmState watch.
+    // T9 replaces the default with `config.general.theme` resolution
+    // (fallback + warning per decision #1281) before claim_wm.
+    let mut app = App::new(Box::new(x11), config, Arc::new(Theme::default()), area);
     // T19: the bar subscribes to the WmState watch and catches up to the
     // complete current snapshot (SC-bus-04). The watch is live during run();
     // refresh() after the loop reads the final snapshot it carried.

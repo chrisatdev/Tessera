@@ -8,6 +8,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use crate::config::Config;
 use crate::event::Event;
 use crate::geometry::{LayoutKind, WindowId, WorkspaceId};
+use crate::theme::Theme;
 use crate::watch;
 
 /// Bitmask over [`Event`] variants used by [`EventBus::subscribe`].
@@ -77,6 +78,9 @@ pub struct WmState {
     pub focused: Option<WindowId>,
     pub workspaces: Vec<WorkspaceState>,
     pub config: Arc<Config>,
+    /// Resolved theme (D4): the palette the bar / Change-2 reads from the
+    /// watch; injected at startup, never mutated after.
+    pub theme: Arc<Theme>,
 }
 
 /// Per-subscriber bounded channels plus the WmState watch (design D4).
@@ -92,18 +96,20 @@ pub type StateReceiver = watch::Receiver<WmState>;
 const SUB_QUEUE_CAPACITY: usize = 16;
 
 impl EventBus {
-    /// Creates a bus with an initial empty [`WmState`] snapshot.
+    /// Creates a bus with an initial empty [`WmState`] snapshot seeded with
+    /// `config` and the resolved `theme` (D4 dual-injection seam).
     ///
     /// The initial current workspace is `0` = "no workspace yet", the same
     /// sentinel as [`WorkspaceManager::current_id`] (reconciled in T12; U1
     /// shipped `current: 1` as a placeholder). Once the first window
     /// auto-opens a workspace, both report the real id (>= 1).
-    pub fn new(config: Arc<Config>) -> Self {
+    pub fn new(config: Arc<Config>, theme: Arc<Theme>) -> Self {
         let initial = WmState {
             current: 0,
             focused: None,
             workspaces: Vec::new(),
             config,
+            theme,
         };
         let (watch_tx, _watch_rx) = watch::Sender::new(initial);
         EventBus {
@@ -162,7 +168,7 @@ mod tests {
     use super::*;
 
     fn bus() -> EventBus {
-        EventBus::new(Arc::new(Config::default()))
+        EventBus::new(Arc::new(Config::default()), Arc::new(Theme::default()))
     }
 
     fn state(current: WorkspaceId, focused: Option<WindowId>) -> WmState {
@@ -171,6 +177,7 @@ mod tests {
             focused,
             workspaces: Vec::new(),
             config: Arc::new(Config::default()),
+            theme: Arc::new(Theme::default()),
         }
     }
 
