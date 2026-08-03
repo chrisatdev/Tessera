@@ -109,6 +109,14 @@ mod tests {
         path
     }
 
+    /// Writes `contents` to a uniquely named temp theme file and returns
+    /// its path (the caller removes it after the assertion).
+    fn theme_path(name: &str, contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("{name}-{}.toml", std::process::id()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
     #[test]
     fn load_config_reads_the_file_at_the_given_path() {
         let path = config_path(
@@ -175,5 +183,60 @@ mod tests {
     fn parse_rejects_unknown_flags_and_missing_values() {
         assert!(CliArgs::parse(["--bogus".to_string()]).is_err());
         assert!(CliArgs::parse(["--config".to_string()]).is_err()); // value missing
+    }
+
+    #[test]
+    fn resolve_theme_uses_embedded_ayu_dark_without_a_theme_path() {
+        // SC-thm-06: config without `theme` -> the embedded ayu_dark is used
+        // and NO file is read (the None branch never touches the filesystem).
+        let cfg = Config::default();
+        assert_eq!(cfg.general.theme, None);
+        let theme = resolve_theme(&cfg);
+        assert_eq!(theme, Theme::default());
+        // The borders derive from the ayu palette (SC-thm-09).
+        assert_eq!(
+            (
+                theme.active_border().r,
+                theme.active_border().g,
+                theme.active_border().b
+            ),
+            (0xFF, 0x8F, 0x40),
+            "focused border must derive from the ayu accent"
+        );
+        assert_eq!(
+            (
+                theme.inactive_border().r,
+                theme.inactive_border().g,
+                theme.inactive_border().b
+            ),
+            (0x62, 0x6A, 0x73),
+            "unfocused border must derive from the ayu comment"
+        );
+    }
+
+    #[test]
+    fn resolve_theme_loads_the_file_at_the_configured_path() {
+        // SC-thm-07: `theme = "path"` -> the file is loaded and its values
+        // take effect; fields the file leaves unset stay on ayu_dark.
+        let theme_file = theme_path("tessera-theme-ok", "red = \"#F07178\"\n");
+        let mut cfg = Config::default();
+        cfg.general.theme = Some(theme_file.to_string_lossy().into_owned());
+        let theme = resolve_theme(&cfg);
+        let _ = std::fs::remove_file(&theme_file);
+        assert_eq!(
+            (theme.red.r, theme.red.g, theme.red.b),
+            (0xF0, 0x71, 0x78),
+            "the file's red must override the ayu_dark default"
+        );
+        assert_eq!(
+            theme.background,
+            Theme::default().background,
+            "an unset field must stay on the ayu_dark default"
+        );
+        assert_eq!(
+            theme.active_border(),
+            Theme::default().active_border(),
+            "an unset border must derive from the ayu accent"
+        );
     }
 }
