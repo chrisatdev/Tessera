@@ -4,6 +4,10 @@
 //! and reusable by every X-facing consumer (frames, the future bar). Parsing is
 //! validated once at load time: bad hex is a parse error, never a silent default.
 
+use std::path::Path;
+
+use serde::{Deserialize, Deserializer, de};
+
 /// A single RGB colour, parsed from a `#RRGGBB` hex string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color {
@@ -42,31 +46,70 @@ impl Color {
     }
 }
 
+impl<'de> Deserialize<'de> for Color {
+    /// Deserializes a `#RRGGBB` string into a [`Color`]; any other shape is a
+    /// deserialize error, surfacing through `Theme::parse` as `ThemeError::Parse`.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Color::parse_hex(&raw).map_err(de::Error::custom)
+    }
+}
+
 /// Theme palette: the 10 ayu_dark colours plus optional explicit border overrides.
 ///
 /// Every palette field defaults to the embedded ayu_dark palette; a `theme.toml`
 /// only overrides the keys it provides (lenient per-field fallback). Unknown keys
 /// are rejected, matching `GeneralConfig`'s strict-field policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Theme {
+    #[serde(default = "default_background")]
     pub background: Color,
+    #[serde(default = "default_foreground")]
     pub foreground: Color,
+    #[serde(default = "default_comment")]
     pub comment: Color,
     /// Primary accent colour (ayu `orange`); focused-frame border default (D3).
+    #[serde(default = "default_accent")]
     pub accent: Color,
+    #[serde(default = "default_yellow")]
     pub yellow: Color,
+    #[serde(default = "default_blue")]
     pub blue: Color,
+    #[serde(default = "default_cyan")]
     pub cyan: Color,
+    #[serde(default = "default_green")]
     pub green: Color,
+    #[serde(default = "default_magenta")]
     pub magenta: Color,
+    #[serde(default = "default_red")]
     pub red: Color,
     /// Explicit focused-border colour; `None` derives from `accent` (D3).
+    #[serde(default)]
     pub active_border: Option<Color>,
     /// Explicit unfocused-border colour; `None` derives from `comment` (D3).
+    #[serde(default)]
     pub inactive_border: Option<Color>,
 }
 
 impl Theme {
+    /// Parses raw TOML into a [`Theme`]. Missing keys fall back per-field to the
+    /// ayu_dark defaults; unknown keys are rejected (matching `Config`).
+    pub fn parse(raw: &str) -> Result<Theme, ThemeError> {
+        toml::from_str(raw).map_err(|e| ThemeError::Parse(e.to_string()))
+    }
+
+    /// Reads and parses the theme file at `path`. A missing/unreadable file is an
+    /// [`ThemeError::Io`]; the caller (the binary startup layer) decides whether
+    /// to fall back to [`Theme::default`] — the pure loader never hides errors.
+    pub fn load(path: &Path) -> Result<Theme, ThemeError> {
+        let raw = std::fs::read_to_string(path).map_err(|e| ThemeError::Io(e.to_string()))?;
+        Theme::parse(&raw)
+    }
+
     /// Border colour for focused frames: explicit override or `accent` (D3).
     pub fn active_border(&self) -> Color {
         self.active_border.unwrap_or(self.accent)
@@ -337,7 +380,10 @@ inactive_border = \"#C0C0C0\"
     #[test]
     fn load_valid_file_returns_parsed_theme() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("tessera-theme-load-test-{}.toml", std::process::id()));
+        let path = dir.join(format!(
+            "tessera-theme-load-test-{}.toml",
+            std::process::id()
+        ));
         std::fs::write(&path, "red = \"#F07178\"\n").expect("write temp theme");
         let t = Theme::load(&path).expect("valid theme file loads");
         assert_eq!(hex(t.red), "#F07178");
