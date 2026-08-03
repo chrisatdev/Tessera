@@ -355,6 +355,9 @@ impl DisplayServer for X11Display {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::sync::Arc;
+
+    use tessera_core::{Color, Theme};
 
     use super::*;
 
@@ -566,5 +569,32 @@ mod tests {
             format!("{err}").contains("cannot connect"),
             "expected a 'cannot connect' message, got {err}"
         );
+    }
+
+    #[test]
+    fn default_theme_pixels_are_ayu_dark_active_and_inactive() {
+        // SC-thm-09 at the X boundary: a fresh display (no set_theme) derives
+        // its border pixels from the embedded ayu_dark theme — active from
+        // accent (#FF8F40), inactive from comment (#626A73) — and they differ.
+        let d = X11Display::new(None);
+        assert_eq!(d.active_border_pixel(), 0x00FF_8F40);
+        assert_eq!(d.inactive_border_pixel(), 0x0062_6A73);
+        assert_ne!(d.active_border_pixel(), d.inactive_border_pixel());
+    }
+
+    #[test]
+    fn set_theme_replaces_the_border_pixels() {
+        // REQ-x11-005 (modified): set_theme mirrors set_config — the stored
+        // theme's explicit border overrides (SC-thm-10) become the pixels the
+        // frame layer uses, replacing the ayu_dark derived defaults.
+        let mut d = X11Display::new(None);
+        let custom = Theme {
+            active_border: Some(Color::parse_hex("#112233").expect("valid hex")),
+            inactive_border: Some(Color::parse_hex("#445566").expect("valid hex")),
+            ..Theme::default()
+        };
+        d.set_theme(Arc::new(custom));
+        assert_eq!(d.active_border_pixel(), 0x0011_2233);
+        assert_eq!(d.inactive_border_pixel(), 0x0044_5566);
     }
 }
