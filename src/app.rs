@@ -258,4 +258,39 @@ mod tests {
             "an unset border must derive from the ayu accent"
         );
     }
+
+    #[test]
+    fn resolve_theme_falls_back_to_ayu_dark_on_a_missing_theme_file() {
+        // Ratified decision #1281 (overrides SC-thm-08/D6): a custom theme
+        // file that is missing must NOT abort startup — the WM warns and
+        // uses the embedded ayu_dark palette.
+        let mut cfg = Config::default();
+        cfg.general.theme = Some("/nonexistent/tessera-theme-gone.toml".to_string());
+        let theme = resolve_theme(&cfg);
+        assert_eq!(theme, Theme::default());
+        assert_eq!(
+            (theme.red.r, theme.red.g, theme.red.b),
+            (0xF2, 0x53, 0x58),
+            "the fallback must be the full ayu_dark palette"
+        );
+    }
+
+    #[test]
+    fn resolve_theme_falls_back_to_ayu_dark_on_an_unparseable_theme_file() {
+        // Ratified decision #1281: a theme file that cannot be parsed must
+        // NOT abort startup either — warn and fall back to ayu_dark (the
+        // "parseable file, missing keys" and "file broken" cases are two
+        // different leniency levels; both are lenient).
+        let theme_file = theme_path("tessera-theme-bad", "not [valid toml");
+        let mut cfg = Config::default();
+        cfg.general.theme = Some(theme_file.to_string_lossy().into_owned());
+        let theme = resolve_theme(&cfg);
+        let _ = std::fs::remove_file(&theme_file);
+        assert_eq!(theme, Theme::default());
+        assert_eq!(
+            (theme.active_border().r, theme.active_border().g, theme.active_border().b),
+            (0xFF, 0x8F, 0x40),
+            "the fallback must keep the ayu derived borders"
+        );
+    }
 }
