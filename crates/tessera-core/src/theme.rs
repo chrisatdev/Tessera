@@ -1,7 +1,179 @@
 //! Pure theme model: canonical ayu_dark palette, lenient TOML parse, strict keys.
 //!
-//! TDD RED: tests written first; production types (`Color`, `Theme`, `ThemeError`)
-//! do not exist yet, so this module intentionally fails to compile.
+//! `Color` and `Theme` live in `tessera-core` so the palette is headless-testable
+//! and reusable by every X-facing consumer (frames, the future bar). Parsing is
+//! validated once at load time: bad hex is a parse error, never a silent default.
+
+/// A single RGB colour, parsed from a `#RRGGBB` hex string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl Color {
+    /// Parses a `#RRGGBB` hex string (case-insensitive digits).
+    ///
+    /// Anything other than exactly `#` + 6 hex digits is rejected with a
+    /// descriptive message, so a bad palette value can never silently corrupt
+    /// a frame's border colour.
+    pub fn parse_hex(s: &str) -> Result<Color, String> {
+        let bytes = s.as_bytes();
+        if bytes.len() != 7 || bytes[0] != b'#' {
+            return Err(format!("invalid color {s:?}: expected a #RRGGBB string"));
+        }
+        let nibble = |b: u8| match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            _ => Err(format!("invalid color {s:?}: non-hex digit")),
+        };
+        let octet = |i: usize| -> Result<u8, String> {
+            let hi = nibble(bytes[i])?;
+            let lo = nibble(bytes[i + 1])?;
+            Ok(hi << 4 | lo)
+        };
+        Ok(Color {
+            r: octet(1)?,
+            g: octet(3)?,
+            b: octet(5)?,
+        })
+    }
+}
+
+/// Theme palette: the 10 ayu_dark colours plus optional explicit border overrides.
+///
+/// Every palette field defaults to the embedded ayu_dark palette; a `theme.toml`
+/// only overrides the keys it provides (lenient per-field fallback). Unknown keys
+/// are rejected, matching `GeneralConfig`'s strict-field policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Theme {
+    pub background: Color,
+    pub foreground: Color,
+    pub comment: Color,
+    /// Primary accent colour (ayu `orange`); focused-frame border default (D3).
+    pub accent: Color,
+    pub yellow: Color,
+    pub blue: Color,
+    pub cyan: Color,
+    pub green: Color,
+    pub magenta: Color,
+    pub red: Color,
+    /// Explicit focused-border colour; `None` derives from `accent` (D3).
+    pub active_border: Option<Color>,
+    /// Explicit unfocused-border colour; `None` derives from `comment` (D3).
+    pub inactive_border: Option<Color>,
+}
+
+impl Theme {
+    /// Border colour for focused frames: explicit override or `accent` (D3).
+    pub fn active_border(&self) -> Color {
+        self.active_border.unwrap_or(self.accent)
+    }
+
+    /// Border colour for unfocused frames: explicit override or `comment` (D3).
+    pub fn inactive_border(&self) -> Color {
+        self.inactive_border.unwrap_or(self.comment)
+    }
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Theme {
+            background: default_background(),
+            foreground: default_foreground(),
+            comment: default_comment(),
+            accent: default_accent(),
+            yellow: default_yellow(),
+            blue: default_blue(),
+            cyan: default_cyan(),
+            green: default_green(),
+            magenta: default_magenta(),
+            red: default_red(),
+            active_border: None,
+            inactive_border: None,
+        }
+    }
+}
+
+/// Errors while reading or parsing a theme file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThemeError {
+    Io(String),
+    Parse(String),
+}
+
+fn default_background() -> Color {
+    Color {
+        r: 0x0A,
+        g: 0x0E,
+        b: 0x14,
+    }
+}
+fn default_foreground() -> Color {
+    Color {
+        r: 0xB3,
+        g: 0xB1,
+        b: 0xAD,
+    }
+}
+fn default_comment() -> Color {
+    Color {
+        r: 0x62,
+        g: 0x6A,
+        b: 0x73,
+    }
+}
+fn default_accent() -> Color {
+    Color {
+        r: 0xFF,
+        g: 0x8F,
+        b: 0x40,
+    }
+}
+fn default_yellow() -> Color {
+    Color {
+        r: 0xE6,
+        g: 0xB4,
+        b: 0x50,
+    }
+}
+fn default_blue() -> Color {
+    Color {
+        r: 0x39,
+        g: 0xBA,
+        b: 0xE6,
+    }
+}
+fn default_cyan() -> Color {
+    Color {
+        r: 0x95,
+        g: 0xE6,
+        b: 0xCB,
+    }
+}
+fn default_green() -> Color {
+    Color {
+        r: 0xAA,
+        g: 0xD9,
+        b: 0x4C,
+    }
+}
+fn default_magenta() -> Color {
+    Color {
+        r: 0xD2,
+        g: 0xA6,
+        b: 0xFF,
+    }
+}
+fn default_red() -> Color {
+    Color {
+        r: 0xF2,
+        g: 0x53,
+        b: 0x58,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -72,9 +244,11 @@ mod tests {
 
     #[test]
     fn explicit_borders_override_derived_defaults() {
-        let mut t = Theme::default();
-        t.active_border = Some(Color::parse_hex("#112233").expect("valid hex"));
-        t.inactive_border = Some(Color::parse_hex("#445566").expect("valid hex"));
+        let t = Theme {
+            active_border: Some(Color::parse_hex("#112233").expect("valid hex")),
+            inactive_border: Some(Color::parse_hex("#445566").expect("valid hex")),
+            ..Theme::default()
+        };
         assert_eq!(hex(t.active_border()), "#112233");
         assert_eq!(hex(t.inactive_border()), "#445566");
     }

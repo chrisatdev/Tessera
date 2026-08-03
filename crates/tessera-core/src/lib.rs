@@ -24,5 +24,6 @@ pub use display::{DErr, DisplayServer, FrameId, spawn_program};
 pub use event::{Event, KeyCombo};
 pub use geometry::{LayoutKind, Placement, Rect, WindowId, WorkspaceId};
 pub use layout::{Layout, MasterStack};
+pub use theme::{Color, Theme};
 pub use window::{CommandEffect, WindowManager, WindowState};
 pub use workspace::{Workspace, WorkspaceManager};
