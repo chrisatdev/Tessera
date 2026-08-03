@@ -252,4 +252,97 @@ mod tests {
         assert_eq!(hex(t.active_border()), "#112233");
         assert_eq!(hex(t.inactive_border()), "#445566");
     }
+
+    #[test]
+    fn parse_full_theme_overrides_every_field() {
+        let raw = "\
+background = \"#101010\"
+foreground = \"#202020\"
+comment = \"#303030\"
+accent = \"#404040\"
+yellow = \"#505050\"
+blue = \"#606060\"
+cyan = \"#707070\"
+green = \"#808080\"
+magenta = \"#909090\"
+red = \"#A0A0A0\"
+active_border = \"#B0B0B0\"
+inactive_border = \"#C0C0C0\"
+";
+        let t = Theme::parse(raw).expect("valid full theme");
+        assert_eq!(hex(t.background), "#101010");
+        assert_eq!(hex(t.foreground), "#202020");
+        assert_eq!(hex(t.comment), "#303030");
+        assert_eq!(hex(t.accent), "#404040");
+        assert_eq!(hex(t.yellow), "#505050");
+        assert_eq!(hex(t.blue), "#606060");
+        assert_eq!(hex(t.cyan), "#707070");
+        assert_eq!(hex(t.green), "#808080");
+        assert_eq!(hex(t.magenta), "#909090");
+        assert_eq!(hex(t.red), "#A0A0A0");
+        assert_eq!(hex(t.active_border()), "#B0B0B0");
+        assert_eq!(hex(t.inactive_border()), "#C0C0C0");
+    }
+
+    #[test]
+    fn parse_partial_theme_falls_back_per_field() {
+        let t = Theme::parse("red = \"#F07178\"\n").expect("valid partial theme");
+        assert_eq!(hex(t.red), "#F07178");
+        assert_eq!(hex(t.background), "#0A0E14");
+        assert_eq!(hex(t.foreground), "#B3B1AD");
+        assert_eq!(hex(t.comment), "#626A73");
+        assert_eq!(hex(t.accent), "#FF8F40");
+        assert_eq!(hex(t.yellow), "#E6B450");
+        assert_eq!(hex(t.blue), "#39BAE6");
+        assert_eq!(hex(t.cyan), "#95E6CB");
+        assert_eq!(hex(t.green), "#AAD94C");
+        assert_eq!(hex(t.magenta), "#D2A6FF");
+        // Borders stay unset in the file → derived defaults apply.
+        assert_eq!(hex(t.active_border()), "#FF8F40");
+        assert_eq!(hex(t.inactive_border()), "#626A73");
+    }
+
+    #[test]
+    fn parse_unknown_key_is_rejected_and_named() {
+        let msg = |raw: &str| match Theme::parse(raw) {
+            Ok(t) => panic!("expected rejection for {raw:?}, got {t:?}"),
+            Err(ThemeError::Parse(m)) => m,
+            Err(other) => panic!("expected Parse error, got {other:?}"),
+        };
+        let err1 = msg("bogus = \"#123456\"\n");
+        assert!(err1.contains("bogus"), "error should name the key: {err1}");
+        let err2 = msg("red = \"#FF0000\"\nnope = \"#000000\"\n");
+        assert!(err2.contains("nope"), "error should name the key: {err2}");
+    }
+
+    #[test]
+    fn parse_malformed_toml_fails() {
+        let err = Theme::parse("not [valid toml").expect_err("malformed toml must fail");
+        assert!(matches!(err, ThemeError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_bad_hex_value_fails() {
+        let err = Theme::parse("red = \"#ZZZZZZ\"\n").expect_err("bad hex must fail");
+        assert!(matches!(err, ThemeError::Parse(_)));
+    }
+
+    #[test]
+    fn load_missing_file_fails_with_io_error() {
+        let missing = std::path::Path::new("/nonexistent/tessera-theme-does-not-exist.toml");
+        let err = Theme::load(missing).expect_err("missing file must fail");
+        assert!(matches!(err, ThemeError::Io(_)));
+    }
+
+    #[test]
+    fn load_valid_file_returns_parsed_theme() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tessera-theme-load-test-{}.toml", std::process::id()));
+        std::fs::write(&path, "red = \"#F07178\"\n").expect("write temp theme");
+        let t = Theme::load(&path).expect("valid theme file loads");
+        assert_eq!(hex(t.red), "#F07178");
+        assert_eq!(hex(t.background), "#0A0E14");
+        assert_eq!(hex(t.active_border()), "#FF8F40");
+        let _ = std::fs::remove_file(&path);
+    }
 }
