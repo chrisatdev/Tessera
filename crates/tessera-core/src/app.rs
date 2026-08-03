@@ -259,6 +259,7 @@ mod tests {
     use crate::config::Config;
     use crate::display::test_double::{DisplayCall, MockDisplay};
     use crate::geometry::{LayoutKind, Placement, Rect};
+    use crate::theme::Theme;
 
     use super::*;
 
@@ -298,6 +299,18 @@ mod tests {
     fn app_with(script: Vec<Event>, config: Config) -> (App, Arc<Mutex<Vec<DisplayCall>>>) {
         let (mock, log) = MockDisplay::new(script);
         (App::new(Box::new(mock), Arc::new(config), AREA), log)
+    }
+
+    fn app_with_theme(
+        script: Vec<Event>,
+        config: Config,
+        theme: Arc<Theme>,
+    ) -> (App, Arc<Mutex<Vec<DisplayCall>>>) {
+        let (mock, log) = MockDisplay::new(script);
+        (
+            App::new(Box::new(mock), Arc::new(config), theme, AREA),
+            log,
+        )
     }
 
     fn calls(log: &Arc<Mutex<Vec<DisplayCall>>>) -> Vec<DisplayCall> {
@@ -353,6 +366,21 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn app_publishes_resolved_theme_in_state_snapshot() {
+        // D4: the App owns the resolved theme and exposes it through the
+        // WmState watch, so the bar (Change-2) reads the palette headless.
+        let theme = Arc::new(Theme::default());
+        let (mut app, _log) = app_with_theme(
+            vec![Event::WindowMapRequested(1)],
+            Config::default(),
+            Arc::clone(&theme),
+        );
+        let state_rx = app.bus().state_rx();
+        app.run();
+        assert!(Arc::ptr_eq(&state_rx.borrow().theme, &theme));
     }
 
     #[test]

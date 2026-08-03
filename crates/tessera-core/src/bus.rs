@@ -157,6 +157,7 @@ mod tests {
     use crossbeam_channel::RecvTimeoutError;
 
     use crate::config::Config;
+    use crate::theme::Theme;
 
     use super::*;
 
@@ -291,5 +292,16 @@ mod tests {
         let s = state(3, Some(5));
         bus.set_state(s.clone());
         assert_eq!(rx.borrow(), s);
+    }
+
+    #[test]
+    fn bus_carries_theme_in_initial_snapshot() {
+        // D4 seam: the bus is seeded with the resolved theme, so a WmState
+        // consumer (bar / Change-2) reads the palette from the watch without
+        // any X dependency.
+        let theme = Arc::new(Theme::default());
+        let bus = EventBus::new(Arc::new(Config::default()), Arc::clone(&theme));
+        let rx = bus.state_rx();
+        assert!(Arc::ptr_eq(&rx.borrow().theme, &theme));
     }
 }
