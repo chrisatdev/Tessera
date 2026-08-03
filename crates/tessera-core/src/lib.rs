@@ -11,6 +11,7 @@ pub mod display;
 pub mod event;
 pub mod geometry;
 pub mod layout;
+pub mod theme;
 pub mod watch;
 pub mod window;
 pub mod workspace;
