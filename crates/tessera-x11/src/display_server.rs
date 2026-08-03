@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tessera_core::{Config, DErr, DisplayServer, Event, FrameId, Rect, WindowId};
+use tessera_core::{Config, DErr, DisplayServer, Event, FrameId, Rect, Theme, WindowId};
 use x11rb::connection::Connection;
 use x11rb::errors::{ConnectError, ConnectionError, ReplyError};
 use x11rb::protocol::xproto::{
@@ -266,13 +266,25 @@ impl DisplayServer for X11Display {
 
     fn manage(&mut self, w: WindowId) -> Result<FrameId, DErr> {
         // REQ-x11-005 / SC-x11-07: reparent `w` into a fresh border-only frame
-        // and remember the client -> frame mapping (frames.rs, T17).
+        // and remember the client -> frame mapping (frames.rs, T17). The frame
+        // is created with the theme's active border pixel (T6/T7: pixel
+        // threading lives in frames.rs; the stored theme replaces the default
+        // below in T7 via active_border_pixel()).
         let conn = self
             .conn
             .as_ref()
             .ok_or_else(|| DErr::X("connect() must succeed before manage()".to_string()))?;
         let border = u16::try_from(self.config.general.border_width).unwrap_or(u16::MAX);
-        let frame = frames::create_frame(conn, self.root, w, border, self.depth, self.visual)?;
+        let active_pixel = frames::pixel(Theme::default().active_border());
+        let frame = frames::create_frame(
+            conn,
+            self.root,
+            w,
+            border,
+            self.depth,
+            self.visual,
+            active_pixel,
+        )?;
         self.frames.insert(w, frame);
         Ok(frame)
     }
