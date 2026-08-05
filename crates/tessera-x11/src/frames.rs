@@ -9,23 +9,30 @@
 //! Every X side effect goes through the [`FrameOps`] seam so the mechanics are
 //! scriptable headless; [`RustConnection`] implements it directly.
 
-use tessera_core::{DErr, FrameId, Rect, WindowId};
+use std::collections::HashMap;
+
+use tessera_core::{Color, DErr, FrameId, Rect, WindowId};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    ConfigureWindowAux, CreateWindowAux, EventMask, InputFocus, Visualid, Window, WindowClass,
-    configure_window, create_window, destroy_window, map_window, reparent_window, set_input_focus,
-    unmap_window,
+    ChangeWindowAttributesAux, ConfigureWindowAux, CreateWindowAux, EventMask, InputFocus,
+    Visualid, Window, WindowClass, change_window_attributes, configure_window, create_window,
+    destroy_window, map_window, reparent_window, set_input_focus, unmap_window,
 };
 use x11rb::rust_connection::RustConnection;
 
 use crate::display_server::{map_conn_error, map_reply_error};
 
-/// Border color of a v1 frame (white). The config has no border color yet —
-/// a fixed pixel value keeps the frame visible on dark and light clients.
-pub(crate) const FRAME_BORDER_PIXEL: u32 = 0xFFFF_FFFF;
 /// Background of the frame window behind the client (black; only visible in
 /// the gap before the first configure).
 pub(crate) const FRAME_BACKGROUND_PIXEL: u32 = 0;
+
+/// Packs a theme [`Color`] into the 24-bit `border_pixel` X expects
+/// (D2): on TrueColor roots the low 24 bits are R/G/B as `0xRRGGBB`, and
+/// bits ≥ 24 are ignored. The conversion lives at the X boundary so
+/// `tessera-core` never depends on X (pure-core rule).
+pub(crate) fn pixel(c: Color) -> u32 {
+    (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b)
+}
 
 /// The X surface frame management needs, abstracted so frame mechanics are
 /// scriptable headless (same seam shape as [`X11Startup`](crate::display_server::X11Startup)).
@@ -64,6 +71,9 @@ pub(crate) trait FrameOps {
         height: u32,
         border_width: u32,
     ) -> Result<(), DErr>;
+    /// Repaints `window`'s border with `border_pixel` (theme active/inactive
+    /// repaint on focus change, REQ-x11-005 modified / SC-x11-13).
+    fn set_border_pixel(&self, window: Window, border_pixel: u32) -> Result<(), DErr>;
     /// Sets input focus to `window`.
     fn focus(&self, window: Window) -> Result<(), DErr>;
     /// Destroys `window`.
@@ -136,6 +146,11 @@ impl FrameOps for RustConnection {
         let cookie = configure_window(self, window, &aux).map_err(map_conn_error)?;
         cookie.check().map_err(map_reply_error)
     }
+    fn set_border_pixel(&self, window: Window, border_pixel: u32) -> Result<(), DErr> {
+        let aux = ChangeWindowAttributesAux::default().border_pixel(border_pixel);
+        let cookie = change_window_attributes(self, window, &aux).map_err(map_conn_error)?;
+        cookie.check().map_err(map_reply_error)
+    }
     fn focus(&self, window: Window) -> Result<(), DErr> {
         let cookie = set_input_focus(self, InputFocus::PARENT, window, x11rb::CURRENT_TIME)
             .map_err(map_conn_error)?;
@@ -163,11 +178,12 @@ pub(crate) fn create_frame(
     border: u16,
     depth: u8,
     visual: Visualid,
+    border_pixel: u32,
 ) -> Result<FrameId, DErr> {
     let frame = ops.generate_id()?;
     let aux = CreateWindowAux::default()
         .background_pixel(FRAME_BACKGROUND_PIXEL)
-        .border_pixel(FRAME_BORDER_PIXEL)
+        .border_pixel(border_pixel)
         .event_mask(EventMask::SUBSTRUCTURE_NOTIFY)
         .override_redirect(1u32);
     ops.create_window(
@@ -186,6 +202,43 @@ pub(crate) fn create_frame(
     let offset = i16::try_from(border).unwrap_or(i16::MAX);
     ops.reparent(client, frame, offset, offset)?;
     Ok(FrameId(frame))
+}
+
+/// Repaints `frame`'s border with `border_pixel` (the X half of a theme
+/// focus repaint, SC-x11-13). The frame is found by the display layer; this
+/// only issues the `ChangeWindowAttributes` that repaints it.
+pub(crate) fn set_border_pixel(
+    ops: &impl FrameOps,
+    frame: Window,
+    border_pixel: u32,
+) -> Result<(), DErr> {
+    ops.set_border_pixel(frame, border_pixel)
+}
+
+/// Repaints frame borders on a focus change (REQ-x11-005 modified,
+/// SC-x11-13): the previously focused client's frame (when it differs from
+/// the newly focused one and still has a managed frame) is repainted with the
+/// inactive pixel, and the newly focused client's frame with the active
+/// pixel. Clients without a managed frame are skipped — a focus target can
+/// arrive before `manage()` in a race, and repainting nothing is safe.
+pub(crate) fn repaint_focus(
+    ops: &impl FrameOps,
+    frames: &HashMap<WindowId, FrameId>,
+    previous: Option<WindowId>,
+    next: WindowId,
+    active_pixel: u32,
+    inactive_pixel: u32,
+) -> Result<(), DErr> {
+    if let Some(frame) = previous
+        .filter(|&prev| prev != next)
+        .and_then(|prev| frames.get(&prev))
+    {
+        set_border_pixel(ops, frame.0, inactive_pixel)?;
+    }
+    if let Some(frame) = frames.get(&next) {
+        set_border_pixel(ops, frame.0, active_pixel)?;
+    }
+    Ok(())
 }
 
 /// Maps the frame and then the client (REQ-x11-005 "frame mapped"): the
@@ -244,8 +297,9 @@ mod tests {
     //! record the exact X calls described by SC-x11-07/09 on a scripted seam.
 
     use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
 
-    use tessera_core::{DErr, FrameId, Rect, WindowId};
+    use tessera_core::{Color, DErr, FrameId, Rect, WindowId};
     use x11rb::protocol::xproto::{CreateWindowAux, EventMask, Visualid, Window, WindowClass};
 
     use super::*;
@@ -256,6 +310,10 @@ mod tests {
     const VISUAL: Visualid = 0x20;
     /// First id `generate_id` hands out (sequential from here).
     const FIRST_FRAME: Window = 0x0000_1001;
+    /// ayu_dark `accent` (#FF8F40) as a 24-bit X pixel (SC-thm-09).
+    const ACTIVE_PIXEL: u32 = 0x00FF_8F40;
+    /// ayu_dark `comment` (#626A73) as a 24-bit X pixel (SC-thm-09).
+    const INACTIVE_PIXEL: u32 = 0x0062_6A73;
 
     /// `EventMask::SUBSTRUCTURE_NOTIFY` as `u32` (the `From` impl is not
     /// const, so this is a helper rather than a constant).
@@ -293,6 +351,10 @@ mod tests {
             width: u32,
             height: u32,
             border_width: u32,
+        },
+        SetBorderPixel {
+            window: Window,
+            border_pixel: u32,
         },
         Focus(Window),
         Destroy(Window),
@@ -392,6 +454,13 @@ mod tests {
             self.calls.borrow_mut().push(FrameCall::Focus(window));
             Ok(())
         }
+        fn set_border_pixel(&self, window: Window, border_pixel: u32) -> Result<(), DErr> {
+            self.calls.borrow_mut().push(FrameCall::SetBorderPixel {
+                window,
+                border_pixel,
+            });
+            Ok(())
+        }
         fn destroy(&self, window: Window) -> Result<(), DErr> {
             self.calls.borrow_mut().push(FrameCall::Destroy(window));
             Ok(())
@@ -407,7 +476,7 @@ mod tests {
         // tracking must move to the frame) and is override-redirect so another
         // WM's SubstructureRedirect never sees it.
         let fake = FakeFrameOps::new();
-        let frame = create_frame(&fake, ROOT, CLIENT, 2, DEPTH, VISUAL).unwrap();
+        let frame = create_frame(&fake, ROOT, CLIENT, 2, DEPTH, VISUAL, ACTIVE_PIXEL).unwrap();
         assert_eq!(frame, FrameId(FIRST_FRAME));
         assert_eq!(
             fake.calls(),
@@ -422,7 +491,7 @@ mod tests {
                     visual: VISUAL,
                     event_mask: substructure_notify(),
                     override_redirect: true,
-                    border_pixel: FRAME_BORDER_PIXEL,
+                    border_pixel: ACTIVE_PIXEL,
                 },
                 FrameCall::Reparent {
                     window: CLIENT,
@@ -439,7 +508,7 @@ mod tests {
         // A non-default border (config.general.border_width) must be reflected
         // in the frame's border and in the client's offset inside it.
         let fake = FakeFrameOps::new();
-        create_frame(&fake, ROOT, CLIENT, 4, DEPTH, VISUAL).unwrap();
+        create_frame(&fake, ROOT, CLIENT, 4, DEPTH, VISUAL, ACTIVE_PIXEL).unwrap();
         let calls = fake.calls();
         assert_eq!(
             calls[1],
@@ -452,7 +521,7 @@ mod tests {
                 visual: VISUAL,
                 event_mask: substructure_notify(),
                 override_redirect: true,
-                border_pixel: FRAME_BORDER_PIXEL,
+                border_pixel: ACTIVE_PIXEL,
             }
         );
         assert_eq!(
@@ -464,6 +533,145 @@ mod tests {
                 y: 4,
             }
         );
+    }
+
+    #[test]
+    fn pixel_packs_rgb_into_low_24_bits() {
+        // D2: on 24-bit TrueColor roots the border_pixel's low 24 bits are
+        // R/G/B (0xRRGGBB). #FF8F40 (ayu_dark accent) must pack to
+        // 0x00FF_8F40, with the high bits zero.
+        assert_eq!(
+            pixel(Color {
+                r: 0xFF,
+                g: 0x8F,
+                b: 0x40
+            }),
+            ACTIVE_PIXEL
+        );
+        assert_eq!(
+            pixel(Color {
+                r: 0x62,
+                g: 0x6A,
+                b: 0x73
+            }),
+            INACTIVE_PIXEL
+        );
+    }
+
+    #[test]
+    fn active_and_inactive_border_pixels_differ() {
+        // SC-thm-09: the derived ayu_dark active (#FF8F40) and inactive
+        // (#626A73) pixels must be distinct so a focused frame is visibly
+        // different from an unfocused one.
+        assert_ne!(ACTIVE_PIXEL, INACTIVE_PIXEL);
+    }
+
+    #[test]
+    fn create_frame_records_the_themed_border_pixel() {
+        // REQ-x11-005 (modified): the frame's border pixel comes from the
+        // theme, not a hardcoded constant — the pixel passed in must be what
+        // lands in CreateWindowAux.border_pixel. A non-default theme (inactive
+        // comment pixel here) proves the value flows through, not a fixed one.
+        let fake = FakeFrameOps::new();
+        create_frame(&fake, ROOT, CLIENT, 2, DEPTH, VISUAL, INACTIVE_PIXEL).unwrap();
+        assert_eq!(
+            fake.calls()[1],
+            FrameCall::Create {
+                depth: DEPTH,
+                wid: FIRST_FRAME,
+                parent: ROOT,
+                border_width: 2,
+                class: u16::from(WindowClass::INPUT_OUTPUT),
+                visual: VISUAL,
+                event_mask: substructure_notify(),
+                override_redirect: true,
+                border_pixel: INACTIVE_PIXEL,
+            }
+        );
+    }
+
+    #[test]
+    fn set_border_pixel_issues_change_window_attributes() {
+        // SC-x11-13: repainting a frame border is a ChangeWindowAttributes
+        // carrying the new border_pixel — the exact X call the display layer
+        // needs on a focus change.
+        let fake = FakeFrameOps::new();
+        set_border_pixel(&fake, FIRST_FRAME, INACTIVE_PIXEL).unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![FrameCall::SetBorderPixel {
+                window: FIRST_FRAME,
+                border_pixel: INACTIVE_PIXEL,
+            }]
+        );
+    }
+
+    #[test]
+    fn repaint_focus_repaints_old_frame_inactive_and_new_frame_active() {
+        // SC-x11-13: focus moving from client A to client B repaints A's frame
+        // with the inactive pixel and B's frame with the active pixel — both
+        // exactly once.
+        let fake = FakeFrameOps::new();
+        let frames = HashMap::from([
+            (CLIENT, FrameId(FIRST_FRAME)),
+            (43u32, FrameId(0x0000_1002)),
+        ]);
+        repaint_focus(
+            &fake,
+            &frames,
+            Some(CLIENT),
+            43u32,
+            ACTIVE_PIXEL,
+            INACTIVE_PIXEL,
+        )
+        .unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![
+                FrameCall::SetBorderPixel {
+                    window: FIRST_FRAME,
+                    border_pixel: INACTIVE_PIXEL,
+                },
+                FrameCall::SetBorderPixel {
+                    window: 0x0000_1002,
+                    border_pixel: ACTIVE_PIXEL,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn repaint_focus_without_previous_only_repaints_the_new_frame_active() {
+        // First focus (no previously focused client): only the newly focused
+        // frame is repainted, active — nothing is repainted inactive.
+        let fake = FakeFrameOps::new();
+        let frames = HashMap::from([(CLIENT, FrameId(FIRST_FRAME))]);
+        repaint_focus(&fake, &frames, None, CLIENT, ACTIVE_PIXEL, INACTIVE_PIXEL).unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![FrameCall::SetBorderPixel {
+                window: FIRST_FRAME,
+                border_pixel: ACTIVE_PIXEL,
+            }]
+        );
+    }
+
+    #[test]
+    fn repaint_focus_ignores_frames_missing_from_the_map() {
+        // A focus target with no managed frame must not crash or repaint
+        // anything (defensive: the map lookup is what proves membership).
+        let fake = FakeFrameOps::new();
+        let frames = HashMap::new();
+        repaint_focus(
+            &fake,
+            &frames,
+            Some(CLIENT),
+            99u32,
+            ACTIVE_PIXEL,
+            INACTIVE_PIXEL,
+        )
+        .unwrap();
+        assert_eq!(fake.calls(), Vec::new());
     }
 
     #[test]

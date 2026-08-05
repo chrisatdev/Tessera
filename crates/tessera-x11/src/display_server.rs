@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tessera_core::{Config, DErr, DisplayServer, Event, FrameId, Rect, WindowId};
+use tessera_core::{Config, DErr, DisplayServer, Event, FrameId, Rect, Theme, WindowId};
 use x11rb::connection::Connection;
 use x11rb::errors::{ConnectError, ConnectionError, ReplyError};
 use x11rb::protocol::xproto::{
@@ -45,8 +45,15 @@ pub struct X11Display {
     /// The config the X layer needs: frame border width (T17) and the
     /// keybindings to grab (T18). Defaults until [`X11Display::set_config`].
     config: Arc<Config>,
+    /// The theme the frame layer paints from (T6/T7): active/inactive border
+    /// pixels. Defaults to the embedded ayu_dark until
+    /// [`X11Display::set_theme`] (REQ-x11-005 modified).
+    theme: Arc<Theme>,
     /// Frame window id created per managed client (`manage`, T17).
     frames: HashMap<WindowId, FrameId>,
+    /// The currently focused client, if any — repaint target for the
+    /// previous frame when focus moves (D5, SC-x11-13).
+    focused: Option<WindowId>,
     /// Cached keycode → keysym mapping, loaded during `claim_wm` (T18).
     keyboard: Option<keyboard::Keymap>,
 }
@@ -62,7 +69,9 @@ impl X11Display {
             depth: 0,
             visual: 0,
             config: Arc::new(Config::default()),
+            theme: Arc::new(Theme::default()),
             frames: HashMap::new(),
+            focused: None,
             keyboard: None,
         }
     }
@@ -71,6 +80,26 @@ impl X11Display {
     /// keybindings grabbed during `claim_wm` (T18). Defaults until called.
     pub fn set_config(&mut self, config: Arc<Config>) {
         self.config = config;
+    }
+
+    /// Replaces the theme the X layer paints from (T7): the active/inactive
+    /// border pixels for frame creation and focus repaints (D4 — mirrors
+    /// [`X11Display::set_config`]; the [`DisplayServer`] trait stays theme-free
+    /// so the pure core never depends on X). Defaults to ayu_dark until called.
+    pub fn set_theme(&mut self, theme: Arc<Theme>) {
+        self.theme = theme;
+    }
+
+    /// The X pixel of the focused-frame border (REQ-x11-005 modified):
+    /// the theme's active border colour packed into the low 24 bits (D2).
+    fn active_border_pixel(&self) -> u32 {
+        frames::pixel(self.theme.active_border())
+    }
+
+    /// The X pixel of the unfocused-frame border (REQ-x11-005 modified):
+    /// the theme's inactive border colour packed into the low 24 bits (D2).
+    fn inactive_border_pixel(&self) -> u32 {
+        frames::pixel(self.theme.inactive_border())
     }
 
     /// The frame of client `w`, or an error when the client was never managed
@@ -266,13 +295,24 @@ impl DisplayServer for X11Display {
 
     fn manage(&mut self, w: WindowId) -> Result<FrameId, DErr> {
         // REQ-x11-005 / SC-x11-07: reparent `w` into a fresh border-only frame
-        // and remember the client -> frame mapping (frames.rs, T17).
+        // and remember the client -> frame mapping (frames.rs, T17). The frame
+        // is created with the theme's active border pixel (REQ-x11-005
+        // modified) so a freshly managed client starts focused-coloured.
         let conn = self
             .conn
             .as_ref()
             .ok_or_else(|| DErr::X("connect() must succeed before manage()".to_string()))?;
         let border = u16::try_from(self.config.general.border_width).unwrap_or(u16::MAX);
-        let frame = frames::create_frame(conn, self.root, w, border, self.depth, self.visual)?;
+        let active_pixel = self.active_border_pixel();
+        let frame = frames::create_frame(
+            conn,
+            self.root,
+            w,
+            border,
+            self.depth,
+            self.visual,
+            active_pixel,
+        )?;
         self.frames.insert(w, frame);
         Ok(frame)
     }
@@ -308,10 +348,19 @@ impl DisplayServer for X11Display {
     }
 
     fn focus_window(&mut self, w: WindowId) -> Result<(), DErr> {
+        // REQ-x11-005 (modified) / SC-x11-13: on a focus change the previously
+        // focused frame repaints inactive and the newly focused frame repaints
+        // active, then input focus moves to the client (D5 — X11Display owns
+        // `focused`, so the repaint is local, no trait/bus change).
         let conn = self
             .conn
             .as_ref()
             .ok_or_else(|| DErr::X("connect() must succeed before focus_window()".to_string()))?;
+        let previous = self.focused;
+        let active = self.active_border_pixel();
+        let inactive = self.inactive_border_pixel();
+        frames::repaint_focus(conn, &self.frames, previous, w, active, inactive)?;
+        self.focused = Some(w);
         frames::focus_client(conn, w)
     }
 
@@ -343,6 +392,9 @@ impl DisplayServer for X11Display {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::sync::Arc;
+
+    use tessera_core::{Color, Theme};
 
     use super::*;
 
@@ -554,5 +606,32 @@ mod tests {
             format!("{err}").contains("cannot connect"),
             "expected a 'cannot connect' message, got {err}"
         );
+    }
+
+    #[test]
+    fn default_theme_pixels_are_ayu_dark_active_and_inactive() {
+        // SC-thm-09 at the X boundary: a fresh display (no set_theme) derives
+        // its border pixels from the embedded ayu_dark theme — active from
+        // accent (#FF8F40), inactive from comment (#626A73) — and they differ.
+        let d = X11Display::new(None);
+        assert_eq!(d.active_border_pixel(), 0x00FF_8F40);
+        assert_eq!(d.inactive_border_pixel(), 0x0062_6A73);
+        assert_ne!(d.active_border_pixel(), d.inactive_border_pixel());
+    }
+
+    #[test]
+    fn set_theme_replaces_the_border_pixels() {
+        // REQ-x11-005 (modified): set_theme mirrors set_config — the stored
+        // theme's explicit border overrides (SC-thm-10) become the pixels the
+        // frame layer uses, replacing the ayu_dark derived defaults.
+        let mut d = X11Display::new(None);
+        let custom = Theme {
+            active_border: Some(Color::parse_hex("#112233").expect("valid hex")),
+            inactive_border: Some(Color::parse_hex("#445566").expect("valid hex")),
+            ..Theme::default()
+        };
+        d.set_theme(Arc::new(custom));
+        assert_eq!(d.active_border_pixel(), 0x0011_2233);
+        assert_eq!(d.inactive_border_pixel(), 0x0044_5566);
     }
 }
