@@ -267,11 +267,15 @@ mod tests {
     use crate::command::Command;
     use crate::config::Config;
     use crate::event::Event;
+    use crate::theme::Theme;
 
     use super::*;
 
     fn setup() -> (Arc<EventBus>, Receiver<Event>, WindowManager) {
-        let bus = Arc::new(EventBus::new(Arc::new(Config::default())));
+        let bus = Arc::new(EventBus::new(
+            Arc::new(Config::default()),
+            Arc::new(Theme::default()),
+        ));
         let rx = bus.subscribe_all();
         let wm = WindowManager::new(Arc::clone(&bus));
         (bus, rx, wm)

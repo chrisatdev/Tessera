@@ -39,6 +39,10 @@ pub struct GeneralConfig {
     pub gaps: u32,
     #[serde(default = "default_terminal")]
     pub terminal: String,
+    /// Optional path to a `theme.toml` (REQ-thm-003). `None` -> embedded
+    /// ayu_dark, no file read; `Some(path)` is resolved at startup.
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 impl Default for GeneralConfig {
@@ -47,6 +51,7 @@ impl Default for GeneralConfig {
             border_width: default_border_width(),
             gaps: default_gaps(),
             terminal: default_terminal(),
+            theme: None,
         }
     }
 }
@@ -262,5 +267,26 @@ mod tests {
         ));
         assert_eq!(shared.general.border_width, 12);
         assert_eq!(shared.general.terminal, "alacritty"); // unset stays default
+    }
+
+    #[test]
+    fn default_theme_option_is_none() {
+        // REQ-thm-003: absent `theme` -> embedded ayu_dark, no file read.
+        let c = Config::default();
+        assert_eq!(c.general.theme, None);
+    }
+
+    #[test]
+    fn theme_path_round_trips_through_parse() {
+        // REQ-thm-003: a `theme = "path"` in [general] survives a round-trip.
+        let c = Config::parse("[general]\ntheme = \"themes/ayu.toml\"\n").expect("valid toml");
+        assert_eq!(c.general.theme, Some("themes/ayu.toml".to_string()));
+        // An explicit theme while other general keys are set keeps its value.
+        let d =
+            Config::parse("[general]\nborder_width = 4\ntheme = \"dark.toml\"\n").expect("valid");
+        assert_eq!(d.general.theme, Some("dark.toml".to_string()));
+        // Absent theme stays None even when other general keys are present.
+        let e = Config::parse("[general]\ngaps = 6\n").expect("valid");
+        assert_eq!(e.general.theme, None);
     }
 }

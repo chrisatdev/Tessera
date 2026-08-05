@@ -25,6 +25,7 @@ use crate::display::{DErr, DisplayServer, FrameId};
 use crate::event::{Event, KeyCombo};
 use crate::geometry::{Rect, WindowId, WorkspaceId};
 use crate::layout::{Layout, MasterStack};
+use crate::theme::Theme;
 use crate::window::{CommandEffect, WindowManager, WindowState};
 
 /// The core window manager: one [`DisplayServer`] plus the pure state
@@ -34,6 +35,9 @@ pub struct App {
     wm: WindowManager,
     display: Box<dyn DisplayServer>,
     config: Arc<Config>,
+    /// Resolved theme (D4): published to the watch so state consumers read
+    /// the palette; never mutated after construction.
+    theme: Arc<Theme>,
     area: Rect,
     layout: MasterStack,
     /// Frame id created per managed client (for `destroy_frame`).
@@ -44,15 +48,21 @@ pub struct App {
 
 impl App {
     /// Creates an app driving `display` over `area`, publishing on a fresh
-    /// bus seeded with `config`.
-    pub fn new(display: Box<dyn DisplayServer>, config: Arc<Config>, area: Rect) -> Self {
-        let bus = Arc::new(EventBus::new(Arc::clone(&config)));
+    /// bus seeded with `config` and the resolved `theme` (D4 seam).
+    pub fn new(
+        display: Box<dyn DisplayServer>,
+        config: Arc<Config>,
+        theme: Arc<Theme>,
+        area: Rect,
+    ) -> Self {
+        let bus = Arc::new(EventBus::new(Arc::clone(&config), Arc::clone(&theme)));
         let wm = WindowManager::new(Arc::clone(&bus));
         App {
             bus,
             wm,
             display,
             config,
+            theme,
             area,
             layout: MasterStack::default(),
             frames: HashMap::new(),
@@ -216,6 +226,7 @@ impl App {
             focused: self.wm.focused_window(),
             workspaces: self.wm.state_snapshots(),
             config: Arc::clone(&self.config),
+            theme: Arc::clone(&self.theme),
         };
         self.bus.set_state(state);
     }
@@ -259,6 +270,7 @@ mod tests {
     use crate::config::Config;
     use crate::display::test_double::{DisplayCall, MockDisplay};
     use crate::geometry::{LayoutKind, Placement, Rect};
+    use crate::theme::Theme;
 
     use super::*;
 
@@ -297,7 +309,24 @@ mod tests {
 
     fn app_with(script: Vec<Event>, config: Config) -> (App, Arc<Mutex<Vec<DisplayCall>>>) {
         let (mock, log) = MockDisplay::new(script);
-        (App::new(Box::new(mock), Arc::new(config), AREA), log)
+        (
+            App::new(
+                Box::new(mock),
+                Arc::new(config),
+                Arc::new(Theme::default()),
+                AREA,
+            ),
+            log,
+        )
+    }
+
+    fn app_with_theme(
+        script: Vec<Event>,
+        config: Config,
+        theme: Arc<Theme>,
+    ) -> (App, Arc<Mutex<Vec<DisplayCall>>>) {
+        let (mock, log) = MockDisplay::new(script);
+        (App::new(Box::new(mock), Arc::new(config), theme, AREA), log)
     }
 
     fn calls(log: &Arc<Mutex<Vec<DisplayCall>>>) -> Vec<DisplayCall> {
@@ -353,6 +382,21 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn app_publishes_resolved_theme_in_state_snapshot() {
+        // D4: the App owns the resolved theme and exposes it through the
+        // WmState watch, so the bar (Change-2) reads the palette headless.
+        let theme = Arc::new(Theme::default());
+        let (mut app, _log) = app_with_theme(
+            vec![Event::WindowMapRequested(1)],
+            Config::default(),
+            Arc::clone(&theme),
+        );
+        let state_rx = app.bus().state_rx();
+        app.run();
+        assert!(Arc::ptr_eq(&state_rx.borrow().theme, &theme));
     }
 
     #[test]
