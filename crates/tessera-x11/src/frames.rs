@@ -73,7 +73,11 @@ pub(crate) trait FrameOps {
     ) -> Result<(), DErr>;
     /// Repaints `window`'s border with `border_pixel` (theme active/inactive
     /// repaint on focus change, REQ-x11-005 modified / SC-x11-13).
-    fn set_border_pixel(&self, window: Window, border_pixel: u32) -> Result<(), DErr>;
+    /// Default no-op; production code inlines the logic in display_server.rs,
+    /// tests override in FakeFrameOps.
+    fn set_border_pixel(&self, _window: Window, _border_pixel: u32) -> Result<(), DErr> {
+        Ok(())
+    }
     /// Sets input focus to `window`.
     fn focus(&self, window: Window) -> Result<(), DErr>;
     /// Destroys `window`.
@@ -204,9 +208,10 @@ pub(crate) fn create_frame(
     Ok(FrameId(frame))
 }
 
+#[cfg(test)]
 /// Repaints `frame`'s border with `border_pixel` (the X half of a theme
-/// focus repaint, SC-x11-13). The frame is found by the display layer; this
-/// only issues the `ChangeWindowAttributes` that repaints it.
+/// focus repaint, SC-x11-13). In tests, delegates to the trait method which
+/// `FakeFrameOps` records; production code inlines the logic in display_server.rs.
 pub(crate) fn set_border_pixel(
     ops: &impl FrameOps,
     frame: Window,
@@ -215,12 +220,12 @@ pub(crate) fn set_border_pixel(
     ops.set_border_pixel(frame, border_pixel)
 }
 
+#[cfg(test)]
 /// Repaints frame borders on a focus change (REQ-x11-005 modified,
 /// SC-x11-13): the previously focused client's frame (when it differs from
 /// the newly focused one and still has a managed frame) is repainted with the
 /// inactive pixel, and the newly focused client's frame with the active
-/// pixel. Clients without a managed frame are skipped — a focus target can
-/// arrive before `manage()` in a race, and repainting nothing is safe.
+/// pixel. Clients without a managed frame are skipped.
 pub(crate) fn repaint_focus(
     ops: &impl FrameOps,
     frames: &HashMap<WindowId, FrameId>,
@@ -233,10 +238,10 @@ pub(crate) fn repaint_focus(
         .filter(|&prev| prev != next)
         .and_then(|prev| frames.get(&prev))
     {
-        set_border_pixel(ops, frame.0, inactive_pixel)?;
+        ops.set_border_pixel(frame.0, inactive_pixel)?;
     }
     if let Some(frame) = frames.get(&next) {
-        set_border_pixel(ops, frame.0, active_pixel)?;
+        ops.set_border_pixel(frame.0, active_pixel)?;
     }
     Ok(())
 }

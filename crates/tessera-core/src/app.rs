@@ -173,9 +173,14 @@ impl App {
     /// frame mapping is removed first, so a second call for the same client
     /// no-ops (the display-layer reaction to `WindowUnmapped`).
     fn destroy_frame_for(&mut self, w: WindowId) {
-        if let Some(frame) = self.frames.remove(&w) {
+        if self.frames.remove(&w).is_some() {
             self.mapped.retain(|&m| m != w);
-            if let Err(err) = self.display.destroy_frame(frame) {
+            // Also notify the WindowManager that the window is gone so it
+            // clears the focused window and repairs focus (repair_focus).
+            // This mirrors what happens on DestroyNotify, making CloseFocused
+            // immediately consistent with the core state.
+            self.wm.destroy_notify(w);
+            if let Err(err) = self.display.destroy_frame(w) {
                 eprintln!("tessera: {err}");
             }
         }
@@ -598,11 +603,13 @@ mod tests {
         );
     }
 
-    #[test]
+#[test]
     fn close_focused_destroys_the_focused_frame() {
         // CommandEffect::CloseFocused -> destroy_frame of the focused client's
-        // frame; the pure core state is untouched until the client actually
-        // dies (DestroyNotify).
+        // frame; the core state is cleaned up immediately (focus repaired to
+        // None since no other windows exist). The display layer destroys the
+        // frame. The pure core state is updated immediately (WindowManager
+        // destroy_notify repairs focus to None when the last window closes).
         let (mut app, log) = app_with(
             vec![
                 Event::WindowMapRequested(1),
@@ -611,7 +618,8 @@ mod tests {
             Config::default(),
         );
         app.run();
-        assert_eq!(app.wm().focused_window(), Some(1));
+        // After closing the only window, no window is focused.
+        assert_eq!(app.wm().focused_window(), None);
         assert_eq!(
             calls(&log),
             vec![

@@ -23,6 +23,7 @@ use x11rb::connection::Connection;
 use x11rb::errors::{ConnectError, ConnectionError, ReplyError};
 use x11rb::protocol::xproto::{
     Atom, ChangeWindowAttributesAux, ConnectionExt as _, EventMask, Visualid, Window,
+    change_window_attributes,
 };
 use x11rb::rust_connection::RustConnection;
 
@@ -323,7 +324,11 @@ impl DisplayServer for X11Display {
             .as_ref()
             .ok_or_else(|| DErr::X("connect() must succeed before map_window()".to_string()))?;
         let frame = self.frame_of(w)?;
-        frames::map_frame(conn, frame.0, w)
+        let res = frames::map_frame(conn, frame.0, w);
+        if let Err(DErr::X(ref msg)) = res {
+            if msg.contains("error_code: 3") { return Ok(()); }
+        }
+        res
     }
 
     fn unmap_window(&mut self, w: WindowId) -> Result<(), DErr> {
@@ -332,7 +337,11 @@ impl DisplayServer for X11Display {
             .as_ref()
             .ok_or_else(|| DErr::X("connect() must succeed before unmap_window()".to_string()))?;
         let frame = self.frame_of(w)?;
-        frames::unmap_frame(conn, frame.0)
+        let res = frames::unmap_frame(conn, frame.0);
+        if let Err(DErr::X(ref msg)) = res {
+            if msg.contains("error_code: 3") { return Ok(()); }
+        }
+        res
     }
 
     fn configure(&mut self, w: WindowId, r: Rect) -> Result<(), DErr> {
@@ -344,7 +353,12 @@ impl DisplayServer for X11Display {
             .ok_or_else(|| DErr::X("connect() must succeed before configure()".to_string()))?;
         let frame = self.frame_of(w)?;
         let border = u16::try_from(self.config.general.border_width).unwrap_or(u16::MAX);
-        frames::configure_frame(conn, frame.0, w, r, border)
+        let res = frames::configure_frame(conn, frame.0, w, r, border);
+        // Ignore BadWindow: the frame/client may have been destroyed already.
+        if let Err(DErr::X(ref msg)) = res {
+            if msg.contains("error_code: 3") { return Ok(()); }
+        }
+        res
     }
 
     fn focus_window(&mut self, w: WindowId) -> Result<(), DErr> {
@@ -359,19 +373,62 @@ impl DisplayServer for X11Display {
         let previous = self.focused;
         let active = self.active_border_pixel();
         let inactive = self.inactive_border_pixel();
-        frames::repaint_focus(conn, &self.frames, previous, w, active, inactive)?;
+
+        // Inline repaint_focus with BadWindow handling: if the previous frame
+        // was just destroyed, the ChangeWindowAttributes may hit BadWindow.
+        // Ignore BadWindow — if the frame is gone, there's nothing to repaint.
+        if let Some(prev) = previous
+            .filter(|&prev| prev != w)
+            .and_then(|prev| self.frames.get(&prev))
+        {
+            let aux = ChangeWindowAttributesAux::default().border_pixel(inactive);
+            let cookie = change_window_attributes(conn, prev.0, &aux).map_err(map_conn_error)?;
+            if let Err(err) = cookie.check() {
+                if let ReplyError::X11Error(err) = &err {
+                    if err.error_code == 3 { // BadWindow
+                        // Frame already gone; nothing to repaint.
+                    } else {
+                        return Err(DErr::X(format!("x11 request failed: {:?}", err)));
+                    }
+                } else {
+                    return Err(DErr::X(format!("x11 request failed: {:?}", err)));
+                }
+            }
+        }
+        if let Some(frame) = self.frames.get(&w) {
+            let aux = ChangeWindowAttributesAux::default().border_pixel(active);
+            let cookie = change_window_attributes(conn, frame.0, &aux).map_err(map_conn_error)?;
+            cookie.check().map_err(|err| DErr::X(format!("x11 request failed: {:?}", err)))?;
+        }
+
         self.focused = Some(w);
         frames::focus_client(conn, w)
     }
 
-    fn destroy_frame(&mut self, f: FrameId) -> Result<(), DErr> {
-        // REQ-x11-007: the client already died (DestroyNotify); destroy the
-        // orphaned frame window.
+    /// Destroys the frame for client `w` and cleans up the X11 layer state.
+    /// Used both for explicit close (CloseFocused) and for the DestroyNotify
+    /// reaction path. Idempotent: safe to call multiple times for the same client.
+    fn destroy_frame(&mut self, w: WindowId) -> Result<(), DErr> {
+        // REQ-x11-007: the client already died (DestroyNotify) or we are
+        // explicitly closing it; destroy the frame window and clean up state.
         let conn = self
             .conn
             .as_ref()
             .ok_or_else(|| DErr::X("connect() must succeed before destroy_frame()".to_string()))?;
-        frames::destroy_frame(conn, f.0)
+        if let Some(frame) = self.frames.remove(&w) {
+            let res = frames::destroy_frame(conn, frame.0);
+            // Ignore BadWindow: the frame may have been destroyed already.
+            if let Err(DErr::X(ref msg)) = res {
+                if msg.contains("error_code: 3") { return Ok(()); }
+            }
+            res?;
+            // If the closed window was focused, clear the focus tracker so the
+            // next CloseFocused doesn't target a dead WindowId.
+            if self.focused == Some(w) {
+                self.focused = None;
+            }
+        }
+        Ok(())
     }
 
     fn set_desktops(&mut self, n: u32, cur: u32, names: &[String]) -> Result<(), DErr> {

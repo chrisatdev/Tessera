@@ -59,8 +59,9 @@ pub trait DisplayServer {
     fn configure(&mut self, w: WindowId, r: Rect) -> Result<(), DErr>;
     /// Sets X input focus to client `w`.
     fn focus_window(&mut self, w: WindowId) -> Result<(), DErr>;
-    /// Destroys frame `f` (the display-layer reaction to `WindowUnmapped`).
-    fn destroy_frame(&mut self, f: FrameId) -> Result<(), DErr>;
+    /// Destroys the frame of client `w` and cleans up the X layer state.
+    /// Idempotent: safe to call multiple times for the same client.
+    fn destroy_frame(&mut self, w: WindowId) -> Result<(), DErr>;
     /// Syncs the three EWMH desktop properties (recorded only until U4,
     /// REQ-ws-003 / SC-ws-05).
     fn set_desktops(&mut self, n: u32, cur: u32, names: &[String]) -> Result<(), DErr>;
@@ -188,11 +189,11 @@ pub(crate) mod test_double {
             self.calls.lock().unwrap().push(DisplayCall::Focus(w));
             Ok(())
         }
-        fn destroy_frame(&mut self, f: FrameId) -> Result<(), DErr> {
+        fn destroy_frame(&mut self, w: WindowId) -> Result<(), DErr> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(DisplayCall::DestroyFrame(f));
+                .push(DisplayCall::DestroyFrame(FrameId(w)));
             Ok(())
         }
         fn set_desktops(&mut self, n: u32, cur: u32, names: &[String]) -> Result<(), DErr> {
