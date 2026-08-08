@@ -16,11 +16,12 @@
 //! integration tests in U5.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use tessera_core::{Config, DErr, DisplayServer, Event, FrameId, Rect, Theme, WindowId};
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::{ConnectError, ConnectionError, ReplyError};
+use x11rb::protocol::randr::{Connection as RandRConnection, ConnectionExt as _};
 use x11rb::protocol::xproto::{
     Atom, ChangeWindowAttributesAux, ConnectionExt as _, EventMask, Visualid, Window,
 };
@@ -34,8 +35,10 @@ use crate::{ewmh, frames, keyboard};
 pub struct X11Display {
     /// Display name passed to [`X11Display::new`]; `None` means `$DISPLAY`.
     display_name: Option<String>,
-    /// The live connection, created by [`DisplayServer::connect`].
-    conn: Option<RustConnection>,
+    /// The live connection, created by [`DisplayServer::connect`]. Wrapped in
+    /// an [`Arc`] so the bar's dedicated renderer thread (task 2.7) can share
+    /// it with the event loop.
+    conn: Option<Arc<RustConnection>>,
     /// Root window of the connected screen (set by `connect`).
     root: Window,
     /// Root depth of the screen (frame windows use it).
@@ -117,7 +120,7 @@ impl X11Display {
     pub fn root_size(&self) -> Result<Rect, DErr> {
         let conn = self
             .conn
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| DErr::X("connect() must succeed before root_size()".to_string()))?;
         let cookie = conn.get_geometry(self.root).map_err(map_conn_error)?;
         let geom = cookie.reply().map_err(map_reply_error)?;
@@ -127,6 +130,47 @@ impl X11Display {
             w: geom.width,
             h: geom.height,
         })
+    }
+
+    /// The shared connection, so the binary can pass it to the bar's
+    /// dedicated renderer thread (task 2.7). Call after `connect`.
+    pub fn connection(&self) -> Result<Arc<RustConnection>, DErr> {
+        self.conn
+            .clone()
+            .ok_or_else(|| DErr::X("connect() must succeed before connection()".to_string()))
+    }
+
+    /// The root window of the connected screen (call after `connect`).
+    pub fn root(&self) -> Window {
+        self.root
+    }
+
+    /// The root depth, used by the bar window (call after `connect`).
+    pub fn depth(&self) -> u8 {
+        self.depth
+    }
+
+    /// The root visual, used by the bar window (call after `connect`).
+    pub fn visual(&self) -> Visualid {
+        self.visual
+    }
+
+    /// The monitor the bar renders on (design D10): the primary RandR output,
+    /// else the first connected output (lowest id), else the root geometry.
+    /// Never refuses to start — any RandR failure falls back to the full
+    /// screen, logging a warning once.
+    pub fn bar_area(&self) -> Result<Rect, DErr> {
+        let conn = self
+            .conn
+            .as_deref()
+            .ok_or_else(|| DErr::X("connect() must succeed before bar_area()".to_string()))?;
+        match bar_monitor_rect(conn, self.root) {
+            Ok(Some(rect)) => Ok(rect),
+            Ok(None) | Err(_) => {
+                log_bar_fallback_once();
+                self.root_size()
+            }
+        }
     }
 }
 
@@ -152,6 +196,98 @@ pub(crate) fn map_conn_error(err: ConnectionError) -> DErr {
 /// `pub(crate)`: also used by frames/ewmh/keyboard (U4-B).
 pub(crate) fn map_reply_error(err: ReplyError) -> DErr {
     DErr::X(format!("x11 request failed: {err}"))
+}
+
+/// D10: the output the bar renders on — the primary RandR output, else the
+/// first connected output (lowest RandR id), else `None` (the caller falls
+/// back to the root geometry and never refuses to start).
+///
+/// `outputs` is the ordered list of `(RandR output id, connected)` pairs as
+/// returned by `get_screen_resources_current`. A stale primary id that is no
+/// longer in the list cannot win over a real connected output.
+fn pick_bar_output(primary: u32, outputs: &[(u32, bool)]) -> Option<u32> {
+    if primary != x11rb::NONE && outputs.iter().any(|&(id, _)| id == primary) {
+        return Some(primary);
+    }
+    outputs
+        .iter()
+        .find(|(_, connected)| *connected)
+        .map(|(id, _)| *id)
+}
+
+/// Resolves the bar monitor rect over a live connection per D10. `Ok(None)`
+/// (no RandR extension, no output, or an inactive CRTC) and any `Err` both
+/// mean "fall back to the root geometry" for the caller.
+fn bar_monitor_rect(conn: &RustConnection, root: Window) -> Result<Option<Rect>, DErr> {
+    // Register the RANDR extension first: the generated protocol functions
+    // resolve their major opcode through the extension cache.
+    let randr = conn
+        .extension_information("RANDR")
+        .map_err(map_conn_error)?;
+    if randr.is_none() {
+        return Ok(None);
+    }
+    let resources = conn
+        .randr_get_screen_resources_current(root)
+        .map_err(map_conn_error)?
+        .reply()
+        .map_err(map_reply_error)?;
+    let primary = conn
+        .randr_get_output_primary(root)
+        .map_err(map_conn_error)?
+        .reply()
+        .map_err(map_reply_error)?
+        .output;
+    let outputs: Vec<(u32, bool)> = resources
+        .outputs
+        .iter()
+        .map(|&id| {
+            let connected = conn
+                .randr_get_output_info(id, x11rb::CURRENT_TIME)
+                .ok()
+                .and_then(|cookie| cookie.reply().ok())
+                .map(|reply| reply.connection == RandRConnection::CONNECTED)
+                .unwrap_or(false);
+            (id, connected)
+        })
+        .collect();
+    let Some(output) = pick_bar_output(primary, &outputs) else {
+        return Ok(None);
+    };
+    let info = conn
+        .randr_get_output_info(output, x11rb::CURRENT_TIME)
+        .map_err(map_conn_error)?
+        .reply()
+        .map_err(map_reply_error)?;
+    if info.crtc == x11rb::NONE {
+        return Ok(None);
+    }
+    let crtc = conn
+        .randr_get_crtc_info(info.crtc, x11rb::CURRENT_TIME)
+        .map_err(map_conn_error)?
+        .reply()
+        .map_err(map_reply_error)?;
+    if crtc.width == 0 || crtc.height == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Rect {
+        x: crtc.x as i32,
+        y: crtc.y as i32,
+        w: crtc.width,
+        h: crtc.height,
+    }))
+}
+
+/// Warns once when the bar falls back to the full screen because no usable
+/// RandR monitor could be resolved (D10: never refuses to start).
+static BAR_FALLBACK_WARNED: Once = Once::new();
+fn log_bar_fallback_once() {
+    BAR_FALLBACK_WARNED.call_once(|| {
+        eprintln!(
+            "tessera: warning: no usable RandR bar monitor found; \
+             drawing the bar on the full screen"
+        );
+    });
 }
 
 /// The minimal X surface the WM_S0 claim needs (REQ-x11-002), abstracted so
@@ -239,7 +375,7 @@ impl DisplayServer for X11Display {
         self.root = screen.root;
         self.depth = screen.root_depth;
         self.visual = screen.root_visual;
-        self.conn = Some(conn);
+        self.conn = Some(Arc::new(conn));
         Ok(())
     }
 
@@ -249,7 +385,7 @@ impl DisplayServer for X11Display {
         // managed. The claim itself is scripted headless through startup_claim.
         let conn = self
             .conn
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| DErr::X("connect() must succeed before claim_wm()".to_string()))?;
         startup_claim(conn, self.root)?;
         // REQ-x11-008: becoming the WM also means grabbing the configured
@@ -272,7 +408,7 @@ impl DisplayServer for X11Display {
         // only ever sees typed Events. Ok(None) = connection closed.
         let conn = self
             .conn
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| DErr::X("connect() must succeed before next_event()".to_string()))?;
         loop {
             match next_x11_event(conn)? {
@@ -300,7 +436,7 @@ impl DisplayServer for X11Display {
         // modified) so a freshly managed client starts focused-coloured.
         let conn = self
             .conn
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| DErr::X("connect() must succeed before manage()".to_string()))?;
         let border = u16::try_from(self.config.general.border_width).unwrap_or(u16::MAX);
         let active_pixel = self.active_border_pixel();
@@ -320,7 +456,7 @@ impl DisplayServer for X11Display {
     fn map_window(&mut self, w: WindowId) -> Result<(), DErr> {
         let conn = self
             .conn
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| DErr::X("connect() must succeed before map_window()".to_string()))?;
         let frame = self.frame_of(w)?;
         frames::map_frame(conn, frame.0, w)
@@ -329,7 +465,7 @@ impl DisplayServer for X11Display {
     fn unmap_window(&mut self, w: WindowId) -> Result<(), DErr> {
         let conn = self
             .conn
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| DErr::X("connect() must succeed before unmap_window()".to_string()))?;
         let frame = self.frame_of(w)?;
         frames::unmap_frame(conn, frame.0)
@@ -340,7 +476,7 @@ impl DisplayServer for X11Display {
         // placement — the frame takes `r`, the client the frame interior.
         let conn = self
             .conn
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| DErr::X("connect() must succeed before configure()".to_string()))?;
         let frame = self.frame_of(w)?;
         let border = u16::try_from(self.config.general.border_width).unwrap_or(u16::MAX);
@@ -354,7 +490,7 @@ impl DisplayServer for X11Display {
         // `focused`, so the repaint is local, no trait/bus change).
         let conn = self
             .conn
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| DErr::X("connect() must succeed before focus_window()".to_string()))?;
         let previous = self.focused;
         let active = self.active_border_pixel();
@@ -369,7 +505,7 @@ impl DisplayServer for X11Display {
         // orphaned frame window.
         let conn = self
             .conn
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| DErr::X("connect() must succeed before destroy_frame()".to_string()))?;
         frames::destroy_frame(conn, f.0)
     }
@@ -379,7 +515,7 @@ impl DisplayServer for X11Display {
         // properties through ewmh.rs (T18).
         let conn = self
             .conn
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| DErr::X("connect() must succeed before set_desktops()".to_string()))?;
         ewmh::set_desktops(conn, self.root, n, cur, names)
     }
@@ -633,5 +769,58 @@ mod tests {
         d.set_theme(Arc::new(custom));
         assert_eq!(d.active_border_pixel(), 0x0011_2233);
         assert_eq!(d.inactive_border_pixel(), 0x0044_5566);
+    }
+
+    #[test]
+    fn bar_area_requires_a_connection_first() {
+        // Same guard as root_size: the bar monitor is resolved over the live
+        // connection, so a missing connection is an error, never a panic.
+        let d = X11Display::new(None);
+        let err = d.bar_area().unwrap_err();
+        assert!(
+            matches!(err, DErr::X(ref msg) if msg.contains("connect")),
+            "expected an error mentioning connect, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pick_bar_output_prefers_the_primary_output() {
+        // D10: with a primary set, the bar uses exactly that output.
+        assert_eq!(
+            pick_bar_output(5, &[(5, true), (7, true)]),
+            Some(5),
+            "the primary output wins"
+        );
+    }
+
+    #[test]
+    fn pick_bar_output_falls_back_to_the_first_connected_output() {
+        // D10: no primary (NONE) -> the first connected output by RandR id.
+        assert_eq!(
+            pick_bar_output(x11rb::NONE, &[(1, false), (2, true), (3, true)]),
+            Some(2),
+            "the first connected output (lowest id) is the fallback"
+        );
+    }
+
+    #[test]
+    fn pick_bar_output_ignores_a_primary_not_in_the_output_list() {
+        // A stale primary id must not win over a real connected output.
+        assert_eq!(
+            pick_bar_output(99, &[(1, true)]),
+            Some(1),
+            "an unknown primary must not shadow the connected output"
+        );
+    }
+
+    #[test]
+    fn pick_bar_output_returns_none_with_no_connected_output() {
+        // D10: nothing usable -> None, and the caller falls back to the root
+        // geometry (never refuses to start).
+        assert_eq!(
+            pick_bar_output(x11rb::NONE, &[(1, false), (3, false)]),
+            None,
+            "no connected output means no bar monitor"
+        );
     }
 }
