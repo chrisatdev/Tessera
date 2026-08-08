@@ -44,6 +44,10 @@ pub struct App {
     frames: HashMap<WindowId, FrameId>,
     /// Clients whose frame is currently mapped on screen.
     mapped: Vec<WindowId>,
+    /// D4 bar hook: called after every recompute publishes a fresh
+    /// [`WmState`] snapshot. The binary uses it to redraw the bar exactly
+    /// once per recompute — never on idle event polling.
+    on_recompute: Option<Box<dyn FnMut()>>,
 }
 
 impl App {
@@ -67,12 +71,22 @@ impl App {
             layout: MasterStack::default(),
             frames: HashMap::new(),
             mapped: Vec::new(),
+            on_recompute: None,
         }
     }
 
     /// The event bus; subscribe before [`App::run`] to observe the stream.
     pub fn bus(&self) -> Arc<EventBus> {
         Arc::clone(&self.bus)
+    }
+
+    /// Registers a callback invoked after every recompute publishes a fresh
+    /// [`WmState`] snapshot (design D4). The binary hooks the bar here so it
+    /// redraws exactly once per recompute and never on idle event polling.
+    /// The core stays bar-free: it only knows "something wants to hear when
+    /// state changed".
+    pub fn set_on_recompute(&mut self, cb: Box<dyn FnMut()>) {
+        self.on_recompute = Some(cb);
     }
 
     /// The window/workspace core (wiring and tests).
@@ -216,6 +230,11 @@ impl App {
         self.bus
             .publish(Event::PlacementsChanged(self.wm.current_id(), placements));
         self.publish_state();
+        // D4: the bar hook fires here — after the fresh snapshot is on the
+        // watch — once per recompute, and only here (never on idle polling).
+        if let Some(cb) = self.on_recompute.as_mut() {
+            cb();
+        }
         Ok(())
     }
 
@@ -381,6 +400,27 @@ mod tests {
                     }],
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn recompute_hook_fires_once_per_recompute_not_on_idle_events() {
+        // D4 hook (bar drawing, design D4 / task 2.6): the binary redraws the
+        // bar exactly once per recompute — never on idle event polling. A
+        // MapRequest triggers one recompute; a following UnmapNotify does NOT
+        // (its handler never re-tiles), so the hook must fire exactly once.
+        let (mut app, _log) = app_with(
+            vec![Event::WindowMapRequested(1), Event::WindowUnmapNotify(1)],
+            Config::default(),
+        );
+        let fires = Arc::new(Mutex::new(0));
+        let hook = Arc::clone(&fires);
+        app.set_on_recompute(Box::new(move || *hook.lock().unwrap() += 1));
+        app.run();
+        assert_eq!(
+            *fires.lock().unwrap(),
+            1,
+            "the hook must fire once per recompute, never on idle events"
         );
     }
 

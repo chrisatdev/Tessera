@@ -8,5 +8,6 @@ license.workspace = true
 [dependencies]
 tessera-core = { path = "../tessera-core" }
 # "xtest" is only used by the gated integration test (T21) for the XTEST
-# keypress fallback; the library itself never touches the extension.
-x11rb = { version = "0.14", features = ["xtest"] }
+# keypress fallback; "randr" backs the bar monitor resolution (task 2.3,
+# design D10). Neither extension is touched by the library unless asked.
+x11rb = { version = "0.14", features = ["xtest", "randr"] }

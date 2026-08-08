@@ -24,12 +24,17 @@ use std::process::{Child, Command as ProcCommand, Stdio};
 use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
+use x11rb::protocol::randr::Connection as RandRConnection;
+use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xproto::{
-    Atom, ConnectionExt, CreateWindowAux, GetGeometryReply, ImageFormat, MapState, Window,
-    WindowClass,
+    Atom, ConnectionExt, CreateWindowAux, EventMask, GetGeometryReply, ImageFormat, MapState,
+    Window, WindowClass,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
+
+use tessera_core::{BarConfig, Rect};
+use tessera_x11::bar_renderer::tiling_area;
 
 /// X11 core event codes used by the XTEST fallback driver.
 const KEY_PRESS: u8 = 2;
@@ -124,6 +129,12 @@ impl WmChild {
     /// True while the WM process is still running.
     fn alive(&mut self) -> bool {
         matches!(self.0.try_wait(), Ok(None))
+    }
+
+    /// The WM's OS pid, used by the idle-CPU test to read its `/proc/<pid>`
+    /// tick counters.
+    fn pid(&self) -> u32 {
+        self.0.id()
     }
 }
 
@@ -247,25 +258,30 @@ fn border_pixel(conn: &RustConnection, frame: Window) -> u32 {
 }
 
 /// Expected master/stack placement rects under the default layout (ratio 0.5,
-/// border 2), derived from the REAL screen size — the assertion that makes
-/// the root-geometry wiring (T21) observable: a WM still tiling the old
-/// hardcoded 1920x1080 area places its frames elsewhere on the pinned
-/// 1280x1024 Xvfb screen.
-fn expected_placements(area_w: u16, area_h: u16) -> (Geom, Geom) {
+/// border 2), derived from the tiling area — the REAL screen minus the default
+/// top bar (22px, task 2.6) — so the assertions prove both the root-geometry
+/// wiring (T21) and the bar-shrunk area: a WM still tiling the old hardcoded
+/// 1920x1080 area (or the full screen) places its frames elsewhere on the
+/// pinned 1280x1024 Xvfb screen.
+fn expected_placements(area: Rect) -> (Geom, Geom) {
     // Mirrors MasterStack::arrange with ratio 0.5: the placements are already
-    // border-inset (MasterStack::inset).
+    // border-inset (MasterStack::inset), offset by the tiling area's origin.
+    let area_w = area.w;
+    let area_h = area.h;
     let master_w = ((f64::from(area_w) * 0.5).round() as i32).clamp(0, i32::from(area_w)) as u16;
     let stack_w = area_w - master_w;
     let border_x = i16::try_from(BORDER).unwrap_or(i16::MAX);
+    let area_x = i16::try_from(area.x).unwrap_or(i16::MAX);
+    let area_y = i16::try_from(area.y).unwrap_or(i16::MAX);
     let master = (
-        border_x,
-        border_x,
+        area_x + border_x,
+        area_y + border_x,
         master_w - 2 * BORDER,
         area_h - 2 * BORDER,
     );
     let stack = (
-        i16::try_from(i32::from(master_w) + i32::from(BORDER)).unwrap_or(i16::MAX),
-        border_x,
+        area_x + i16::try_from(i32::from(master_w) + i32::from(BORDER)).unwrap_or(i16::MAX),
+        area_y + border_x,
         stack_w - 2 * BORDER,
         area_h - 2 * BORDER,
     );
@@ -401,13 +417,20 @@ fn map_request_tiles_to_real_geometry_and_keys_drive_focus_and_switch() {
 
     // Real screen geometry: the area the WM must tile against. The pinned
     // harness screen (1280x1024x24) is deliberately NOT 1920x1080 so these
-    // expectations can only be met by the root-geometry wiring (T21).
+    // expectations can only be met by the root-geometry wiring (T21). The
+    // default top bar (22px) shrinks the tiling area (task 2.6).
     let root_geom = geom(&conn, root);
     assert!(
         (root_geom.width, root_geom.height) != (1920, 1080),
         "harness screen must differ from the old hardcoded 1920x1080 area"
     );
-    let (master, stack) = expected_placements(root_geom.width, root_geom.height);
+    let monitor = Rect {
+        x: 0,
+        y: 0,
+        w: root_geom.width,
+        h: root_geom.height,
+    };
+    let (master, stack) = expected_placements(tiling_area(monitor, &BarConfig::default()));
 
     // Two normal clients map on the focused workspace. The most recently
     // mapped window is focused, so B starts as master and A in the stack.
@@ -593,4 +616,397 @@ fn custom_theme_file_overrides_frame_border_pixels() {
 
     let _ = std::fs::remove_file(&theme);
     let _ = std::fs::remove_file(&config);
+}
+
+// ------------------------------------------------------------------- bar E2E
+//
+// Task 5.1 (`x11::bar-position::*` tags): the status bar must be drawn along
+// exactly the configured screen edge (default top), and stay idle-cheap. The
+// tests run only under an Xvfb E2E session (same ignore harness as the other
+// suites); selection:
+// ```text
+// xvfb-run -a -s "-screen 0 1280x1024x24" cargo test --test integration -- --ignored bar_position --test-threads=1
+// ```
+
+/// The status bar's default `[bar] thickness` for `Top`/`Bottom` (design D6).
+///
+/// Kept independent of the renderer constants on purpose: the E2E asserts a
+/// concrete, spec-derived number, so a regression in the renderer's default
+/// breaks this test instead of silently matching a copied value.
+const BAR_TOP_BOTTOM_THICKNESS: u16 = 22;
+/// Default `[bar] thickness` for `Left`/`Right` (design D6).
+const BAR_SIDE_THICKNESS: u16 = 6;
+/// The idle window the low-CPU budget is measured over (spec: 60 seconds).
+const CPU_IDLE_WINDOW: Duration = Duration::from_secs(60);
+/// The idle budget: below 5% of one core (spec "Low Idle CPU Overhead").
+const CPU_BUDGET_FRACTION: f64 = 0.05;
+
+/// The status bar's root child window, or `None` before the WM maps it.
+///
+/// The bar and the reparented client frames are both override-redirect, but
+/// frames select `SubstructureNotify` on themselves (frames.rs) while the bar
+/// window requests no events (`BarRenderer::new`), so the two are
+/// distinguishable by `GetWindowAttributes` even when clients are present.
+fn find_bar(conn: &RustConnection, root: Window) -> Option<Window> {
+    conn.query_tree(root)
+        .unwrap()
+        .reply()
+        .unwrap()
+        .children
+        .into_iter()
+        .find(|&w| {
+            conn.get_window_attributes(w)
+                .unwrap()
+                .reply()
+                .is_ok_and(|attrs| {
+                    attrs.override_redirect
+                        && !attrs
+                            .your_event_mask
+                            .contains(EventMask::SUBSTRUCTURE_NOTIFY)
+                        && attrs.map_state == MapState::VIEWABLE
+                })
+        })
+}
+
+/// Writes a `[bar] position = "<position>"` config into a unique temp file
+/// and returns its path.
+fn bar_position_config(position: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "tessera-e2e-bar-position-{position}-{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(&path, format!("[bar]\nposition = \"{position}\"\n"))
+        .expect("write the bar-position config");
+    path
+}
+
+/// Spawns the WM (with `config`, or defaults when `None`) and waits for the
+/// WM_S0 claim, returning the harness pieces the caller asserts over.
+fn spawn_wm(display: &str, config: Option<&Path>) -> (WmChild, RustConnection, Window) {
+    let wm = WmChild::spawn_with_config(display, config);
+    let conn = connect(display);
+    let root = root_of(&conn);
+    let wm_s0 = intern(&conn, b"WM_S0");
+    wait_until("the WM to own WM_S0", || {
+        conn.get_selection_owner(wm_s0)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .owner
+            == root
+    });
+    (wm, conn, root)
+}
+
+/// Asserts `[bar] position = <position>` renders a Viewable bar exactly along
+/// that edge at the default thickness (22px top/bottom, 6px left/right).
+fn assert_bar_position(display: &str, position: &str) {
+    let config = bar_position_config(position);
+    let (_wm, conn, root) = spawn_wm(display, Some(&config));
+    wait_until("the bar window to be mapped", || {
+        find_bar(&conn, root).is_some()
+    });
+    let bar = find_bar(&conn, root).expect("the WM must create the bar window");
+    let bar_geom = geom(&conn, bar);
+    let root_geom = geom(&conn, root);
+    let (rw, rh) = (i32::from(root_geom.width), i32::from(root_geom.height));
+    let expected: Geom = match position {
+        "top" => (0, 0, rw as u16, BAR_TOP_BOTTOM_THICKNESS),
+        "bottom" => (
+            0,
+            i16::try_from(rh - i32::from(BAR_TOP_BOTTOM_THICKNESS)).unwrap_or(i16::MAX),
+            rw as u16,
+            BAR_TOP_BOTTOM_THICKNESS,
+        ),
+        "left" => (0, 0, BAR_SIDE_THICKNESS, rh as u16),
+        "right" => (
+            i16::try_from(rw - i32::from(BAR_SIDE_THICKNESS)).unwrap_or(i16::MAX),
+            0,
+            BAR_SIDE_THICKNESS,
+            rh as u16,
+        ),
+        other => panic!("unknown bar position {other:?}"),
+    };
+    assert!(
+        frame_is(&conn, bar, expected),
+        "the {position} bar must sit at the {position} edge {expected:?}, \
+         got {bar_geom:?} on a {root_geom:?} root"
+    );
+    assert_eq!(
+        map_state(&conn, bar),
+        MapState::VIEWABLE,
+        "the {position} bar must be mapped and visible"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[test]
+#[ignore]
+fn bar_position_top() {
+    assert_bar_position(&display_name(), "top");
+}
+
+#[test]
+#[ignore]
+fn bar_position_bottom() {
+    assert_bar_position(&display_name(), "bottom");
+}
+
+#[test]
+#[ignore]
+fn bar_position_left() {
+    assert_bar_position(&display_name(), "left");
+}
+
+#[test]
+#[ignore]
+fn bar_position_right() {
+    assert_bar_position(&display_name(), "right");
+}
+
+#[test]
+#[ignore]
+fn bar_position_idle_cpu_within_budget_of_one_core() {
+    // SC "Low Idle CPU Overhead": with a visible bar under Xvfb, a 60s idle
+    // window keeps the WM's whole-process CPU (including the dedicated bar
+    // thread) under 5% of one core — the proof that the event loop blocks on
+    // `wait_for_event` (no idle polling) and the bar only draws on recompute
+    // (design D4/D11). The budget is measured as the WM's own tick delta per
+    // the system tick delta across all cores, normalized to ONE core, so the
+    // host's background load cannot inflate the WM's number.
+    let display = display_name();
+    let (mut wm, conn, root) = spawn_wm(&display, None);
+    wait_until("the bar window to be mapped", || {
+        find_bar(&conn, root).is_some()
+    });
+    assert!(
+        wm.alive(),
+        "the WM must still run once the default-config bar is up"
+    );
+
+    // A client opens a workspace, so the bar really paints once; afterwards
+    // nothing touches the WM for the whole idle window.
+    let screen = &conn.setup().roots[0];
+    let client = map_client(&conn, root, screen.root_depth, screen.root_visual);
+    wait_until("the client to be reparented into a frame", || {
+        parent_of(&conn, client) != root
+    });
+
+    let pid = wm.pid();
+    let start = Instant::now();
+    let start_proc = process_cpu_ticks(pid);
+    let start_sys = system_cpu_ticks();
+    while start.elapsed() < CPU_IDLE_WINDOW {
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    let end_proc = process_cpu_ticks(pid);
+    let end_sys = system_cpu_ticks();
+
+    let sys_delta = end_sys.saturating_sub(start_sys);
+    assert!(
+        sys_delta > 0,
+        "the system CPU clock must advance over the idle window"
+    );
+    let proc_delta = end_proc.saturating_sub(start_proc);
+    let cores = system_core_count().max(1);
+    let fraction_of_one_core = proc_delta as f64 * cores as f64 / sys_delta as f64;
+
+    assert!(wm.alive(), "the WM must survive the whole idle window");
+    assert!(
+        fraction_of_one_core < CPU_BUDGET_FRACTION,
+        "idle WM+bar used {:.2}% of one core over {:?} (budget {:.0}%), \
+         proc {proc_delta} ticks vs {sys_delta} system ticks on {cores} cores",
+        fraction_of_one_core * 100.0,
+        CPU_IDLE_WINDOW,
+        CPU_BUDGET_FRACTION * 100.0
+    );
+}
+
+#[test]
+#[ignore]
+fn bar_position_two_outputs_render_only_the_primary() {
+    // Design D10's "bar on the RandR primary output only" needs a REAL
+    // multi-head RandR server. Xvfb exposes exactly one output per screen
+    // (extra `-screen` args create separate X screens — different roots, not
+    // two outputs of one root — and generic RandR has no way to fabricate an
+    // output+CRTC pair headlessly), so under a single-output server this test
+    // records the skip honestly and returns; on a genuine dual-monitor setup
+    // it proves the bar stays inside the primary output and draws no bar that
+    // overlaps a non-primary output.
+    let display = display_name();
+    let (_wm, conn, root) = spawn_wm(&display, None);
+    wait_until("the bar window to be mapped", || {
+        find_bar(&conn, root).is_some()
+    });
+
+    let resources = conn
+        .randr_get_screen_resources_current(root)
+        .unwrap()
+        .reply()
+        .unwrap();
+    let primary_id = conn
+        .randr_get_output_primary(root)
+        .unwrap()
+        .reply()
+        .unwrap()
+        .output;
+
+    let mut connected: Vec<(u32, Rect)> = Vec::new();
+    for &out in resources.outputs.iter() {
+        let info = conn
+            .randr_get_output_info(out, x11rb::CURRENT_TIME)
+            .unwrap()
+            .reply();
+        let info = match info {
+            Ok(reply)
+                if reply.connection == RandRConnection::CONNECTED && reply.crtc != x11rb::NONE =>
+            {
+                reply
+            }
+            _ => continue,
+        };
+        let crtc = conn
+            .randr_get_crtc_info(info.crtc, x11rb::CURRENT_TIME)
+            .unwrap()
+            .reply()
+            .unwrap();
+        if crtc.width == 0 || crtc.height == 0 {
+            continue;
+        }
+        connected.push((
+            out,
+            Rect {
+                x: i32::from(crtc.x),
+                y: i32::from(crtc.y),
+                w: crtc.width,
+                h: crtc.height,
+            },
+        ));
+    }
+
+    if connected.len() < 2 {
+        eprintln!(
+            "skip: two-output primary-only assertion needs a real multi-head \
+             display ({} connected output(s) found)",
+            connected.len()
+        );
+        return;
+    }
+
+    let bar = find_bar(&conn, root).expect("the bar window");
+    let g = geom(&conn, bar);
+    let bar_rect = Rect {
+        x: i32::from(g.x),
+        y: i32::from(g.y),
+        w: g.width,
+        h: g.height,
+    };
+    let primary_rect = connected
+        .iter()
+        .find(|(id, _)| *id == primary_id)
+        .map(|(_, rect)| *rect)
+        .unwrap_or(connected[0].1);
+    assert!(
+        rect_contains(primary_rect, bar_rect),
+        "the bar {bar_rect:?} must sit inside the primary output {primary_rect:?}"
+    );
+    for (id, rect) in connected {
+        if rect == primary_rect {
+            continue;
+        }
+        assert!(
+            !rects_overlap(bar_rect, rect),
+            "the bar {bar_rect:?} must not overlap the non-primary \
+             output {id} ({rect:?})"
+        );
+    }
+}
+
+/// Sum of `utime`+`stime` (fields 14/15 of each thread's stat file) across
+/// every thread of `pid` — the whole-process CPU the bar renderer thread
+/// contributes to. Reading only `/proc/<pid>/stat` would miss the dedicated
+/// bar thread (that file reports the thread-group leader only).
+fn process_cpu_ticks(pid: u32) -> u64 {
+    let task_dir = Path::new("/proc").join(pid.to_string()).join("task");
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(&task_dir)
+        .unwrap_or_else(|err| panic!("cannot read {task_dir:?} for pid {pid}: {err}"))
+    {
+        let stat = std::fs::read_to_string(entry.unwrap().path().join("stat"))
+            .unwrap_or_else(|err| panic!("cannot read thread stat for pid {pid}: {err}"));
+        // `pid (comm) state ppid ... utime stime ...`: after the closing `)`
+        // the first token is field 3 (state), so utime (field 14) is token 11
+        // and stime (field 15) is token 12.
+        let after_comm = stat.rsplit(')').next().expect("a stat line ends with ')'");
+        let mut fields = after_comm.split_whitespace();
+        let utime: u64 = fields
+            .nth(11)
+            .unwrap_or_else(|| panic!("no utime field in stat {stat:?}"))
+            .parse()
+            .unwrap_or_else(|err| panic!("utime parse: {err}"));
+        let stime: u64 = fields
+            .next()
+            .unwrap_or_else(|| panic!("no stime field in stat {stat:?}"))
+            .parse()
+            .unwrap_or_else(|err| panic!("stime parse: {err}"));
+        total += utime + stime;
+    }
+    total
+}
+
+/// Total system CPU ticks across all cores (the first `/proc/stat` line), in
+/// the same USER_HZ unit as the process tick fields.
+fn system_cpu_ticks() -> u64 {
+    let stat = std::fs::read_to_string("/proc/stat").expect("cannot read /proc/stat");
+    let cpu = stat.lines().next().expect("cpu line");
+    cpu.split_whitespace()
+        .skip(1)
+        .take(8)
+        .map(|token| token.parse::<u64>().unwrap_or(0))
+        .sum()
+}
+
+/// Number of online CPUs (the `cpuN` lines in `/proc/stat`).
+fn system_core_count() -> usize {
+    let stat = std::fs::read_to_string("/proc/stat").expect("cannot read /proc/stat");
+    stat.lines()
+        .filter(|line| {
+            line.starts_with("cpu") && line.as_bytes().get(3).is_some_and(|b| b.is_ascii_digit())
+        })
+        .count()
+}
+
+/// Whether rect `a` lies entirely inside rect `b` (i64 math so negative
+/// CRT-relative coordinates on real multi-head roots cannot overflow).
+fn rect_contains(outer: Rect, inner: Rect) -> bool {
+    let (ox, oy, ow, oh) = (
+        i64::from(outer.x),
+        i64::from(outer.y),
+        i64::from(outer.w),
+        i64::from(outer.h),
+    );
+    let (ix, iy, iw, ih) = (
+        i64::from(inner.x),
+        i64::from(inner.y),
+        i64::from(inner.w),
+        i64::from(inner.h),
+    );
+    ix >= ox && iy >= oy && ix + iw <= ox + ow && iy + ih <= oy + oh
+}
+
+/// Whether rects `a` and `b` share at least one pixel.
+fn rects_overlap(a: Rect, b: Rect) -> bool {
+    let (ax, ay, aw, ah) = (
+        i64::from(a.x),
+        i64::from(a.y),
+        i64::from(a.w),
+        i64::from(a.h),
+    );
+    let (bx, by, bw, bh) = (
+        i64::from(b.x),
+        i64::from(b.y),
+        i64::from(b.w),
+        i64::from(b.h),
+    );
+    ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah
 }
