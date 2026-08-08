@@ -19,7 +19,7 @@ pub mod workspace;
 pub use app::{App, command_for_key};
 pub use bus::{EventBus, EventMask, WmState, WorkspaceState};
 pub use command::Command;
-pub use config::{Config, GeneralConfig, Keybindings};
+pub use config::{BarConfig, BarPosition, Config, GeneralConfig, Keybindings};
 pub use display::{DErr, DisplayServer, FrameId, spawn_program};
 pub use event::{Event, KeyCombo};
 pub use geometry::{LayoutKind, Placement, Rect, WindowId, WorkspaceId};

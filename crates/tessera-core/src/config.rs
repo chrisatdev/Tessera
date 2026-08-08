@@ -3,9 +3,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 
 use crate::event::KeyCombo;
+use crate::theme::Color;
 
 /// Modifier mask for the "Super" (Mod4) key.
 ///
@@ -28,6 +29,10 @@ pub struct Config {
     pub general: GeneralConfig,
     #[serde(default)]
     pub keybindings: Keybindings,
+    /// Status-bar configuration (`[bar]` table, design D5). Additive: a config
+    /// without the table uses `BarConfig::default()` (top edge, visible).
+    #[serde(default)]
+    pub bar: BarConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -64,6 +69,91 @@ fn default_gaps() -> u32 {
 }
 fn default_terminal() -> String {
     "alacritty".to_string()
+}
+
+/// Screen edge the status bar is drawn on (`[bar] position`).
+///
+/// Deserializes from the lowercase strings `"top" | "bottom" | "left" |
+/// "right"`; any other value is a strict-TOML parse error (spec scenario
+/// "Invalid position string").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BarPosition {
+    #[default]
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// Status-bar configuration (`[bar]` table, design D5/D6).
+///
+/// Strict-TOML: unknown keys are rejected, matching `GeneralConfig`. Colors
+/// reuse the shared `#RRGGBB`-only `Color` deserializer (design OQ4).
+/// `thickness` is `None` when omitted, letting the renderer resolve the
+/// per-edge default (22px top/bottom, 6px left/right) from `position`; an
+/// explicit value is uniform and MUST be in `1..=200` (spec scenario
+/// "Thickness bounds").
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BarConfig {
+    #[serde(default)]
+    pub position: BarPosition,
+    #[serde(default, deserialize_with = "deserialize_thickness")]
+    pub thickness: Option<u16>,
+    #[serde(default = "default_bar_bg_color")]
+    pub bg_color: Color,
+    #[serde(default = "default_bar_fg_color")]
+    pub fg_color: Color,
+    #[serde(default = "default_bar_visible")]
+    pub visible: bool,
+}
+
+impl Default for BarConfig {
+    fn default() -> Self {
+        BarConfig {
+            position: BarPosition::Top,
+            thickness: None,
+            bg_color: default_bar_bg_color(),
+            fg_color: default_bar_fg_color(),
+            visible: default_bar_visible(),
+        }
+    }
+}
+
+fn default_bar_bg_color() -> Color {
+    Color {
+        r: 0x22,
+        g: 0x22,
+        b: 0x22,
+    }
+}
+fn default_bar_fg_color() -> Color {
+    Color {
+        r: 0xEE,
+        g: 0xEE,
+        b: 0xEE,
+    }
+}
+fn default_bar_visible() -> bool {
+    true
+}
+
+/// Validates an explicit `[bar] thickness` at parse time.
+///
+/// A missing field keeps `None` (per-edge default, design D6). A present value
+/// out of `1..=200` aborts startup with a config-validation error naming the
+/// field (spec scenario "Thickness bounds": `0` and `> 200` are rejected).
+fn deserialize_thickness<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<u16>::deserialize(deserializer)?;
+    match raw {
+        Some(0) => Err(de::Error::custom("bar.thickness must be in 1..=200")),
+        Some(n) if n > 200 => Err(de::Error::custom("bar.thickness must be in 1..=200")),
+        other => Ok(other),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -288,5 +378,133 @@ mod tests {
         // Absent theme stays None even when other general keys are present.
         let e = Config::parse("[general]\ngaps = 6\n").expect("valid");
         assert_eq!(e.general.theme, None);
+    }
+
+    // === Bar config ([bar] table) — PR1 / Work Unit 1 (tessera-bar-login) ===
+
+    #[test]
+    fn bar_defaults_when_table_absent() {
+        // Spec: no `[bar]` table (or `position` omitted) -> top edge, default
+        // colors, visible; thickness `None` resolves to the per-edge default
+        // at draw time (design D6).
+        let c = Config::parse("[general]\n").expect("valid toml");
+        assert_eq!(c.bar.position, BarPosition::Top);
+        assert_eq!(c.bar.thickness, None);
+        assert_eq!(c.bar.bg_color, Color::parse_hex("#222222").expect("hex"));
+        assert_eq!(c.bar.fg_color, Color::parse_hex("#eeeeee").expect("hex"));
+        assert!(c.bar.visible);
+        // The serde defaults agree with the manual Default constructor, so
+        // `Config::default()` and a parsed empty config cannot drift apart.
+        assert_eq!(Config::default().bar, BarConfig::default());
+        assert_eq!(Config::default().bar, c.bar);
+    }
+
+    #[test]
+    fn bar_position_parses_all_lowercase_variants() {
+        // Triangulation: each enum variant must deserialize from its exact
+        // lowercase string (serde rename_all = "lowercase").
+        for (raw, want) in [
+            ("top", BarPosition::Top),
+            ("bottom", BarPosition::Bottom),
+            ("left", BarPosition::Left),
+            ("right", BarPosition::Right),
+        ] {
+            let c = Config::parse(&format!("[bar]\nposition = \"{raw}\"\n")).expect("valid toml");
+            assert_eq!(c.bar.position, want);
+        }
+    }
+
+    #[test]
+    fn bar_full_explicit_config_applies() {
+        // Spec scenario "Full explicit config": all five fields parsed.
+        let raw = "[bar]\nposition = \"bottom\"\nthickness = 28\nbg_color = \"#112233\"\nfg_color = \"#445566\"\nvisible = true\n";
+        let c = Config::parse(raw).expect("valid toml");
+        assert_eq!(c.bar.position, BarPosition::Bottom);
+        assert_eq!(c.bar.thickness, Some(28));
+        assert_eq!(c.bar.bg_color, Color::parse_hex("#112233").expect("hex"));
+        assert_eq!(c.bar.fg_color, Color::parse_hex("#445566").expect("hex"));
+        assert!(c.bar.visible);
+    }
+
+    #[test]
+    fn bar_rejects_unknown_field_naming_key() {
+        // Spec scenario "Unknown field rejected": strict-TOML error names the
+        // offending key and the accepted field set. (toml 0.9's serde error
+        // for a nested `deny_unknown_fields` table names the key but not the
+        // parent table path; the key is identified precisely.)
+        let err = Config::parse("[bar]\nflavor = \"cherry\"\n").expect_err("must reject");
+        assert!(
+            format!("{err:?}").contains("flavor"),
+            "unexpected err: {err:?}"
+        );
+        assert!(
+            format!("{err:?}").contains("expected one of"),
+            "unexpected err: {err:?}"
+        );
+    }
+
+    #[test]
+    fn bar_rejects_thickness_zero() {
+        let err = Config::parse("[bar]\nthickness = 0\n").expect_err("must reject");
+        assert!(
+            format!("{err:?}").contains("thickness"),
+            "unexpected err: {err:?}"
+        );
+    }
+
+    #[test]
+    fn bar_rejects_thickness_above_200() {
+        for n in [201u16, 1000] {
+            let raw = format!("[bar]\nthickness = {n}\n");
+            let err = Config::parse(&raw).expect_err("must reject");
+            assert!(
+                format!("{err:?}").contains("thickness"),
+                "unexpected err: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bar_visible_false_parses() {
+        // Spec scenario "Visible=false hides bar": parses, and only visibility
+        // flips; the remaining fields keep their defaults.
+        let c = Config::parse("[bar]\nvisible = false\n").expect("valid toml");
+        assert!(!c.bar.visible);
+        assert_eq!(c.bar.position, BarPosition::Top);
+        assert_eq!(c.bar.thickness, None);
+    }
+
+    #[test]
+    fn bar_rejects_invalid_position_string() {
+        // Spec scenario "Invalid position string": "diagonal" is not a variant.
+        let err = Config::parse("[bar]\nposition = \"diagonal\"\n").expect_err("must reject");
+        assert!(
+            format!("{err:?}").contains("position"),
+            "unexpected err: {err:?}"
+        );
+    }
+
+    #[test]
+    fn bar_rejects_non_rrggbb_colors() {
+        // Design OQ4: colors are restricted to `#RRGGBB`; named X colors and
+        // malformed hex are rejected by the shared `Color` deserializer.
+        let err = Config::parse("[bar]\nbg_color = \"red\"\n").expect_err("must reject");
+        assert!(
+            format!("{err:?}").contains("bg_color"),
+            "unexpected err: {err:?}"
+        );
+        let err = Config::parse("[bar]\nfg_color = \"#12345\"\n").expect_err("must reject");
+        assert!(
+            format!("{err:?}").contains("fg_color"),
+            "unexpected err: {err:?}"
+        );
+    }
+
+    #[test]
+    fn bar_types_reexported_from_crate_root() {
+        // Task 1.2: `BarConfig` and `BarPosition` are visible at the crate
+        // root, not only via `config::`.
+        assert_eq!(crate::BarPosition::Top, BarPosition::Top);
+        let _ = crate::BarConfig::default();
     }
 }
