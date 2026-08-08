@@ -31,6 +31,9 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
+use tessera_core::{BarConfig, Rect};
+use tessera_x11::bar_renderer::tiling_area;
+
 /// X11 core event codes used by the XTEST fallback driver.
 const KEY_PRESS: u8 = 2;
 const KEY_RELEASE: u8 = 3;
@@ -247,25 +250,30 @@ fn border_pixel(conn: &RustConnection, frame: Window) -> u32 {
 }
 
 /// Expected master/stack placement rects under the default layout (ratio 0.5,
-/// border 2), derived from the REAL screen size — the assertion that makes
-/// the root-geometry wiring (T21) observable: a WM still tiling the old
-/// hardcoded 1920x1080 area places its frames elsewhere on the pinned
-/// 1280x1024 Xvfb screen.
-fn expected_placements(area_w: u16, area_h: u16) -> (Geom, Geom) {
+/// border 2), derived from the tiling area — the REAL screen minus the default
+/// top bar (22px, task 2.6) — so the assertions prove both the root-geometry
+/// wiring (T21) and the bar-shrunk area: a WM still tiling the old hardcoded
+/// 1920x1080 area (or the full screen) places its frames elsewhere on the
+/// pinned 1280x1024 Xvfb screen.
+fn expected_placements(area: Rect) -> (Geom, Geom) {
     // Mirrors MasterStack::arrange with ratio 0.5: the placements are already
-    // border-inset (MasterStack::inset).
+    // border-inset (MasterStack::inset), offset by the tiling area's origin.
+    let area_w = area.w;
+    let area_h = area.h;
     let master_w = ((f64::from(area_w) * 0.5).round() as i32).clamp(0, i32::from(area_w)) as u16;
     let stack_w = area_w - master_w;
     let border_x = i16::try_from(BORDER).unwrap_or(i16::MAX);
+    let area_x = i16::try_from(area.x).unwrap_or(i16::MAX);
+    let area_y = i16::try_from(area.y).unwrap_or(i16::MAX);
     let master = (
-        border_x,
-        border_x,
+        area_x + border_x,
+        area_y + border_x,
         master_w - 2 * BORDER,
         area_h - 2 * BORDER,
     );
     let stack = (
-        i16::try_from(i32::from(master_w) + i32::from(BORDER)).unwrap_or(i16::MAX),
-        border_x,
+        area_x + i16::try_from(i32::from(master_w) + i32::from(BORDER)).unwrap_or(i16::MAX),
+        area_y + border_x,
         stack_w - 2 * BORDER,
         area_h - 2 * BORDER,
     );
@@ -401,13 +409,20 @@ fn map_request_tiles_to_real_geometry_and_keys_drive_focus_and_switch() {
 
     // Real screen geometry: the area the WM must tile against. The pinned
     // harness screen (1280x1024x24) is deliberately NOT 1920x1080 so these
-    // expectations can only be met by the root-geometry wiring (T21).
+    // expectations can only be met by the root-geometry wiring (T21). The
+    // default top bar (22px) shrinks the tiling area (task 2.6).
     let root_geom = geom(&conn, root);
     assert!(
         (root_geom.width, root_geom.height) != (1920, 1080),
         "harness screen must differ from the old hardcoded 1920x1080 area"
     );
-    let (master, stack) = expected_placements(root_geom.width, root_geom.height);
+    let monitor = Rect {
+        x: 0,
+        y: 0,
+        w: root_geom.width,
+        h: root_geom.height,
+    };
+    let (master, stack) = expected_placements(tiling_area(monitor, &BarConfig::default()));
 
     // Two normal clients map on the focused workspace. The most recently
     // mapped window is focused, so B starts as master and A in the stack.

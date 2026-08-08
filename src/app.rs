@@ -1,11 +1,14 @@
 //! Binary wiring (T20): assemble the X display layer, the core [`App`] and
 //! the bar placeholder, then run the loop (REQ-x11-001/002, SC-x11-01).
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use tessera_core::{App, Config, DErr, DisplayServer, Theme};
 use tessera_x11::X11Display;
+use tessera_x11::bar_renderer::tiling_area;
 
 use crate::bar::Bar;
 
@@ -80,13 +83,13 @@ pub fn resolve_theme(config: &Config) -> Theme {
     }
 }
 
-/// Wires core + x11 (+ the bar placeholder) and runs the loop (SC-x11-01).
+/// Wires core + x11 + the bar and runs the loop (SC-x11-01).
 ///
 /// Startup aborts with `Err` when the display is unreachable (REQ-x11-001,
 /// SC-x11-02) or the WM_S0 claim fails (REQ-x11-002, SC-x11-04); [`main`]
 /// maps that to a non-zero exit. The bar consumes the WmState watch
-/// (REQ-bus-004, T19); its live per-iteration rendering lands with the real
-/// bar (later change).
+/// (REQ-bus-004, T19): its renderer lives on a dedicated thread (task 2.7)
+/// drawing once per recompute (design D4).
 pub fn run(args: &CliArgs) -> Result<(), DErr> {
     // Config: explicit file, or defaults. A bad file aborts startup (there is
     // no previous config at boot to keep — D6 covers reloads only).
@@ -108,20 +111,50 @@ pub fn run(args: &CliArgs) -> Result<(), DErr> {
     x11.connect()?;
     // REQ-x11-002: another WM owning WM_S0 aborts startup (SC-x11-04).
     x11.claim_wm()?;
-    // T21: the tiling area is the real screen geometry, queried from the root
-    // window after connect (replaces the hardcoded 1920x1080 const).
-    let area = x11.root_size()?;
+    // The bar's monitor (design D10: primary RandR output, else first
+    // connected, else full screen with a once-only warning) and the tiling
+    // area it leaves once the bar is subtracted (task 2.6).
+    let bar_area = x11.bar_area()?;
+    let area = tiling_area(bar_area, &config.bar);
+    // The bar thread shares the X connection (task 2.7); grab the pieces
+    // before `x11` is moved into the core App.
+    let conn = x11.connection()?;
+    let root = x11.root();
+    let depth = x11.depth();
+    let visual = x11.visual();
+    let bar_config = config.bar.clone();
     // SC-x11-01: connected and claimed -> the core loop runs.
     // T4 seam (D4): the resolved theme rides through App::new into the
     // WmState watch; the X layer already holds the same Arc (dual injection).
     let mut app = App::new(Box::new(x11), config, theme, area);
-    // T19: the bar subscribes to the WmState watch and catches up to the
-    // complete current snapshot (SC-bus-04). The watch is live during run();
-    // refresh() after the loop reads the final snapshot it carried.
-    let mut bar = Bar::new(app.bus().state_rx());
+    // T19/task 2.7: the bar subscribes to the WmState watch and catches up to
+    // the complete current snapshot (SC-bus-04), then renders it on its own
+    // thread. `Rc<RefCell<_>>` keeps the bar alive after the hook below moves
+    // a clone into the App; the worker thread joins when the last clone drops.
+    let bar = Rc::new(RefCell::new(Bar::spawn(
+        conn,
+        root,
+        depth,
+        visual,
+        bar_area,
+        &bar_config,
+        app.bus().state_rx(),
+    )?));
+    // D4: draw exactly once per recompute — never on idle event polling, so
+    // an idle WM issues no X traffic from the bar. `recompute()` -> the hook
+    // (fires after `publish_state`, so the snapshot is fresh).
+    let draw_bar = Rc::clone(&bar);
+    let snapshot_rx = app.bus().state_rx();
+    app.set_on_recompute(Box::new(move || {
+        if let Err(err) = draw_bar.borrow_mut().draw(&snapshot_rx.borrow()) {
+            eprintln!("tessera: {err}");
+        }
+    }));
     app.run();
-    bar.refresh();
-    eprintln!("tessera: bar: {}", bar.render());
+    // The watch is live during run(); refresh() after the loop reads the
+    // final snapshot it carried.
+    bar.borrow_mut().refresh();
+    eprintln!("tessera: bar: {}", bar.borrow().render());
     Ok(())
 }
 

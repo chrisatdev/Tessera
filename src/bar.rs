@@ -1,84 +1,182 @@
-//! Status-bar placeholder (T19, REQ-bus-004 / SC-bus-04).
+//! Status-bar binary wrapper (T19/Phase-2, REQ-bus-004 / SC-bus-04).
 //!
-//! The real bar (X drawing) is a later change; this placeholder owns the
-//! snapshot-consumer seam — it subscribes to the WmState watch and renders
-//! the complete current snapshot as plain text. It has zero X dependencies:
-//! it consumes [`WmState`] only, so it can be promoted to its own crate later
-//! (design: a `src/bar.rs` module in the binary crate for now).
+//! Owns the snapshot-consumer seam: [`Bar`] subscribes to the WmState watch
+//! and keeps the complete current snapshot as plain text ([`Bar::render`]).
+//! Phase 2 replaces the placeholder output with a real X-drawn bar: a
+//! [`BarRenderer`] runs on its own dedicated thread (task 2.7) over the
+//! shared connection, and [`Bar::draw`] feeds it exactly one snapshot per
+//! recompute (design D4 — never on idle event polling).
+//!
+//! The snapshot seam is X-free: [`Bar::new`] builds a bar that only renders
+//! text, which the 4 existing bar unit tests depend on. [`Bar::spawn`] is the
+//! real constructor (X connection + renderer thread).
 
-use tessera_core::WmState;
+use std::sync::Arc;
+use std::sync::mpsc;
+use std::thread;
+
 use tessera_core::bus::StateReceiver;
+use tessera_core::{BarConfig, DErr, Rect, WmState};
+use tessera_x11::{BarRenderer, RustConnection, Visualid, Window};
 
 /// Snapshot consumer for the status bar (REQ-bus-004 / SC-bus-04).
 ///
 /// Holds the latest [`WmState`] published on the watch and renders it as
-/// plain text. The actual X drawing is a later change; this placeholder owns
-/// the seam — it must NOT depend on X specifics, only consume [`WmState`].
+/// plain text; when spawned with an X connection it also forwards each
+/// recompute snapshot to a dedicated bar-renderer thread (task 2.7, D4).
 pub struct Bar {
-    /// The watch receiver; [`Bar::refresh`] pulls the newest snapshot from it.
+    /// The watch receiver; [`Bar::refresh`] pulls the newest snapshot.
     state_rx: StateReceiver,
     /// The complete current snapshot (SC-bus-04).
     latest: WmState,
+    /// The dedicated renderer thread, present when spawned with X.
+    worker: Option<BarWorker>,
+}
+
+/// The dedicated bar-renderer thread plus the channel that feeds it one
+/// snapshot per recompute (task 2.7). Draining the channel (closing the
+/// sender) makes the thread finish its current draw and exit.
+struct BarWorker {
+    tx: mpsc::Sender<WmState>,
+    handle: Option<thread::JoinHandle<()>>,
 }
 
 impl Bar {
     /// Subscribes to the WmState watch and immediately captures the complete
-    /// current snapshot (SC-bus-04: a new consumer catches up to the full
-    /// current state, not the event history).
-    pub fn new(state_rx: StateReceiver) -> Self {
+    /// current snapshot (SC-bus-04). X-free: `render`/`latest` stay usable
+    /// without a display (the snapshot-seam contract the tests rely on).
+    #[cfg(test)]
+    pub(crate) fn new(state_rx: StateReceiver) -> Self {
         let latest = state_rx.borrow();
-        Bar { state_rx, latest }
+        Bar {
+            state_rx,
+            latest,
+            worker: None,
+        }
+    }
+
+    /// Real constructor (task 2.7): spawns the dedicated renderer thread
+    /// owning a [`BarRenderer`] over the shared connection. [`Bar::draw`]
+    /// then feeds it one snapshot per recompute. Never aborts on a renderer
+    /// problem beyond its own error.
+    pub fn spawn(
+        conn: Arc<RustConnection>,
+        root: Window,
+        depth: u8,
+        visual: Visualid,
+        monitor: Rect,
+        bar: &BarConfig,
+        state_rx: StateReceiver,
+    ) -> Result<Self, DErr> {
+        let latest = state_rx.borrow();
+        let renderer = BarRenderer::new(Arc::clone(&conn), root, depth, visual, monitor, bar)?;
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::Builder::new()
+            .name("tessera-bar".to_string())
+            .spawn(move || bar_thread(rx, renderer))
+            .map_err(|err| DErr::X(format!("cannot spawn the bar thread: {err}")))?;
+        Ok(Bar {
+            state_rx,
+            latest,
+            worker: Some(BarWorker {
+                tx,
+                handle: Some(handle),
+            }),
+        })
+    }
+
+    /// Forwards one recompute snapshot to the renderer thread (D4: the
+    /// binary hook fires once per recompute, so the bar draws once per
+    /// recompute — never on idle event polling). Also keeps the snapshot
+    /// seam current. Without a spawned thread this is a safe no-op (the
+    /// X-free snapshot seam).
+    pub fn draw(&mut self, state: &WmState) -> Result<(), DErr> {
+        self.latest = state.clone();
+        if let Some(worker) = &self.worker {
+            worker
+                .tx
+                .send(state.clone())
+                .map_err(|_| DErr::X("the bar thread has stopped".to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Pulls the newest snapshot from the watch (the core republishes state
+    /// after every placement change — `recompute` -> `publish_state`).
+    pub fn refresh(&mut self) {
+        self.latest = self.state_rx.borrow();
     }
 
     /// The complete current snapshot the bar holds. Test-facing today: the
     /// placeholder's output path is [`Bar::render`]; the real bar's read path
-    /// will promote this accessor.
+    /// promotes this accessor.
     #[cfg(test)]
     pub(crate) fn latest(&self) -> &WmState {
         &self.latest
     }
 
-    /// Pulls the newest snapshot from the watch. The core republishes state
-    /// after every placement change (`recompute` -> `publish_state`); in the
-    /// single-threaded binary this is called when the app re-reads state. A
-    /// blocking `changed()` consumer belongs to the real bar (later change).
-    pub fn refresh(&mut self) {
-        self.latest = self.state_rx.borrow();
-    }
-
     /// A plain-text, render-ready line for the snapshot, e.g. `*1[2]:2,3 2:4`
     /// (current workspace 1 focused on window 2 with windows 2,3, then
-    /// workspace 2 focused on window 4). The X drawing is a later change.
+    /// workspace 2 focused on window 4).
     pub fn render(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        for ws in &self.latest.workspaces {
-            let mut part = String::new();
-            if ws.id == self.latest.current {
-                part.push('*');
+        render_text(&self.latest)
+    }
+}
+
+impl Drop for Bar {
+    fn drop(&mut self) {
+        // Signal the renderer thread to finish its last draw and exit, then
+        // wait so a final in-flight flush is not torn down mid-draw.
+        if let Some(worker) = self.worker.take() {
+            drop(worker.tx);
+            if let Some(handle) = worker.handle {
+                let _ = handle.join();
             }
-            part.push_str(&ws.name);
-            if let Some(focus) = ws.focus {
-                part.push('[');
-                part.push_str(&focus.to_string());
-                part.push(']');
-            }
-            if !ws.windows.is_empty() {
-                part.push(':');
-                part.push_str(
-                    &ws.windows
-                        .iter()
-                        .map(|w| w.to_string())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                );
-            }
-            parts.push(part);
         }
-        if parts.is_empty() {
-            "no workspaces".to_string()
-        } else {
-            parts.join(" ")
+    }
+}
+
+/// The renderer thread loop: draw exactly once per received snapshot, then
+/// wait for the next one. A closed channel (the [`Bar`] was dropped) exits.
+fn bar_thread(rx: mpsc::Receiver<WmState>, renderer: BarRenderer<Arc<RustConnection>>) {
+    while let Ok(state) = rx.recv() {
+        if let Err(err) = renderer.draw(&state) {
+            eprintln!("tessera: {err}");
         }
+    }
+}
+
+/// Plain-text rendering of a snapshot (the placeholder's output, kept as the
+/// snapshot-seam contract for the bar tests).
+fn render_text(state: &WmState) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for ws in &state.workspaces {
+        let mut part = String::new();
+        if ws.id == state.current {
+            part.push('*');
+        }
+        part.push_str(&ws.name);
+        if let Some(focus) = ws.focus {
+            part.push('[');
+            part.push_str(&focus.to_string());
+            part.push(']');
+        }
+        if !ws.windows.is_empty() {
+            part.push(':');
+            part.push_str(
+                &ws.windows
+                    .iter()
+                    .map(|w| w.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        "no workspaces".to_string()
+    } else {
+        parts.join(" ")
     }
 }
 
@@ -166,5 +264,16 @@ mod tests {
         let bus = bus();
         let bar = Bar::new(bus.state_rx());
         assert_eq!(bar.render(), "no workspaces");
+    }
+
+    #[test]
+    fn draw_is_a_safe_noop_without_a_spawned_renderer_thread() {
+        // The X-free snapshot seam: a bar built with `new` has no renderer
+        // thread, so draw must accept (and drop) snapshots without error.
+        let bus = bus();
+        let mut bar = Bar::new(bus.state_rx());
+        bar.draw(&state(1, Some(7), vec![ws(1, "1", vec![7], Some(7))]))
+            .unwrap();
+        assert_eq!(bar.render(), "*1[7]:7");
     }
 }
