@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Tessera
+Comment=Minimal X11 tiling window manager
+Exec=tessera
+DesktopNames=Tessera
