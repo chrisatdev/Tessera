@@ -422,9 +422,9 @@ mod tests {
         let launcher_grabs: Vec<(u16, u8)> = calls
             .iter()
             .filter_map(|c| match c {
-                KeyboardCall::Grab { modifiers, keycode, .. }
-                    if [4, 6, 20, 36, 22, 38, 52, 54].contains(modifiers) =>
-                {
+                KeyboardCall::Grab {
+                    modifiers, keycode, ..
+                } if [4, 6, 20, 36, 22, 38, 52, 54].contains(modifiers) => {
                     Some((*modifiers, *keycode))
                 }
                 _ => None,
@@ -463,7 +463,10 @@ mod tests {
             .iter()
             .filter(|c| matches!(c, KeyboardCall::Grab { keycode: 36, .. }))
             .count();
-        assert_eq!(keycode_36_grabs, 8, "identical combos collapse to one 8-grab set");
+        assert_eq!(
+            keycode_36_grabs, 8,
+            "identical combos collapse to one 8-grab set"
+        );
     }
 
     #[test]
@@ -499,15 +502,15 @@ mod tests {
         // (raw mods, keycode, expected stripped mods) — each row is a press
         // one of the lock-variant grabs would deliver.
         let rows = [
-            (u32::from(MOD_SUPER), 36, u32::from(MOD_SUPER)),          // 64 -> 64
-            (u32::from(MOD_SUPER) | 2, 36, u32::from(MOD_SUPER)),      // +CapsLock
-            (u32::from(MOD_SUPER) | 16, 36, u32::from(MOD_SUPER)),     // +NumLock
+            (u32::from(MOD_SUPER), 36, u32::from(MOD_SUPER)), // 64 -> 64
+            (u32::from(MOD_SUPER) | 2, 36, u32::from(MOD_SUPER)), // +CapsLock
+            (u32::from(MOD_SUPER) | 16, 36, u32::from(MOD_SUPER)), // +NumLock
             (u32::from(MOD_SUPER) | 2 | 16 | 32, 36, u32::from(MOD_SUPER)), // all locks
-            (u32::from(MOD_SUPER) | 8, 36, u32::from(MOD_SUPER) | 8),  // Mod1 kept
-            (u32::from(MOD_SUPER) | 128, 36, u32::from(MOD_SUPER)),    // Mod5 over-match
-            (4, 65, 4),     // Ctrl+Space plain
-            (4 | 16, 65, 4), // Ctrl+Space + NumLock
-            (4 | 128, 65, 4), // Ctrl+Space + Mod5 over-match
+            (u32::from(MOD_SUPER) | 8, 36, u32::from(MOD_SUPER) | 8), // Mod1 kept
+            (u32::from(MOD_SUPER) | 128, 36, u32::from(MOD_SUPER)), // Mod5 over-match
+            (4, 65, 4),                                       // Ctrl+Space plain
+            (4 | 16, 65, 4),                                  // Ctrl+Space + NumLock
+            (4 | 128, 65, 4),                                 // Ctrl+Space + Mod5 over-match
         ];
         for (raw_mods, keycode, expected_mods) in rows {
             let translated = translate_key_press(
@@ -546,7 +549,14 @@ mod tests {
         );
         // And the Mod5 over-match: AltGr+Ctrl+Space strips to exactly the
         // configured launcher combo (4, XK_space) — the accepted over-match.
-        let over = translate_key_press(&keymap, KeyCombo { mods: 4 | 128, key: 65 }).unwrap();
+        let over = translate_key_press(
+            &keymap,
+            KeyCombo {
+                mods: 4 | 128,
+                key: 65,
+            },
+        )
+        .unwrap();
         let Event::KeyPressed(over_combo) = over else {
             unreachable!()
         };
@@ -567,7 +577,10 @@ mod tests {
         let holes = keymap.nosymbol_keycodes();
         assert_eq!(holes.len(), 59); // 60 in-range keycodes minus the mapped one
         assert!(!holes.contains(&36), "the mapped keycode is not a hole");
-        assert!(holes.contains(&37), "an empty slot right after the mapping is a hole");
+        assert!(
+            holes.contains(&37),
+            "an empty slot right after the mapping is a hole"
+        );
         assert!(holes.contains(&8), "the first in-range keycode is a hole");
         assert!(holes.contains(&67), "the last in-range keycode is a hole");
     }
