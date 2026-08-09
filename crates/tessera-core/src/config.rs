@@ -616,9 +616,8 @@ mod tests {
         // NKB-1 "Named key equals legacy int": `mods = "super", key =
         // "Return"` must parse to exactly the legacy `mods = 64, key = 65293`
         // combo (0xff0d).
-        let named =
-            Config::parse("[keybindings.terminal]\nmods = \"super\"\nkey = \"Return\"\n")
-                .expect("named values must parse");
+        let named = Config::parse("[keybindings.terminal]\nmods = \"super\"\nkey = \"Return\"\n")
+            .expect("named values must parse");
         let legacy =
             Config::parse("[keybindings.terminal]\nmods = 64\nkey = 65293\n").expect("legacy ints");
         assert_eq!(
@@ -637,8 +636,9 @@ mod tests {
     #[test]
     fn mod_combo_string_ors_masks() {
         // NKB-1 "Mod combo OR": `"super+control"` (64 | 4) must become 68.
-        let c = Config::parse("[keybindings.terminal]\nmods = \"super+control\"\nkey = \"Return\"\n")
-            .expect("a+b mod list must parse");
+        let c =
+            Config::parse("[keybindings.terminal]\nmods = \"super+control\"\nkey = \"Return\"\n")
+                .expect("a+b mod list must parse");
         assert_eq!(c.keybindings.terminal.mods, 68);
         // Triangulation: a second combo exercises a different mask set.
         let d = Config::parse("[keybindings.close]\nmods = \"mod1+lock\"\nkey = \"q\"\n")
@@ -702,12 +702,18 @@ mod tests {
             let err = Config::parse(&raw).expect_err("unknown key name must be rejected");
             let msg = format!("{err:?}");
             assert!(msg.contains("key"), "error must name the field: {msg}");
-            assert!(msg.contains("accepted"), "error must list accepted names: {msg}");
+            assert!(
+                msg.contains("accepted"),
+                "error must list accepted names: {msg}"
+            );
             assert!(
                 msg.contains("Return"),
                 "accepted list must include the canonical name: {msg}"
             );
-            assert!(msg.contains(bad), "error must echo the offending name: {msg}");
+            assert!(
+                msg.contains(bad),
+                "error must echo the offending name: {msg}"
+            );
         }
     }
 
@@ -720,7 +726,10 @@ mod tests {
             .expect_err("unknown mod name must be rejected");
         let msg = format!("{err:?}");
         assert!(msg.contains("mods"), "error must name the field: {msg}");
-        assert!(msg.contains("hyper"), "error must echo the offending name: {msg}");
+        assert!(
+            msg.contains("hyper"),
+            "error must echo the offending name: {msg}"
+        );
         for accepted in [
             "super", "control", "ctrl", "shift", "alt", "mod1", "mod2", "mod3", "mod4", "mod5",
             "lock",

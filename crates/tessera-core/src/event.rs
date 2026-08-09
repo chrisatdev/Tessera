@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use serde::{Deserialize, Deserializer, de};
+use serde::{Deserializer, de};
 
 use crate::command::Command;
 use crate::config::Config;
@@ -136,13 +136,19 @@ impl<'de> de::Visitor<'de> for DictVisitor {
 
     fn visit_i64<E: de::Error>(self, v: i64) -> Result<u32, E> {
         u32::try_from(v).map_err(|_| {
-            E::custom(format!("{}: {} must be a non-negative u32, got {v}", self.field, self.what))
+            E::custom(format!(
+                "{}: {} must be a non-negative u32, got {v}",
+                self.field, self.what
+            ))
         })
     }
 
     fn visit_u64<E: de::Error>(self, v: u64) -> Result<u32, E> {
         u32::try_from(v).map_err(|_| {
-            E::custom(format!("{}: {} must fit in u32, got {v}", self.field, self.what))
+            E::custom(format!(
+                "{}: {} must fit in u32, got {v}",
+                self.field, self.what
+            ))
         })
     }
 
