@@ -12,24 +12,39 @@ use tessera_x11::bar_renderer::tiling_area;
 
 use crate::bar::Bar;
 
-/// Minimal CLI: `tessera [--config <path>] [--display <name>]`.
+/// Minimal CLI: `tessera [--config <path>] [--display <name>] [--version]`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CliArgs {
     /// Optional TOML config file path (`--config`).
     pub config_path: Option<PathBuf>,
     /// Optional X display name (`--display`); `None` means `$DISPLAY`.
     pub display: Option<String>,
+    /// `--version`: print the version to stdout and exit 0 before any
+    /// config or display work (VER-1). The parse loop short-circuits on it,
+    /// so no argument after it is ever validated (design D5).
+    pub version: bool,
 }
 
 impl CliArgs {
     /// Parses the CLI arguments (`--config <path>`, `--display <name>`).
-    /// Unknown flags and missing values are rejected.
+    /// Unknown flags and missing values are rejected; `--version` wins over
+    /// everything after it (VER-1) — once seen, parsing stops and returns
+    /// immediately.
     pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<CliArgs, String> {
         let mut args = args.into_iter();
         let mut config_path = None;
         let mut display = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--version" => {
+                    // VER-1: the winning flag — skip all later validation
+                    // (a trailing `--config` with a missing value must not
+                    // turn a version query into an error, design D5).
+                    return Ok(CliArgs {
+                        version: true,
+                        ..Default::default()
+                    });
+                }
                 "--config" => {
                     let value = args.next().ok_or("--config needs a config file path")?;
                     config_path = Some(PathBuf::from(value));
@@ -44,7 +59,104 @@ impl CliArgs {
         Ok(CliArgs {
             config_path,
             display,
+            version: false,
         })
+    }
+}
+
+/// Default configuration written to the auto-detected path on first run
+/// (CFG-3, design D6/D7): every value IS a [`Config::default()`] value, so
+/// `Config::parse(TEMPLATE) == Config::default()` is locked by
+/// `template_round_trips_to_default` (CFG-6). Hand-written, commented, and
+/// deliberately WITHOUT `Serialize` derives — the file is never re-emitted
+/// after editing, so the comments survive.
+const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Tessera default configuration — created on first run. Edit and restart (or SIGHUP) to apply.
+# mods = X11 modifier mask: Shift=1, Control=4, Mod1/Alt=8, Mod4/Super=64. key = keysym in decimal
+# (Return=65293, space=32, j=106, k=107, q=113, 1..9=49..57, 0=48).
+
+[general]
+border_width = 2
+gaps = 0
+terminal = "alacritty"
+launcher = ["rofi", "-show", "drun"]
+
+[keybindings.terminal]     # Super+Enter: open a terminal
+mods = 64
+key = 65293
+
+[keybindings.focus_next]   # Super+J
+mods = 64
+key = 106
+
+[keybindings.focus_prev]   # Super+K
+mods = 64
+key = 107
+
+[keybindings.close]        # Super+Q
+mods = 64
+key = 113
+
+[keybindings.toggle_layout]  # Super+Space
+mods = 64
+key = 32
+
+[keybindings.launcher]     # Ctrl+Space: run [general] launcher
+mods = 4
+key = 32
+
+# Workspace 1..9, Super+0 = workspace 10. To rebind off Super (e.g. in a VM whose
+# host captures Super — see README "Super in VM guests"): change the mods of a binding to 4 (Control).
+[[keybindings.workspace]]  # workspace-1 (Super+1)
+mods = 64
+key = 49
+[[keybindings.workspace]]  # workspace-2 (Super+2)
+mods = 64
+key = 50
+[[keybindings.workspace]]  # workspace-3 (Super+3)
+mods = 64
+key = 51
+[[keybindings.workspace]]  # workspace-4 (Super+4)
+mods = 64
+key = 52
+[[keybindings.workspace]]  # workspace-5 (Super+5)
+mods = 64
+key = 53
+[[keybindings.workspace]]  # workspace-6 (Super+6)
+mods = 64
+key = 54
+[[keybindings.workspace]]  # workspace-7 (Super+7)
+mods = 64
+key = 55
+[[keybindings.workspace]]  # workspace-8 (Super+8)
+mods = 64
+key = 56
+[[keybindings.workspace]]  # workspace-9 (Super+9)
+mods = 64
+key = 57
+[[keybindings.workspace]]  # workspace-10 (Super+0)
+mods = 64
+key = 48
+"#;
+
+/// Resolves the auto-detected config path (CFG-1, design D6): an absolute
+/// `$XDG_CONFIG_HOME` wins; an empty, relative or absent XDG falls back to
+/// `$HOME/.config`; with no usable `$HOME` there is no candidate at all
+/// (the caller warns and uses defaults). Pure — takes the env values as
+/// parameters so the whole table is testable without touching the process
+/// environment.
+fn auto_config_path(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    let xdg = xdg.filter(|v| !v.is_empty() && Path::new(v).is_absolute());
+    match xdg {
+        Some(xdg) => Some(PathBuf::from(xdg).join("Tessera").join("tessera.toml")),
+        None => {
+            let home = home.filter(|v| !v.is_empty())?;
+            Some(
+                PathBuf::from(home)
+                    .join(".config")
+                    .join("Tessera")
+                    .join("tessera.toml"),
+            )
+        }
     }
 }
 
@@ -222,6 +334,7 @@ mod tests {
             CliArgs {
                 config_path: None,
                 display: None,
+                version: false,
             }
         );
         assert_eq!(
@@ -238,7 +351,33 @@ mod tests {
             CliArgs {
                 config_path: Some("/tmp/tessera.toml".into()),
                 display: Some(":9".into()),
+                version: false,
             }
+        );
+    }
+
+    #[test]
+    fn parse_version_short_circuits() {
+        // VER-1: `--version` wins — once seen, no other argument validation
+        // runs (a trailing `--config` with a missing value, or any later
+        // unknown flag, must not error). VER-2: without `--version` first,
+        // unknown flags still fail.
+        for args in [
+            vec!["--version".to_string()],
+            vec!["--version".to_string(), "--config".to_string()],
+            vec!["--version".to_string(), "--bogus".to_string()],
+        ] {
+            let parsed = CliArgs::parse(args).expect("--version must short-circuit");
+            assert!(
+                parsed.version,
+                "--version must set version: true (got {parsed:?})"
+            );
+            assert_eq!(parsed.config_path, None);
+            assert_eq!(parsed.display, None);
+        }
+        assert!(
+            CliArgs::parse(["--bogus".to_string()].into_iter()).is_err(),
+            "an unknown flag without a preceding --version must still error"
         );
     }
 
