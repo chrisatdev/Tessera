@@ -8,6 +8,11 @@
 //! [`grab_keybindings`] can convert the config's keysym bindings into
 //! keycode grabs on the root window. Every X side effect goes through the
 //! [`KeyboardOps`] seam so both directions are scriptable headless.
+//!
+//! Grabs are lock-tolerant (KBR-1): every binding is expanded into 8
+//! lock-variant masks so CapsLock/NumLock/ScrollLock cannot kill a binding,
+//! and [`translate_key_press`] strips those lock bits from the press state
+//! (KBR-2) so `command_for_key` matches on the meaningful modifiers only.
 
 use tessera_core::{Config, DErr, Event, KeyCombo};
 use x11rb::connection::Connection;
@@ -15,6 +20,17 @@ use x11rb::protocol::xproto::{GrabMode, ModMask, Window, get_keyboard_mapping, g
 use x11rb::rust_connection::RustConnection;
 
 use crate::display_server::{map_conn_error, map_reply_error};
+
+/// Lock modifier bits stripped from KeyPress state before the core's
+/// `command_for_key` lookup (KBR-2, D2): Lock(2) | Mod2(16) | Mod3(32) |
+/// Mod5(128) = 178. Shift(1), Mod1(8) and Mod4(64) are never stripped.
+pub(crate) const LOCK_STRIP: u32 = 2 | 16 | 32 | 128;
+
+/// Every subset of the lock bits {2, 16, 32}: each binding is grabbed once
+/// per variant so a press differing only in lock bits still matches an
+/// exact-modifier grab (KBR-1, D1 — the X core protocol special-cases no
+/// modifier, so Lock/Mod2/Mod3 must all be grabbed explicitly).
+const LOCK_VARIANTS: [u16; 8] = [0, 2, 16, 32, 18, 34, 48, 50];
 
 /// The X surface keyboard handling needs, abstracted so translation and
 /// grabbing are scriptable headless (same seam shape as
@@ -109,28 +125,45 @@ impl Keymap {
 /// `crate::translate`) into one carrying the keysym the core's
 /// `command_for_key` matches against (SC-x11-12). `None` for a key with no
 /// keysym — unbound keys are not published.
+///
+/// The lock bits (2|16|32|128) are stripped from the published mods (KBR-2,
+/// D2): a lock-variant grab delivers the press with locks in its state, and
+/// the core must match on the meaningful modifiers exactly.
 pub(crate) fn translate_key_press(keymap: &Keymap, raw: KeyCombo) -> Option<Event> {
     let keysym = keymap.keysym(raw.key as u8);
     if keysym == 0 {
         return None;
     }
     Some(Event::KeyPressed(KeyCombo {
-        mods: raw.mods,
+        mods: raw.mods & !LOCK_STRIP,
         key: keysym,
     }))
 }
 
+/// Result of a keybinding grab pass (D6, KBR-3): the CONFIGURED binding count
+/// and the ACTUAL grab count — `grabs` drops below `bindings * 8` when a
+/// binding's keysym resolves nowhere in the mapping (unresolved) or two
+/// identical combos collapse onto one expanded (mods, keycode) pair.
+pub(crate) struct GrabStats {
+    pub bindings: usize,
+    pub grabs: usize,
+}
+
 /// Grabs every configured keybinding on `root` (REQ-x11-008): each binding's
-/// keysym is resolved to its keycode(s) through `keymap` and grabbed with the
-/// binding's modifier mask. Bindings whose keysym exists nowhere in the
-/// mapping are skipped, and a (mods, keycode) pair is only grabbed once.
-/// Returns how many grabs took effect.
+/// keysym is resolved to its keycode(s) through `keymap` and grabbed with
+/// every lock-variant mask (`base | variant` for each of the 8
+/// `LOCK_VARIANTS`) so an exact-modifier grab fires under any lock
+/// combination (KBR-1, D1). Bindings whose keysym exists nowhere in the
+/// mapping are skipped, and an expanded `(mods, keycode)` pair is only
+/// grabbed once. Returns the configured binding count plus how many grabs
+/// took effect (KBR-3). Grab failures abort loudly — a silent drop would
+/// recreate the silent-binding-death class this change exists to fix.
 pub(crate) fn grab_keybindings(
     ops: &impl KeyboardOps,
     keymap: &Keymap,
     root: Window,
     cfg: &Config,
-) -> Result<usize, DErr> {
+) -> Result<GrabStats, DErr> {
     let k = &cfg.keybindings;
     let fixed = [
         k.terminal,
@@ -138,18 +171,24 @@ pub(crate) fn grab_keybindings(
         k.focus_prev,
         k.close,
         k.toggle_layout,
+        k.launcher,
     ];
     let mut grabbed: Vec<(u16, u8)> = Vec::new();
     for combo in fixed.iter().chain(k.workspace.iter()) {
         for keycode in keymap.keycodes_for_keysym(combo.key) {
-            let pair = (combo.mods as u16, keycode);
-            if !grabbed.contains(&pair) {
-                ops.grab_key(root, pair.0, pair.1)?;
-                grabbed.push(pair);
+            for variant in LOCK_VARIANTS {
+                let pair = (combo.mods as u16 | variant, keycode);
+                if !grabbed.contains(&pair) {
+                    ops.grab_key(root, pair.0, pair.1)?;
+                    grabbed.push(pair);
+                }
             }
         }
     }
-    Ok(grabbed.len())
+    Ok(GrabStats {
+        bindings: fixed.len() + k.workspace.len(),
+        grabs: grabbed.len(),
+    })
 }
 
 #[cfg(test)]
