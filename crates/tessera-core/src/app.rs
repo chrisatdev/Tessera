@@ -174,6 +174,9 @@ impl App {
             CommandEffect::Applied => self.recompute(),
             CommandEffect::Ignored | CommandEffect::Unsupported => Ok(()),
             CommandEffect::SpawnTerminal => self.display.spawn(&self.config.general.terminal),
+            CommandEffect::SpawnLauncher => {
+                self.display.spawn_with_args(&self.config.general.launcher)
+            }
             CommandEffect::CloseFocused => {
                 if let Some(focused) = self.wm.focused_window() {
                     self.destroy_frame_for(focused);
@@ -270,6 +273,9 @@ pub fn command_for_key(cfg: &Config, combo: KeyCombo) -> Option<Command> {
     }
     if combo == k.toggle_layout {
         return Some(Command::ToggleLayout);
+    }
+    if combo == k.launcher {
+        return Some(Command::SpawnLauncher);
     }
     for (i, bound) in k.workspace.iter().enumerate() {
         if *bound == combo {
