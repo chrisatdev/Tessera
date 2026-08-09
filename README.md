@@ -33,7 +33,7 @@ Implemented in this change (all unit tests green, headless):
   → key-driven focus/workspace-switch handling, plus themed border pixels on
   the real server (default and custom theme files).
 
-Test counts: 177 unit tests (15 binary + 97 core + 65 x11) plus 4 ignored
+Test counts: 202 unit tests (24 binary + 109 core + 69 x11) plus 16 ignored
 integration tests. `cargo test --workspace`, `cargo clippy
 --workspace --all-targets`, and `cargo fmt --check` are clean.
 
@@ -113,7 +113,25 @@ recompute from that snapshot (never on idle polling).
 
 ## Configuration
 
-Defaults (a TOML file is optional; `--config <path>` overrides):
+The config file is optional. When no `--config <path>` is given, Tessera
+auto-detects it: `$XDG_CONFIG_HOME/Tessera/tessera.toml`, or
+`~/.config/Tessera/tessera.toml` when `XDG_CONFIG_HOME` is unset, empty or
+relative. On first run the file does not exist, so Tessera creates it from a
+commented template (`tessera: created default config at <path>` in the log)
+and loads it — every value in the template is a default, so a fresh install
+behaves exactly like an unconfigured one.
+
+Precedence and failure handling differ between the two paths:
+
+| Path | Missing file | Malformed file |
+|---|---|---|
+| explicit `--config <path>` | aborts startup (nothing is ever auto-created) | aborts startup (strict, unchanged) |
+| auto-detected | first run: template created, logged, loaded | warns `cannot parse … using defaults` and keeps going |
+
+With neither `$HOME` nor `$XDG_CONFIG_HOME` set, the WM warns and uses the
+defaults. Edit the created file and restart (or SIGHUP) to apply changes.
+
+Defaults (all values in the first-run template):
 
 | Setting | Default |
 |---|---|
