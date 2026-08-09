@@ -18,6 +18,13 @@
 //! hardcoded 1920x1080 tiling area, so the geometry assertions really prove
 //! the real-screen wiring (T21) instead of matching the old constant by
 //! coincidence.
+//!
+//! The lock-tolerance and launcher tests (PR4) drive keys purely through
+//! XTEST fake input — never xdotool `--clearmodifiers`, which clears the
+//! lock bits those tests exist to prove — and run the terminal/launcher
+//! through test-only probe fixtures under the workspace `tests/` directory
+//! (plain executables on a PATH given ONLY to the WM under test; never
+//! installed, never compiled by cargo).
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcCommand, Stdio};
@@ -26,9 +33,10 @@ use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::Connection as RandRConnection;
 use x11rb::protocol::randr::ConnectionExt as _;
+use x11rb::protocol::xkb::{ConnectionExt as _, Group, ID};
 use x11rb::protocol::xproto::{
     Atom, ConnectionExt, CreateWindowAux, EventMask, GetGeometryReply, ImageFormat, MapState,
-    Window, WindowClass,
+    ModMask, Window, WindowClass,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
@@ -45,6 +53,21 @@ const KEY_J: u32 = 0x006a;
 const KEY_2: u32 = 0x0032;
 /// Mod4 keysym (XK_Super_L) — every default binding is Super-based.
 const SUPER_L: u32 = 0xffeb;
+/// Keysyms the launcher/lock E2E (PR4) drives: Return (terminal), Space
+/// (Ctrl+Space launcher), Control_L, and the two lock keys XTEST can toggle
+/// under Xvfb (NumLock, CapsLock). ScrollLock's Mod3 bit has no toggleable
+/// key under Xvfb's default keymap, so [`set_locks`] sets it through the
+/// XKB LatchLockState request instead.
+const KEY_RETURN: u32 = 0xff0d;
+const KEY_SPACE: u32 = 0x0020;
+const CONTROL_L: u32 = 0xffe3;
+const NUM_LOCK: u32 = 0xff7f;
+const CAPS_LOCK: u32 = 0xffe5;
+/// The three lock-modifier bits (XKB locked mods): Lock (CapsLock, 2),
+/// Mod2 (NumLock, 16) and Mod3 (ScrollLock, 32) — the bits keyboard.rs
+/// strips (LOCK_STRIP=178) before the command lookup, so a locked press
+/// still matches the base combo.
+const LOCK_BITS: u16 = 2 | 16 | 32;
 /// Default frame border (`config.general.border_width`), baked into every
 /// layout placement.
 const BORDER: u16 = 2;
@@ -103,6 +126,22 @@ impl WmChild {
     /// file). Detached stdio keeps the WM's eprintln chatter out of the test
     /// harness pipes.
     fn spawn_with_config(display: &str, config: Option<&Path>) -> WmChild {
+        Self::spawn_full(display, config, &[], false)
+    }
+
+    /// Spawns the binary on `display` with extra env entries (e.g. a
+    /// probe-only PATH and the probe sentinel path — applied ONLY to the WM
+    /// child, never to the harness) and optional stderr capture (the claim
+    /// log's KBR-3 "16 bindings" line). With `capture_stderr`, the pipe must
+    /// be drained via [`Self::stop_and_read_stderr`] after the child has
+    /// stopped — reading while the WM still runs would block on the open
+    /// pipe forever (the WM never exits on its own).
+    fn spawn_full(
+        display: &str,
+        config: Option<&Path>,
+        envs: &[(&str, &str)],
+        capture_stderr: bool,
+    ) -> WmChild {
         // The previous test's WM must have released WM_S0 before a new WM
         // claims it (the server clears the selection asynchronously).
         wait_for_wm_s0_release(display);
@@ -117,13 +156,43 @@ impl WmChild {
         if let Some(path) = config {
             cmd.arg("--config").arg(path);
         }
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        cmd.stdin(Stdio::null()).stdout(Stdio::null());
+        if capture_stderr {
+            cmd.stderr(Stdio::piped());
+        } else {
+            cmd.stderr(Stdio::null());
+        }
         let child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
             .spawn()
             .unwrap_or_else(|err| panic!("cannot spawn {}: {err}", bin.display()));
         WmChild(child)
+    }
+
+    /// Kills and reaps the WM (no stderr drain).
+    fn kill(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+
+    /// Kills and reaps the WM, then returns everything it wrote to stderr
+    /// ("" when stderr was not captured). Only meaningful after the child
+    /// has stopped — the WM is killed here first, so the pipe reaches EOF
+    /// and drains without blocking.
+    fn stop_and_read_stderr(&mut self) -> String {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+        match self.0.stderr.take() {
+            Some(mut pipe) => {
+                let mut out = String::new();
+                use std::io::Read;
+                let _ = pipe.read_to_string(&mut out);
+                out
+            }
+            None => String::new(),
+        }
     }
 
     /// True while the WM process is still running.
@@ -363,6 +432,110 @@ fn press_super(conn: &RustConnection, keysym: u32, keysym_name: &str, what: &str
     up(key);
     up(super_key);
     conn.flush().unwrap();
+}
+
+/// Raw XTEST press+release of `keycode`, no modifiers touched. This is the
+/// ONLY input path the lock tests use — xdotool's `--clearmodifiers` would
+/// clear the exact lock bits these tests prove survive, so they must never
+/// go through it.
+fn xtest_key(conn: &RustConnection, keycode: u8) {
+    let root = root_of(conn);
+    conn.xtest_fake_input(KEY_PRESS, keycode, 0, root, 0, 0, 0).unwrap();
+    conn.xtest_fake_input(KEY_RELEASE, keycode, 0, root, 0, 0, 0)
+        .unwrap();
+    conn.flush().unwrap();
+}
+
+/// Ensures the XKB extension is usable on `conn` (x11rb's xkb feature gate
+/// requires an explicit xkb_use_extension handshake before any XKB request).
+fn init_xkb(conn: &RustConnection) {
+    conn.xkb_use_extension(1, 0)
+        .unwrap()
+        .reply()
+        .unwrap_or_else(|err| panic!("xkb_use_extension failed: {err}"));
+}
+
+/// The core keyboard's currently locked modifier bits (bit 1 = CapsLock,
+/// bit 4 = NumLock, bit 5 = ScrollLock).
+fn locks_on(conn: &RustConnection) -> u16 {
+    init_xkb(conn);
+    conn.xkb_get_state(ID::USE_CORE_KBD.into())
+        .unwrap()
+        .reply()
+        .unwrap()
+        .locked_mods
+        .into()
+}
+
+/// Drives the three lock modifiers to the requested state by injecting the
+/// REAL key presses a user would use — XTEST toggles for the keys that are
+/// toggleable under Xvfb's default keymap (NumLock=77 locks Mod2, CapsLock=66
+/// locks Lock) — and, for the ScrollLock bit (Mod3, which maps to an inert
+/// keycode 203 under Xvfb), the XKB LatchLockState request. Afterwards the
+/// core keyboard's locked_mods must equal `target & LOCK_BITS`.
+fn set_locks(conn: &RustConnection, target: u16) {
+    let current = locks_on(conn) & LOCK_BITS;
+    let want = target & LOCK_BITS;
+    let toggle_towards = |conn: &RustConnection, keycode: u8, bit: u16| {
+        let active = current & bit != 0;
+        let wanted = want & bit != 0;
+        if active != wanted {
+            xtest_key(conn, keycode);
+        }
+    };
+    toggle_towards(conn, keycode_for_keysym(conn, NUM_LOCK).unwrap(), 16);
+    toggle_towards(conn, keycode_for_keysym(conn, CAPS_LOCK).unwrap(), 2);
+    let locked = locks_on(conn) & LOCK_BITS;
+    let need_latch = want & 32 != 0;
+    let already_latched = locked & 32 != 0;
+    if need_latch != already_latched {
+        init_xkb(conn);
+        conn.xkb_latch_lock_state(
+            ID::USE_CORE_KBD.into(),
+            ModMask::from(32u16), // affect_mod_locks
+            ModMask::from(32u16), // mod_locks
+            false,                // lock_group
+            Group::from(0u8),     // group_lock
+            ModMask::from(0u16),  // affect_mod_latches
+            false,                // latch_group
+            0u16,                 // group_latch
+        )
+        .unwrap();
+        conn.flush().unwrap();
+    }
+    let after = locks_on(conn) & LOCK_BITS;
+    assert_eq!(
+        after, want,
+        "lock bits after set_locks: got {after:#06x}, want {want:#06x}"
+    );
+}
+
+/// Drives a chord via pure XTEST: `mods` then `key`, released in reverse
+/// order. Never clears modifiers — the lock tests rely on the modifier state
+/// being untouched and reported as-is.
+fn press_combo(conn: &RustConnection, mods: &[u8], key: u8) {
+    let root = root_of(conn);
+    for &keycode in mods {
+        conn.xtest_fake_input(KEY_PRESS, keycode, 0, root, 0, 0, 0).unwrap();
+    }
+    conn.xtest_fake_input(KEY_PRESS, key, 0, root, 0, 0, 0).unwrap();
+    conn.xtest_fake_input(KEY_RELEASE, key, 0, root, 0, 0, 0).unwrap();
+    for &keycode in mods.iter().rev() {
+        conn.xtest_fake_input(KEY_RELEASE, keycode, 0, root, 0, 0, 0).unwrap();
+    }
+    conn.flush().unwrap();
+}
+
+/// The `keysym`'s keycode, looked up against the server's table.
+fn keycode_for(conn: &RustConnection, keysym: u32, name: &str) -> u8 {
+    keycode_for_keysym(conn, keysym)
+        .unwrap_or_else(|| panic!("no keycode maps to {name} (keysym {keysym:#06x})"))
+}
+
+/// Full keyboard state for the "every lock modifier on" scenario: the press
+/// must carry locked Lock/Mod2/Mod3 with it.
+fn all_locks_on(conn: &RustConnection) {
+    set_locks(conn, LOCK_BITS);
 }
 
 // -------------------------------------------------------------------- tests
@@ -1009,4 +1182,261 @@ fn rects_overlap(a: Rect, b: Rect) -> bool {
         i64::from(b.h),
     );
     ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah
+}
+
+// ----------------------------------------------------------------------
+// Lock-variant + launcher E2E (PR4, tessera-keybinds-launcher)
+// ----------------------------------------------------------------------
+
+/// The workspace `tests/` directory holding the test-only probe fixtures
+/// (task 4.2: plain executables, never installed — the Makefile installs
+/// only the binary and the desktop entry, and the fixtures are only reachable
+/// through a PATH handed to the WM under test).
+fn probes_dir() -> PathBuf {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .join("../../tests")
+        .canonicalize()
+        .unwrap_or_else(|err| panic!("cannot resolve tests/ dir: {err}"))
+}
+
+/// The inherited PATH with `probes` prepended — the WM's spawned programs
+/// resolve the probe fixtures first, but a real launcher like rofi (found
+/// later on the inherited PATH) still works.
+fn path_with_probes(probes: &Path) -> String {
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{}", probes.display(), inherited)
+}
+
+/// A unique sentinel path for `what`'s probe output (per-process so parallel
+/// harnesses never collide; the probe writes its full argv there).
+fn sentinel_path(what: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "tessera-e2e-{what}-{}.probe",
+        std::process::id()
+    ))
+}
+
+/// Whether `name` resolves through the current PATH (plain `Command::new`
+/// lookup semantics: a `+x` regular file in any PATH entry).
+fn probe_on_path(name: &str) -> bool {
+    std::env::var("PATH").is_ok_and(|path| {
+        path.split(':').any(|dir| {
+            let candidate = Path::new(dir).join(name);
+            candidate.is_file() && {
+                use std::os::unix::fs::PermissionsExt;
+                candidate.metadata().is_ok_and(|m| {
+                    m.permissions().mode() & 0o111 != 0
+                })
+            }
+        })
+    })
+}
+
+/// PIDs of every live process whose comm is exactly `name` (rofi's is
+/// "rofi", unlike xdotool's transient "xdotool").
+fn process_pids(name: &str) -> Vec<u32> {
+    let mut pids = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if std::fs::read_to_string(entry.path().join("comm"))
+                .is_ok_and(|comm| comm.trim() == name)
+            {
+                pids.push(pid);
+            }
+        }
+    }
+    pids
+}
+
+#[test]
+#[ignore]
+fn lock_variant_press_with_locks_on_spawns_the_terminal_probe() {
+    // KBR-3 at the real X server, the scenario xdotool --clearmodifiers
+    // would destroy: with CapsLock+NumLock+ScrollLock ALL on, Super+Enter
+    // must still spawn the terminal. The press is injected through pure
+    // XTEST (never --clearmodifiers), so the lock bits survive, the WM's
+    // lock-variant grab matches, and the locked modifier state is proven to
+    // reach the command lookup untouched.
+    let display = display_name();
+    let probes = probes_dir();
+    let config = std::env::temp_dir().join(format!(
+        "tessera-e2e-lock-terminal-{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(&config, "[general]\nterminal = \"probe_terminal\"\n")
+        .expect("write the terminal-probe config");
+    let sentinel = sentinel_path("lock-terminal");
+    let _ = std::fs::remove_file(&sentinel);
+    let path = path_with_probes(&probes);
+
+    let mut wm = WmChild::spawn_full(
+        &display,
+        Some(&config),
+        &[
+            ("PATH", &path),
+            ("TESSERA_TEST_SENTINEL", sentinel.to_str().unwrap()),
+        ],
+        false,
+    );
+    let conn = connect(&display);
+    let root = root_of(&conn);
+    let wm_s0 = intern(&conn, b"WM_S0");
+    wait_until("the WM to own WM_S0", || {
+        conn.get_selection_owner(wm_s0)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .owner
+            == root
+    });
+    assert!(wm.alive(), "the WM must keep running after claiming WM_S0");
+
+    all_locks_on(&conn);
+    assert_eq!(
+        locks_on(&conn) & LOCK_BITS,
+        LOCK_BITS,
+        "precondition: every lock modifier on"
+    );
+
+    let super_kc = keycode_for(&conn, SUPER_L, "Super_L");
+    let enter_kc = keycode_for(&conn, KEY_RETURN, "Return");
+    press_combo(&conn, &[super_kc], enter_kc);
+
+    wait_until("the terminal probe to record its argv", || {
+        sentinel.exists()
+    });
+    let argv = std::fs::read_to_string(&sentinel)
+        .unwrap_or_else(|err| panic!("read {}: {err}", sentinel.display()));
+    assert_eq!(
+        argv,
+        "probe_terminal\n",
+        "terminal probe must receive exactly the configured argv"
+    );
+    assert_eq!(
+        locks_on(&conn) & LOCK_BITS,
+        LOCK_BITS,
+        "the press must not clear the lock modifiers (no --clearmodifiers)"
+    );
+
+    wm.kill();
+    let _ = std::fs::remove_file(&config);
+    let _ = std::fs::remove_file(&sentinel);
+}
+
+#[test]
+#[ignore]
+fn ctrl_space_spawns_the_launcher_probe_and_claims_16_bindings() {
+    // ALA-2/D4 end-to-end: Ctrl+Space (the default launcher combo) must make
+    // the WM spawn the configured launcher with the argv passed VERBATIM
+    // (argv[0] = program, args after, no shell) — the probe records its whole
+    // argv — and the WM's claim log must prove the 16-binding lock-variant
+    // grab table reached the server (KBR-3's "16 bindings" line on stderr).
+    let display = display_name();
+    let probes = probes_dir();
+    let config = std::env::temp_dir().join(format!(
+        "tessera-e2e-launcher-{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &config,
+        "[general]\nlauncher = [\"probe_launcher\", \"-show\", \"drun\"]\n",
+    )
+    .expect("write the launcher-probe config");
+    let sentinel = sentinel_path("launcher");
+    let _ = std::fs::remove_file(&sentinel);
+    let path = path_with_probes(&probes);
+
+    let mut wm = WmChild::spawn_full(
+        &display,
+        Some(&config),
+        &[
+            ("PATH", &path),
+            ("TESSERA_TEST_SENTINEL", sentinel.to_str().unwrap()),
+        ],
+        true,
+    );
+    let conn = connect(&display);
+    let root = root_of(&conn);
+    let wm_s0 = intern(&conn, b"WM_S0");
+    wait_until("the WM to own WM_S0", || {
+        conn.get_selection_owner(wm_s0)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .owner
+            == root
+    });
+    assert!(wm.alive(), "the WM must keep running after claiming WM_S0");
+
+    let ctrl_kc = keycode_for(&conn, CONTROL_L, "Control_L");
+    let space_kc = keycode_for(&conn, KEY_SPACE, "space");
+    press_combo(&conn, &[ctrl_kc], space_kc);
+
+    wait_until("the launcher probe to record its argv", || {
+        sentinel.exists()
+    });
+    let argv = std::fs::read_to_string(&sentinel)
+        .unwrap_or_else(|err| panic!("read {}: {err}", sentinel.display()));
+    assert_eq!(
+        argv,
+        "probe_launcher\n-show\ndrun\n",
+        "launcher probe must receive the configured argv verbatim"
+    );
+
+    let stderr = wm.stop_and_read_stderr();
+    assert!(
+        stderr.contains("16 bindings"),
+        "claim log must report the 16-binding grab table, got stderr: {stderr:?}"
+    );
+
+    let _ = std::fs::remove_file(&config);
+    let _ = std::fs::remove_file(&sentinel);
+}
+
+#[test]
+#[ignore]
+fn configured_rofi_launcher_spawns_or_skips_when_missing() {
+    // ALA-3 at the real X server: the DEFAULT launcher (`rofi -show drun`)
+    // must actually spawn rofi on Ctrl+Space when rofi is on PATH. When rofi
+    // is not installed the test records the honest skip and returns — the
+    // path-missing behavior itself is unit-proven in tessera-core
+    // (launcher_failure_is_logged_and_the_loop_survives).
+    if !probe_on_path("rofi") {
+        eprintln!("skip: rofi is not on PATH");
+        return;
+    }
+    let display = display_name();
+    let mut wm = WmChild::spawn(&display);
+    let conn = connect(&display);
+    let root = root_of(&conn);
+    let wm_s0 = intern(&conn, b"WM_S0");
+    wait_until("the WM to own WM_S0", || {
+        conn.get_selection_owner(wm_s0)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .owner
+            == root
+    });
+    assert!(wm.alive(), "the WM must keep running after claiming WM_S0");
+
+    let before = process_pids("rofi");
+    let ctrl_kc = keycode_for(&conn, CONTROL_L, "Control_L");
+    let space_kc = keycode_for(&conn, KEY_SPACE, "space");
+    press_combo(&conn, &[ctrl_kc], space_kc);
+
+    wait_until("rofi to appear", || {
+        process_pids("rofi").iter().any(|pid| !before.contains(pid))
+    });
+    for pid in process_pids("rofi") {
+        if !before.contains(&pid) {
+            let _ = ProcCommand::new("kill").arg(pid.to_string()).status();
+        }
+    }
+
+    wm.kill();
 }
