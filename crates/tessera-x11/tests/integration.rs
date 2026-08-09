@@ -1395,6 +1395,137 @@ fn ctrl_space_spawns_the_launcher_probe_and_claims_16_bindings() {
     let _ = std::fs::remove_file(&sentinel);
 }
 
+// ------------------------------------------------------------------ WU1:
+// --version (VER-1) + config bootstrap (CFG-1/3/5), tessera-user-experience.
+// The version tests need no X display (the flag short-circuits before any
+// display work), but stay in the gated suite for the binary-build contract;
+// the bootstrap tests drive the WM's auto-detection through XDG_CONFIG_HOME
+// envs passed ONLY to the child, never to the harness.
+
+#[test]
+#[ignore]
+fn e2e_version_flag_prints_the_version_and_exits_zero() {
+    // VER-1 end-to-end on the real binary: `--version` prints
+    // `tessera <version>` to stdout and exits 0 BEFORE any config or display
+    // work — even with a trailing `--config` whose value is missing (the
+    // flag short-circuits later argument validation, VER-1 "version wins").
+    let bin = wm_binary();
+    assert!(
+        bin.exists(),
+        "build the binary first: cargo build (missing {})",
+        bin.display()
+    );
+    for args in [&["--version"][..], &["--version", "--config"][..]] {
+        let out = ProcCommand::new(&bin)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("cannot run {} {args:?}: {err}", bin.display()));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "tessera 0.1.0\n",
+            "stdout for {args:?} must be the version line"
+        );
+        assert!(
+            out.status.success(),
+            "exit code for {args:?} must be 0 (got {:?})",
+            out.status.code()
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn e2e_first_run_bootstraps_the_default_config_from_xdg() {
+    // CFG-3 end-to-end: with XDG_CONFIG_HOME pointing at a fresh temp dir,
+    // the WM creates the commented template at `$XDG/Tessera/tessera.toml`,
+    // logs `created default config at <path>`, loads it (== defaults) and
+    // keeps running — the convenience path is never fatal.
+    let display = display_name();
+    let dir = std::env::temp_dir().join(format!("tessera-e2e-bootstrap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create the temp XDG dir");
+
+    let mut wm = WmChild::spawn_full(
+        &display,
+        None,
+        &[("XDG_CONFIG_HOME", dir.to_str().unwrap())],
+        true,
+    );
+    let conn = connect(&display);
+    let root = root_of(&conn);
+    let wm_s0 = intern(&conn, b"WM_S0");
+    wait_until("the WM to own WM_S0", || {
+        conn.get_selection_owner(wm_s0)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .owner
+            == root
+    });
+    assert!(
+        wm.alive(),
+        "the WM must keep running after first-run bootstrap"
+    );
+
+    let stderr = wm.stop_and_read_stderr();
+    assert!(
+        stderr.contains("created default config at"),
+        "first run must log the created template, got stderr: {stderr:?}"
+    );
+    let created = dir.join("Tessera").join("tessera.toml");
+    assert!(
+        created.exists(),
+        "the bootstrap must write the template, missing {}",
+        created.display()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore]
+fn e2e_malformed_auto_config_warns_and_keeps_running() {
+    // CFG-5 end-to-end: a malformed file at the auto-detected path is
+    // lenient — the WM logs `cannot parse … using defaults` and keeps
+    // running with Config::default() (explicit --config stays strict, but
+    // that path is unchanged and unit-proven).
+    let display = display_name();
+    let dir = std::env::temp_dir().join(format!("tessera-e2e-malformed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let tessera_dir = dir.join("Tessera");
+    std::fs::create_dir_all(&tessera_dir).expect("create the temp config dir");
+    let cfg = tessera_dir.join("tessera.toml");
+    std::fs::write(&cfg, "not [valid toml").expect("write the malformed auto config");
+
+    let mut wm = WmChild::spawn_full(
+        &display,
+        None,
+        &[("XDG_CONFIG_HOME", dir.to_str().unwrap())],
+        true,
+    );
+    let conn = connect(&display);
+    let root = root_of(&conn);
+    let wm_s0 = intern(&conn, b"WM_S0");
+    wait_until("the WM to own WM_S0", || {
+        conn.get_selection_owner(wm_s0)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .owner
+            == root
+    });
+    assert!(
+        wm.alive(),
+        "the WM must keep running on a malformed auto config"
+    );
+
+    let stderr = wm.stop_and_read_stderr();
+    assert!(
+        stderr.contains("cannot parse") && stderr.contains("using defaults"),
+        "malformed auto config must log the lenient fallback, got stderr: {stderr:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 #[ignore]
 fn configured_rofi_launcher_spawns_or_skips_when_missing() {
