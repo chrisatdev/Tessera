@@ -51,7 +51,10 @@ pub struct GeneralConfig {
     /// Launcher program run by the Ctrl+Space keybinding (design D5, ALA-2).
     /// Defaults to `["rofi", "-show", "drun"]`; an explicit empty array is a
     /// parse error — a launcher that silently does nothing is never accepted.
-    #[serde(default = "default_launcher", deserialize_with = "deserialize_launcher")]
+    #[serde(
+        default = "default_launcher",
+        deserialize_with = "deserialize_launcher"
+    )]
     pub launcher: Vec<String>,
     /// Optional path to a `theme.toml` (REQ-thm-003). `None` -> embedded
     /// ayu_dark, no file read; `Some(path)` is resolved at startup.
@@ -599,7 +602,10 @@ mod tests {
         assert_eq!(d.keybindings.launcher, c.keybindings.launcher);
         assert_eq!(
             d.keybindings.launcher,
-            KeyCombo { mods: 4, key: 0x0020 }
+            KeyCombo {
+                mods: 4,
+                key: 0x0020
+            }
         );
     }
 }
