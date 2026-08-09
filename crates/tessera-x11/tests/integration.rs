@@ -440,7 +440,8 @@ fn press_super(conn: &RustConnection, keysym: u32, keysym_name: &str, what: &str
 /// go through it.
 fn xtest_key(conn: &RustConnection, keycode: u8) {
     let root = root_of(conn);
-    conn.xtest_fake_input(KEY_PRESS, keycode, 0, root, 0, 0, 0).unwrap();
+    conn.xtest_fake_input(KEY_PRESS, keycode, 0, root, 0, 0, 0)
+        .unwrap();
     conn.xtest_fake_input(KEY_RELEASE, keycode, 0, root, 0, 0, 0)
         .unwrap();
     conn.flush().unwrap();
@@ -516,12 +517,16 @@ fn set_locks(conn: &RustConnection, target: u16) {
 fn press_combo(conn: &RustConnection, mods: &[u8], key: u8) {
     let root = root_of(conn);
     for &keycode in mods {
-        conn.xtest_fake_input(KEY_PRESS, keycode, 0, root, 0, 0, 0).unwrap();
+        conn.xtest_fake_input(KEY_PRESS, keycode, 0, root, 0, 0, 0)
+            .unwrap();
     }
-    conn.xtest_fake_input(KEY_PRESS, key, 0, root, 0, 0, 0).unwrap();
-    conn.xtest_fake_input(KEY_RELEASE, key, 0, root, 0, 0, 0).unwrap();
+    conn.xtest_fake_input(KEY_PRESS, key, 0, root, 0, 0, 0)
+        .unwrap();
+    conn.xtest_fake_input(KEY_RELEASE, key, 0, root, 0, 0, 0)
+        .unwrap();
     for &keycode in mods.iter().rev() {
-        conn.xtest_fake_input(KEY_RELEASE, keycode, 0, root, 0, 0, 0).unwrap();
+        conn.xtest_fake_input(KEY_RELEASE, keycode, 0, root, 0, 0, 0)
+            .unwrap();
     }
     conn.flush().unwrap();
 }
@@ -1211,10 +1216,7 @@ fn path_with_probes(probes: &Path) -> String {
 /// A unique sentinel path for `what`'s probe output (per-process so parallel
 /// harnesses never collide; the probe writes its full argv there).
 fn sentinel_path(what: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "tessera-e2e-{what}-{}.probe",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("tessera-e2e-{what}-{}.probe", std::process::id()))
 }
 
 /// Whether `name` resolves through the current PATH (plain `Command::new`
@@ -1225,9 +1227,9 @@ fn probe_on_path(name: &str) -> bool {
             let candidate = Path::new(dir).join(name);
             candidate.is_file() && {
                 use std::os::unix::fs::PermissionsExt;
-                candidate.metadata().is_ok_and(|m| {
-                    m.permissions().mode() & 0o111 != 0
-                })
+                candidate
+                    .metadata()
+                    .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
             }
         })
     })
@@ -1336,10 +1338,8 @@ fn ctrl_space_spawns_the_launcher_probe_and_claims_16_bindings() {
     // grab table reached the server (KBR-3's "16 bindings" line on stderr).
     let display = display_name();
     let probes = probes_dir();
-    let config = std::env::temp_dir().join(format!(
-        "tessera-e2e-launcher-{}.toml",
-        std::process::id()
-    ));
+    let config =
+        std::env::temp_dir().join(format!("tessera-e2e-launcher-{}.toml", std::process::id()));
     std::fs::write(
         &config,
         "[general]\nlauncher = [\"probe_launcher\", \"-show\", \"drun\"]\n",
@@ -1381,8 +1381,7 @@ fn ctrl_space_spawns_the_launcher_probe_and_claims_16_bindings() {
     let argv = std::fs::read_to_string(&sentinel)
         .unwrap_or_else(|err| panic!("read {}: {err}", sentinel.display()));
     assert_eq!(
-        argv,
-        "-show\ndrun\n",
+        argv, "-show\ndrun\n",
         "launcher probe must receive the configured argv verbatim (got {argv:?})"
     );
 
