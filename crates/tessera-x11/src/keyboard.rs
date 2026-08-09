@@ -335,106 +335,81 @@ mod tests {
     }
 
     #[test]
-    fn grab_keybindings_grabs_every_default_binding() {
-        // REQ-x11-008: each configured binding is converted from keysym to
-        // keycode(s) and grabbed on the root with its modifier mask. All 15
-        // default bindings grab exactly once, in config order.
+    fn grab_keybindings_grabs_every_default_binding_as_lock_variants() {
+        // KBR-1 (D1): each of the 16 default bindings is expanded into the 8
+        // lock-variant masks (base | every subset of {2,16,32}), so 16 x 8 =
+        // 128 grabs land on the root. Super bindings use the
+        // {64,66,80,96,82,98,112,114} mask set; the launcher (Ctrl+Space)
+        // uses its disjoint {4,6,20,36,22,38,52,54} set.
         let fake = FakeKeyboardOps::new((8, 67), 2, vec![0u32; 120]);
         let keymap = default_keymap();
-        let grabbed = grab_keybindings(&fake, &keymap, ROOT, &Config::default()).unwrap();
-        assert_eq!(grabbed, 15);
-        assert_eq!(
-            fake.calls(),
-            vec![
-                KeyboardCall::Grab {
-                    window: ROOT,
-                    modifiers: MOD_SUPER,
-                    keycode: 36
-                }, // terminal
-                KeyboardCall::Grab {
-                    window: ROOT,
-                    modifiers: MOD_SUPER,
-                    keycode: 44
-                }, // focus_next
-                KeyboardCall::Grab {
-                    window: ROOT,
-                    modifiers: MOD_SUPER,
-                    keycode: 45
-                }, // focus_prev
-                KeyboardCall::Grab {
-                    window: ROOT,
-                    modifiers: MOD_SUPER,
-                    keycode: 24
-                }, // close
-                KeyboardCall::Grab {
-                    window: ROOT,
-                    modifiers: MOD_SUPER,
-                    keycode: 65
-                }, // toggle_layout
-                KeyboardCall::Grab {
-                    window: ROOT,
-                    modifiers: MOD_SUPER,
-                    keycode: 10
-                }, // ws 1
-                KeyboardCall::Grab {
-                    window: ROOT,
-                    modifiers: MOD_SUPER,
-                    keycode: 11
-                },
-                KeyboardCall::Grab {
-                    window: ROOT,
-                    modifiers: MOD_SUPER,
-                    keycode: 12
-                },
-                KeyboardCall::Grab {
-                    window: ROOT,
-                    modifiers: MOD_SUPER,
-                    keycode: 13
-                },
-                KeyboardCall::Grab {
-                    window: ROOT,
-                    modifiers: MOD_SUPER,
-                    keycode: 14
-                },
-                KeyboardCall::Grab {
-                    window: ROOT,
-                    modifiers: MOD_SUPER,
-                    keycode: 15
-                },
-                KeyboardCall::Grab {
-                    window: ROOT,
-                    modifiers: MOD_SUPER,
-                    keycode: 16
-                },
-                KeyboardCall::Grab {
-                    window: ROOT,
-                    modifiers: MOD_SUPER,
-                    keycode: 17
-                },
-                KeyboardCall::Grab {
-                    window: ROOT,
-                    modifiers: MOD_SUPER,
-                    keycode: 18
-                },
-                KeyboardCall::Grab {
-                    window: ROOT,
-                    modifiers: MOD_SUPER,
-                    keycode: 19
-                }, // ws 10
-            ]
+        let stats = grab_keybindings(&fake, &keymap, ROOT, &Config::default()).unwrap();
+        assert_eq!(stats.bindings, 16);
+        assert_eq!(stats.grabs, 128);
+        let calls = fake.calls();
+        assert!(
+            calls
+                .iter()
+                .all(|c| matches!(c, KeyboardCall::Grab { window: ROOT, .. })),
+            "every grab must target the root window"
         );
+        // The first binding (terminal, Super+Enter) grabs keycode 36 with
+        // exactly the eight Super lock-variant masks, in config order.
+        let terminal_grabs: Vec<u16> = calls[..8]
+            .iter()
+            .map(|c| match c {
+                KeyboardCall::Grab { modifiers, .. } => *modifiers,
+                _ => unreachable!("terminal grabs are the first 8 calls"),
+            })
+            .collect();
+        assert_eq!(terminal_grabs, vec![64, 66, 80, 96, 82, 98, 112, 114]);
+        // The last binding (launcher, Ctrl+Space) grabs keycode 65
+        // (XK_space) with its disjoint Control mask set.
+        let launcher_grabs: Vec<u16> = calls[calls.len() - 8..]
+            .iter()
+            .map(|c| match c {
+                KeyboardCall::Grab { modifiers, .. } => *modifiers,
+                _ => unreachable!("launcher grabs are the last 8 calls"),
+            })
+            .collect();
+        assert_eq!(launcher_grabs, vec![4, 6, 20, 36, 22, 38, 52, 54]);
+    }
+
+    #[test]
+    fn grab_keybindings_dedupes_identical_combos_to_one_variant_set() {
+        // D1: dedup happens on the EXPANDED (mods, keycode) pair. When two
+        // bindings are identical (same mods + keysym -> same keycode), their
+        // variant sets coincide, so only 8 grabs land for that keycode
+        // instead of 16 (120 grabs total, 16 bindings still configured).
+        let fake = FakeKeyboardOps::new((8, 67), 2, vec![0u32; 120]);
+        let keymap = default_keymap();
+        let mut cfg = Config::default();
+        cfg.keybindings.launcher = cfg.keybindings.terminal; // Super+Enter twice
+        let stats = grab_keybindings(&fake, &keymap, ROOT, &cfg).unwrap();
+        assert_eq!(stats.bindings, 16);
+        assert_eq!(stats.grabs, 120); // 15 distinct combos x 8 variants
+        let keycode_36_grabs = fake
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, KeyboardCall::Grab { keycode: 36, .. }))
+            .count();
+        assert_eq!(keycode_36_grabs, 8, "identical combos collapse to one 8-grab set");
     }
 
     #[test]
     fn grab_keybindings_skips_bindings_without_a_keycode() {
         // A binding whose keysym exists nowhere in the mapping is skipped
-        // (nothing to grab, no error); the other bindings still grab.
+        // (nothing to grab, no error); the other 15 bindings still expand to
+        // their 8 lock variants (15 x 8 = 120). bindings still counts the
+        // CONFIGURED 16 — the stats keep the config-derived count visible
+        // when grabs < 128 (KBR-3, D6).
         let fake = FakeKeyboardOps::new((8, 67), 2, vec![0u32; 120]);
         let keymap = default_keymap();
         let mut cfg = Config::default();
         cfg.keybindings.terminal.key = 0x9999; // keysym not in the mapping
-        let grabbed = grab_keybindings(&fake, &keymap, ROOT, &cfg).unwrap();
-        assert_eq!(grabbed, 14);
+        let stats = grab_keybindings(&fake, &keymap, ROOT, &cfg).unwrap();
+        assert_eq!(stats.bindings, 16);
+        assert_eq!(stats.grabs, 120);
         assert!(
             !fake
                 .calls()
@@ -442,5 +417,101 @@ mod tests {
                 .any(|c| matches!(c, KeyboardCall::Grab { keycode: 36, .. })),
             "the unbound terminal keysym must not produce a grab"
         );
+    }
+
+    #[test]
+    fn translate_key_press_strips_lock_bits_never_alt_or_super() {
+        // KBR-2 (D2): lock bits 2|16|32|128 are stripped from the published
+        // KeyPressed mods so the core matches on the meaningful modifiers
+        // only. Shift(1), Mod1(8) and Mod4(64) are never stripped; Mod5
+        // over-matches (accepted for v1 `us`).
+        let keymap = default_keymap();
+        // (raw mods, keycode, expected stripped mods) — each row is a press
+        // one of the lock-variant grabs would deliver.
+        let rows = [
+            (u32::from(MOD_SUPER), 36, u32::from(MOD_SUPER)),          // 64 -> 64
+            (u32::from(MOD_SUPER) | 2, 36, u32::from(MOD_SUPER)),      // +CapsLock
+            (u32::from(MOD_SUPER) | 16, 36, u32::from(MOD_SUPER)),     // +NumLock
+            (u32::from(MOD_SUPER) | 2 | 16 | 32, 36, u32::from(MOD_SUPER)), // all locks
+            (u32::from(MOD_SUPER) | 8, 36, u32::from(MOD_SUPER) | 8),  // Mod1 kept
+            (u32::from(MOD_SUPER) | 128, 36, u32::from(MOD_SUPER)),    // Mod5 over-match
+            (4, 65, 4),     // Ctrl+Space plain
+            (4 | 16, 65, 4), // Ctrl+Space + NumLock
+            (4 | 128, 65, 4), // Ctrl+Space + Mod5 over-match
+        ];
+        for (raw_mods, keycode, expected_mods) in rows {
+            let translated = translate_key_press(
+                &keymap,
+                KeyCombo {
+                    mods: raw_mods,
+                    key: keycode,
+                },
+            )
+            .expect("the bound keycode must translate");
+            let Event::KeyPressed(combo) = translated else {
+                panic!("expected a KeyPressed event");
+            };
+            assert_eq!(
+                combo.mods, expected_mods,
+                "mods {raw_mods} (keycode {keycode}) must strip to {expected_mods}"
+            );
+        }
+        // The Mod1-preserved row (Super+Alt+Enter) must NOT match any
+        // binding: the core sees 72, not the bound 64.
+        let super_alt = translate_key_press(
+            &keymap,
+            KeyCombo {
+                mods: u32::from(MOD_SUPER) | 8,
+                key: 36,
+            },
+        )
+        .unwrap();
+        let Event::KeyPressed(alt_combo) = super_alt else {
+            unreachable!()
+        };
+        assert_eq!(
+            command_for_key(&Config::default(), alt_combo),
+            None,
+            "Super+Alt must not fire the terminal binding"
+        );
+        // And the Mod5 over-match: AltGr+Ctrl+Space strips to exactly the
+        // configured launcher combo (4, XK_space) — the accepted over-match.
+        let over = translate_key_press(&keymap, KeyCombo { mods: 4 | 128, key: 65 }).unwrap();
+        let Event::KeyPressed(over_combo) = over else {
+            unreachable!()
+        };
+        assert_eq!(
+            over_combo,
+            Config::default().keybindings.launcher,
+            "AltGr+Ctrl+Space must over-match the Ctrl+Space launcher binding"
+        );
+    }
+
+    #[test]
+    fn nosymbol_keycodes_reports_holes_in_the_mapping() {
+        // KBR-3: keycodes whose PRIMARY keysym is NoSymbol — the holes a
+        // claim log must surface. With one keycode mapped, every other
+        // in-range keycode (8..=67) is a hole; keycodes beyond the table are
+        // not reported.
+        let keymap = keymap_with(&[(36, KEY_RETURN)]);
+        let holes = keymap.nosymbol_keycodes();
+        assert_eq!(holes.len(), 59); // 60 in-range keycodes minus the mapped one
+        assert!(!holes.contains(&36), "the mapped keycode is not a hole");
+        assert!(holes.contains(&37), "an empty slot right after the mapping is a hole");
+        assert!(holes.contains(&8), "the first in-range keycode is a hole");
+        assert!(holes.contains(&67), "the last in-range keycode is a hole");
+    }
+
+    #[test]
+    fn nosymbol_keycodes_reports_every_hole_when_the_mapping_is_sparse() {
+        // Triangulation: a different hole layout yields a different
+        // (non-empty) result — the hole set really comes from the mapping,
+        // not from a fixed answer.
+        let keymap = keymap_with(&[(36, KEY_RETURN), (65, 0x0020)]);
+        let holes = keymap.nosymbol_keycodes();
+        assert_eq!(holes.len(), 58);
+        assert!(!holes.contains(&36));
+        assert!(!holes.contains(&65));
+        assert!(holes.contains(&64), "a hole between the mapped keycodes");
     }
 }
