@@ -507,4 +507,57 @@ mod tests {
         assert_eq!(crate::BarPosition::Top, BarPosition::Top);
         let _ = crate::BarConfig::default();
     }
+
+    // === Launcher config + Ctrl+Space binding — PR1 / WU1 (tessera-keybinds-launcher) ===
+
+    #[test]
+    fn launcher_defaults_to_rofi_drun() {
+        // ALA-2: `[general] launcher` defaults to ["rofi","-show","drun"].
+        // The serde default must agree with the manual Default constructor,
+        // so `Config::default()` and a parsed empty config cannot drift apart.
+        let c = Config::default();
+        assert_eq!(c.general.launcher, vec!["rofi", "-show", "drun"]);
+        let d = Config::parse("[general]\n").expect("valid toml");
+        assert_eq!(c.general.launcher, d.general.launcher);
+    }
+
+    #[test]
+    fn launcher_override_replaces_default() {
+        // ALA-2 scenario "Launcher is configurable": an explicit array wins.
+        let c = Config::parse("[general]\nlauncher = [\"dmenu_run\"]\n").expect("valid toml");
+        assert_eq!(c.general.launcher, vec!["dmenu_run"]);
+    }
+
+    #[test]
+    fn launcher_empty_array_is_rejected_naming_field() {
+        // Design D5 (Open Question 2): `launcher = []` is a misconfiguration
+        // that would leave Ctrl+Space silently inert, so the strict-TOML
+        // parse error must name the field.
+        let err = Config::parse("[general]\nlauncher = []\n").expect_err("must reject");
+        assert!(
+            format!("{err:?}").contains("launcher"),
+            "unexpected err: {err:?}"
+        );
+    }
+
+    #[test]
+    fn default_launcher_keybinding_is_ctrl_space_and_round_trips() {
+        // ALA-2: the launcher keybinding defaults to Ctrl+Space (mods=4,
+        // key=0x0020); an explicit table with the same values parses to the
+        // identical combo, proving the default round-trips through TOML.
+        let c = Config::default();
+        assert_eq!(
+            c.keybindings.launcher,
+            KeyCombo {
+                mods: MOD_CONTROL,
+                key: KEY_SPACE,
+            }
+        );
+        let d = Config::parse("[keybindings.launcher]\nmods = 4\nkey = 32\n").expect("valid toml");
+        assert_eq!(d.keybindings.launcher, c.keybindings.launcher);
+        assert_eq!(
+            d.keybindings.launcher,
+            KeyCombo { mods: 4, key: 0x0020 }
+        );
+    }
 }
