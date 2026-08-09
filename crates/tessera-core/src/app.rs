@@ -174,6 +174,9 @@ impl App {
             CommandEffect::Applied => self.recompute(),
             CommandEffect::Ignored | CommandEffect::Unsupported => Ok(()),
             CommandEffect::SpawnTerminal => self.display.spawn(&self.config.general.terminal),
+            CommandEffect::SpawnLauncher => {
+                self.display.spawn_with_args(&self.config.general.launcher)
+            }
             CommandEffect::CloseFocused => {
                 if let Some(focused) = self.wm.focused_window() {
                     self.destroy_frame_for(focused);
@@ -270,6 +273,9 @@ pub fn command_for_key(cfg: &Config, combo: KeyCombo) -> Option<Command> {
     }
     if combo == k.toggle_layout {
         return Some(Command::ToggleLayout);
+    }
+    if combo == k.launcher {
+        return Some(Command::SpawnLauncher);
     }
     for (i, bound) in k.workspace.iter().enumerate() {
         if *bound == combo {
@@ -676,7 +682,10 @@ mod tests {
             Config::default(),
         );
         app.run();
-        assert_eq!(calls(&log), vec![DisplayCall::Spawn(TERM.to_string())]);
+        assert_eq!(
+            calls(&log),
+            vec![DisplayCall::Spawn(vec![TERM.to_string()])]
+        );
     }
 
     #[test]
@@ -803,8 +812,8 @@ mod tests {
         assert_eq!(
             calls(&log),
             vec![
-                DisplayCall::Spawn("tessera-no-such-program-xyz".to_string()),
-                DisplayCall::Spawn("tessera-no-such-program-xyz".to_string()),
+                DisplayCall::Spawn(vec!["tessera-no-such-program-xyz".to_string()]),
+                DisplayCall::Spawn(vec!["tessera-no-such-program-xyz".to_string()]),
             ]
         );
     }
@@ -826,8 +835,110 @@ mod tests {
         let calls = calls(&log);
         assert_eq!(
             calls.first(),
-            Some(&DisplayCall::Spawn("/bin/true".to_string()))
+            Some(&DisplayCall::Spawn(vec!["/bin/true".to_string()]))
         );
         assert!(calls.contains(&DisplayCall::Manage(1)));
+    }
+
+    // === Launcher routing — PR3 / WU3 (tessera-keybinds-launcher) ===
+
+    #[test]
+    fn keypress_ctrl_space_spawns_the_configured_launcher() {
+        // ALA-2 scenario "Default Ctrl+Space opens rofi": Ctrl+Space
+        // (mods=4, key=0x0020) is looked up and dispatched to a spawn of the
+        // configured launcher array, recorded as Spawn(vec![...]).
+        let (mut app, log) = app_with(
+            vec![Event::KeyPressed(KeyCombo {
+                mods: 4,
+                key: 0x0020,
+            })],
+            Config::default(),
+        );
+        app.run();
+        assert_eq!(
+            calls(&log),
+            vec![DisplayCall::Spawn(vec![
+                "rofi".to_string(),
+                "-show".to_string(),
+                "drun".to_string(),
+            ])]
+        );
+    }
+
+    #[test]
+    fn keypress_ctrl_space_uses_the_configured_launcher_override() {
+        // ALA-2 scenario "Launcher is configurable": the [general] launcher
+        // override replaces the rofi default at the loop level.
+        let mut cfg = Config::default();
+        cfg.general.launcher = vec!["dmenu_run".to_string()];
+        let (mut app, log) = app_with(
+            vec![Event::KeyPressed(KeyCombo {
+                mods: 4,
+                key: 0x0020,
+            })],
+            cfg,
+        );
+        app.run();
+        assert_eq!(
+            calls(&log),
+            vec![DisplayCall::Spawn(vec!["dmenu_run".to_string()])]
+        );
+    }
+
+    #[test]
+    fn launcher_failure_is_logged_and_the_loop_survives() {
+        // ALA-3 "rofi missing": a launcher absent from PATH (DErr::Spawn) is
+        // logged by run(), the loop keeps running, and the binding stays
+        // inert — no WM state changes, nothing crashes.
+        let mut cfg = Config::default();
+        cfg.general.launcher = vec!["tessera-no-such-program-xyz".to_string()];
+        let (mut app, log) = app_with(
+            vec![
+                Event::KeyPressed(KeyCombo {
+                    mods: 4,
+                    key: 0x0020,
+                }),
+                Event::KeyPressed(KeyCombo {
+                    mods: 4,
+                    key: 0x0020,
+                }),
+            ],
+            cfg,
+        );
+        app.run();
+        assert_eq!(
+            calls(&log),
+            vec![
+                DisplayCall::Spawn(vec!["tessera-no-such-program-xyz".to_string()]),
+                DisplayCall::Spawn(vec!["tessera-no-such-program-xyz".to_string()]),
+            ]
+        );
+        // Binding inert: no workspace was ever opened, no window managed.
+        assert_eq!(app.wm().current_id(), 0);
+    }
+
+    #[test]
+    fn defaults_preserved_super_space_toggles_and_super_enter_spawns() {
+        // ALA-2 scenario "Existing defaults preserved": Super+Space still maps
+        // to ToggleLayout (no spawn at all) and Super+Enter still spawns the
+        // terminal — the launcher change must not disturb the Super set.
+        let (mut app, log) = app_with(
+            vec![
+                Event::KeyPressed(KeyCombo {
+                    mods: 1 << 6,
+                    key: 0x0020,
+                }),
+                Event::KeyPressed(KeyCombo {
+                    mods: 1 << 6,
+                    key: 0xff0d,
+                }),
+            ],
+            Config::default(),
+        );
+        app.run();
+        assert_eq!(
+            calls(&log),
+            vec![DisplayCall::Spawn(vec![TERM.to_string()])]
+        );
     }
 }

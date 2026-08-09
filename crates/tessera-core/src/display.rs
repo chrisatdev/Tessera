@@ -64,21 +64,44 @@ pub trait DisplayServer {
     /// Syncs the three EWMH desktop properties (recorded only until U4,
     /// REQ-ws-003 / SC-ws-05).
     fn set_desktops(&mut self, n: u32, cur: u32, names: &[String]) -> Result<(), DErr>;
-    /// Spawns `prog` resolved through PATH, without a shell (T13).
-    fn spawn(&self, prog: &str) -> Result<(), DErr>;
+    /// Spawns `prog` resolved through PATH, without a shell (T13). Default
+    /// implementation delegates to [`DisplayServer::spawn_with_args`] with a
+    /// single-entry argv, so every existing call site keeps working (D3).
+    fn spawn(&self, prog: &str) -> Result<(), DErr> {
+        self.spawn_with_args(&[prog.to_string()])
+    }
+    /// Spawns `argv` with verbatim entries: the program is resolved through
+    /// PATH by [`std::process::Command`] — no shell, no string
+    /// interpretation, no argument splitting — and stdio is detached (null).
+    /// A failure is returned as [`DErr::Spawn`] so the caller logs it and the
+    /// loop keeps running (ALA-1, D3).
+    fn spawn_with_args(&self, argv: &[String]) -> Result<(), DErr>;
 }
 
 /// Spawns `prog` as a child process (T13, process boundary).
 ///
-/// The program is resolved through `PATH` by [`std::process::Command`] — no
-/// shell, no string interpretation, no argument injection — and its stdio is
-/// detached (`null`): a spawned GUI terminal must never inherit the WM's (or
-/// a test harness's) pipes, or a leaked descriptor would keep those pipes
-/// open forever. The child is not waited on. A failure (e.g. a bogus terminal
-/// program) is returned as [`DErr::Spawn`] so the caller logs it and the
-/// loop keeps running instead of crashing.
+/// Kept as a thin wrapper over [`spawn_program_args`] (design D3) so the
+/// single-program call sites keep their `&str` signature.
 pub fn spawn_program(prog: &str) -> Result<(), DErr> {
+    spawn_program_args(&[prog.to_string()])
+}
+
+/// Spawns `argv` as a child process with verbatim entries (ALA-1, D3).
+///
+/// The first entry is resolved through `PATH` by [`std::process::Command`] —
+/// no shell, no string interpretation, no argument injection — and every
+/// entry is passed through unchanged: an argument containing spaces or shell
+/// metacharacters stays ONE argument (never split, never interpreted). The
+/// stdio is detached (`null`): a spawned GUI program must never inherit the
+/// WM's (or a test harness's) pipes. The child is not waited on. An empty
+/// argv (nothing to exec) and a bogus program are both returned as
+/// [`DErr::Spawn`] so the caller logs them and the loop keeps running.
+pub fn spawn_program_args(argv: &[String]) -> Result<(), DErr> {
+    let Some(prog) = argv.first() else {
+        return Err(DErr::Spawn("empty argv".to_string()));
+    };
     std::process::Command::new(prog)
+        .args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -93,7 +116,7 @@ pub(crate) mod test_double {
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
 
-    use super::{DErr, DisplayServer, FrameId, spawn_program};
+    use super::{DErr, DisplayServer, FrameId, spawn_program_args};
     use crate::event::Event;
     use crate::geometry::{Rect, WindowId};
 
@@ -110,7 +133,7 @@ pub(crate) mod test_double {
         Focus(WindowId),
         DestroyFrame(FrameId),
         SetDesktops(u32, u32, Vec<String>),
-        Spawn(String),
+        Spawn(Vec<String>),
     }
 
     /// Yields scripted [`Event`]s through [`DisplayServer::next_event`] and
@@ -202,12 +225,12 @@ pub(crate) mod test_double {
                 .push(DisplayCall::SetDesktops(n, cur, names.to_vec()));
             Ok(())
         }
-        fn spawn(&self, prog: &str) -> Result<(), DErr> {
+        fn spawn_with_args(&self, argv: &[String]) -> Result<(), DErr> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(DisplayCall::Spawn(prog.to_string()));
-            spawn_program(prog)
+                .push(DisplayCall::Spawn(argv.to_vec()));
+            spawn_program_args(argv)
         }
     }
 }
@@ -282,5 +305,42 @@ mod tests {
         let cmd = format!("echo hi > {payload}");
         assert!(matches!(spawn_program(&cmd), Err(DErr::Spawn(_))));
         assert!(!std::path::Path::new(payload).exists());
+    }
+
+    // === spawn_program_args — PR3 / WU3 (tessera-keybinds-launcher) ===
+
+    #[test]
+    fn spawn_program_args_rejects_empty_argv() {
+        // ALA-1 / design D3: an empty argv has no program to exec — a
+        // misconfiguration that would silently spawn nothing. Must error.
+        assert!(matches!(spawn_program_args(&[]), Err(DErr::Spawn(_))));
+    }
+
+    #[test]
+    fn spawn_program_args_passes_argv_verbatim_without_a_shell() {
+        // ALA-1 "No shell interpretation": argv entries are passed VERBATIM
+        // to the program — `>` inside an argument is data, never redirection.
+        // echo prints it literally and NO file is created. (Task list 3.1:
+        // "no shell, no file" — the args-aware form succeeds; the string
+        // form above still errors.)
+        let payload = "/tmp/opencode/tessera-argv-no-shell-pwned";
+        let _ = std::fs::remove_file(payload);
+        assert!(spawn_program_args(&["echo".to_string(), format!("hi > {payload}"),]).is_ok());
+        assert!(!std::path::Path::new(payload).exists());
+    }
+
+    #[test]
+    fn spawn_program_args_uses_path_only_lookup() {
+        // A program that does not exist on PATH fails cleanly with DErr::Spawn.
+        assert!(matches!(
+            spawn_program_args(&["tessera-no-such-program-xyz".to_string()]),
+            Err(DErr::Spawn(_))
+        ));
+    }
+
+    #[test]
+    fn spawn_program_args_runs_an_absolute_path_without_a_shell() {
+        // A known binary via absolute path: spawned directly, no shell.
+        assert!(spawn_program_args(&["/bin/true".to_string()]).is_ok());
     }
 }

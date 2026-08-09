@@ -40,6 +40,8 @@ pub enum CommandEffect {
     Ignored,
     /// The display layer must spawn the configured terminal (T13).
     SpawnTerminal,
+    /// The display layer must spawn the configured launcher argv (ALA-2, D4).
+    SpawnLauncher,
     /// The display layer must request close of the focused client (T12+).
     CloseFocused,
     /// Command not wired to any behavior yet.
@@ -201,6 +203,7 @@ impl WindowManager {
                 }
             }
             Command::SpawnTerminal => CommandEffect::SpawnTerminal,
+            Command::SpawnLauncher => CommandEffect::SpawnLauncher,
             Command::CloseFocused => CommandEffect::CloseFocused,
             Command::ToggleLayout => CommandEffect::Unsupported,
         }
