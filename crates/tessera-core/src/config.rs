@@ -15,6 +15,10 @@ use crate::theme::Color;
 /// Mod1/Alt). A wrong mask silently breaks every Super binding: the grab
 /// never matches the real Mod4 event state (caught by the Xvfb E2E).
 const MOD_SUPER: u32 = 1 << 6;
+/// Modifier mask for the "Control" key (X11 bit 2, `1 << 2`). Ctrl+Space is
+/// the default launcher binding; mask 4 is disjoint from Super (64), so the
+/// two default sets never collide in grab-variant space.
+const MOD_CONTROL: u32 = 1 << 2;
 // Keysyms for the default keybindings (X11 keysym table).
 const KEY_RETURN: u32 = 0xff0d;
 const KEY_J: u32 = 0x006a;
@@ -44,6 +48,11 @@ pub struct GeneralConfig {
     pub gaps: u32,
     #[serde(default = "default_terminal")]
     pub terminal: String,
+    /// Launcher program run by the Ctrl+Space keybinding (design D5, ALA-2).
+    /// Defaults to `["rofi", "-show", "drun"]`; an explicit empty array is a
+    /// parse error — a launcher that silently does nothing is never accepted.
+    #[serde(default = "default_launcher", deserialize_with = "deserialize_launcher")]
+    pub launcher: Vec<String>,
     /// Optional path to a `theme.toml` (REQ-thm-003). `None` -> embedded
     /// ayu_dark, no file read; `Some(path)` is resolved at startup.
     #[serde(default)]
@@ -56,6 +65,7 @@ impl Default for GeneralConfig {
             border_width: default_border_width(),
             gaps: default_gaps(),
             terminal: default_terminal(),
+            launcher: default_launcher(),
             theme: None,
         }
     }
@@ -69,6 +79,9 @@ fn default_gaps() -> u32 {
 }
 fn default_terminal() -> String {
     "alacritty".to_string()
+}
+fn default_launcher() -> Vec<String> {
+    vec!["rofi".to_string(), "-show".to_string(), "drun".to_string()]
 }
 
 /// Screen edge the status bar is drawn on (`[bar] position`).
@@ -154,6 +167,23 @@ where
         Some(n) if n > 200 => Err(de::Error::custom("bar.thickness must be in 1..=200")),
         other => Ok(other),
     }
+}
+
+/// Validates an explicit `[general] launcher` at parse time.
+///
+/// A missing field keeps the rofi default (design D5). A present empty array
+/// is a misconfiguration: it would leave Ctrl+Space silently inert, the same
+/// class of failure this change exists to fix, so it aborts startup with a
+/// config-validation error naming the field.
+fn deserialize_launcher<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Vec::<String>::deserialize(deserializer)?;
+    if raw.is_empty() {
+        return Err(de::Error::custom("general.launcher must not be empty"));
+    }
+    Ok(raw)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
