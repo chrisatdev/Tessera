@@ -201,6 +201,11 @@ pub struct Keybindings {
     pub workspace: [KeyCombo; 10],
     #[serde(default = "default_toggle_layout")]
     pub toggle_layout: KeyCombo,
+    /// Launcher keybinding (design D5, ALA-2): Ctrl+Space, the 16th default
+    /// binding. Ctrl (bit 2) is disjoint from Super (bit 6), so it can never
+    /// collide with the existing Super+Space/Super+Enter defaults.
+    #[serde(default = "default_launcher_combo")]
+    pub launcher: KeyCombo,
 }
 
 impl Default for Keybindings {
@@ -212,6 +217,7 @@ impl Default for Keybindings {
             close: default_close(),
             workspace: default_workspace(),
             toggle_layout: default_toggle_layout(),
+            launcher: default_launcher_combo(),
         }
     }
 }
@@ -243,6 +249,12 @@ fn default_close() -> KeyCombo {
 fn default_toggle_layout() -> KeyCombo {
     KeyCombo {
         mods: MOD_SUPER,
+        key: KEY_SPACE,
+    }
+}
+fn default_launcher_combo() -> KeyCombo {
+    KeyCombo {
+        mods: MOD_CONTROL,
         key: KEY_SPACE,
     }
 }
