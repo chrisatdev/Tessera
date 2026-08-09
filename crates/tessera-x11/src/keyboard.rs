@@ -119,6 +119,20 @@ impl Keymap {
             .filter(|&keycode| self.keysym(keycode) == keysym)
             .collect()
     }
+
+    /// Every in-range keycode whose PRIMARY keysym is NoSymbol, ascending —
+    /// the mapping holes `claim_wm` logs at claim (KBR-3, D6). Keycodes
+    /// beyond the mapping table are never reported.
+    pub(crate) fn nosymbol_keycodes(&self) -> Vec<u8> {
+        let count = self.keysyms.len() / usize::from(self.keysyms_per_keycode.max(1));
+        let max = self
+            .min_keycode
+            .saturating_add(count as u8)
+            .saturating_sub(1);
+        (self.min_keycode..=max)
+            .filter(|&keycode| self.keysym(keycode) == 0)
+            .collect()
+    }
 }
 
 /// Resolves a raw `KeyPressed` (whose `key` is a keyCODE, as translated by
@@ -402,16 +416,33 @@ mod tests {
             })
             .collect();
         assert_eq!(terminal_grabs, vec![64, 66, 80, 96, 82, 98, 112, 114]);
-        // The last binding (launcher, Ctrl+Space) grabs keycode 65
-        // (XK_space) with its disjoint Control mask set.
-        let launcher_grabs: Vec<u16> = calls[calls.len() - 8..]
+        // The launcher (Ctrl+Space) grabs keycode 65 (XK_space) with its
+        // disjoint Control mask set — exactly one grab per variant, and no
+        // other binding uses a Control mask.
+        let launcher_grabs: Vec<(u16, u8)> = calls
             .iter()
-            .map(|c| match c {
-                KeyboardCall::Grab { modifiers, .. } => *modifiers,
-                _ => unreachable!("launcher grabs are the last 8 calls"),
+            .filter_map(|c| match c {
+                KeyboardCall::Grab { modifiers, keycode, .. }
+                    if [4, 6, 20, 36, 22, 38, 52, 54].contains(modifiers) =>
+                {
+                    Some((*modifiers, *keycode))
+                }
+                _ => None,
             })
             .collect();
-        assert_eq!(launcher_grabs, vec![4, 6, 20, 36, 22, 38, 52, 54]);
+        assert_eq!(
+            launcher_grabs,
+            vec![
+                (4, 65),
+                (6, 65),
+                (20, 65),
+                (36, 65),
+                (22, 65),
+                (38, 65),
+                (52, 65),
+                (54, 65),
+            ]
+        );
     }
 
     #[test]
