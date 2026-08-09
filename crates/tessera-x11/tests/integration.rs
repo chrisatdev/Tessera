@@ -1312,9 +1312,8 @@ fn lock_variant_press_with_locks_on_spawns_the_terminal_probe() {
     let argv = std::fs::read_to_string(&sentinel)
         .unwrap_or_else(|err| panic!("read {}: {err}", sentinel.display()));
     assert_eq!(
-        argv,
-        "probe_terminal\n",
-        "terminal probe must receive exactly the configured argv"
+        argv, "",
+        "terminal probe must receive no arguments beyond argv[0] (got {argv:?})"
     );
     assert_eq!(
         locks_on(&conn) & LOCK_BITS,
@@ -1331,9 +1330,9 @@ fn lock_variant_press_with_locks_on_spawns_the_terminal_probe() {
 #[ignore]
 fn ctrl_space_spawns_the_launcher_probe_and_claims_16_bindings() {
     // ALA-2/D4 end-to-end: Ctrl+Space (the default launcher combo) must make
-    // the WM spawn the configured launcher with the argv passed VERBATIM
-    // (argv[0] = program, args after, no shell) — the probe records its whole
-    // argv — and the WM's claim log must prove the 16-binding lock-variant
+    // the WM spawn the configured launcher with the args passed VERBATIM
+    // (no shell, no interpretation — the probe records its full argument
+    // list), and the WM's claim log must prove the 16-binding lock-variant
     // grab table reached the server (KBR-3's "16 bindings" line on stderr).
     let display = display_name();
     let probes = probes_dir();
@@ -1383,8 +1382,8 @@ fn ctrl_space_spawns_the_launcher_probe_and_claims_16_bindings() {
         .unwrap_or_else(|err| panic!("read {}: {err}", sentinel.display()));
     assert_eq!(
         argv,
-        "probe_launcher\n-show\ndrun\n",
-        "launcher probe must receive the configured argv verbatim"
+        "-show\ndrun\n",
+        "launcher probe must receive the configured argv verbatim (got {argv:?})"
     );
 
     let stderr = wm.stop_and_read_stderr();
