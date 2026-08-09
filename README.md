@@ -33,7 +33,7 @@ Implemented in this change (all unit tests green, headless):
   → key-driven focus/workspace-switch handling, plus themed border pixels on
   the real server (default and custom theme files).
 
-Test counts: 202 unit tests (24 binary + 109 core + 69 x11) plus 16 ignored
+Test counts: 208 unit tests (24 binary + 109 core + 75 x11) plus 16 ignored
 integration tests. `cargo test --workspace`, `cargo clippy
 --workspace --all-targets`, and `cargo fmt --check` are clean.
 
@@ -231,6 +231,54 @@ matches the lock-variant grab and strips the lock bits before lookup).
 
 SIGHUP reloads the config; a bad file is rejected and the running config is
 kept.
+
+### Diagnosing the Super key
+
+Every default binding is a Super (Mod4) combo, so when Super bindings never
+fire, the first step is to prove the guest actually receives the key. At
+claim time Tessera logs the keycodes that carry Mod4 and names any binding
+whose keysym resolved nowhere in the mapping:
+
+```text
+tessera: grabbed 128 lock-variant grabs for 16 bindings; 0 keycodes with NoSymbol keysym
+tessera: mod4 keycodes: 133 (Super_L), 134 (Super_R)
+```
+
+| Evidence command | What it shows |
+|---|---|
+| `grep grabbed ~/.xsession-errors` | the claim line: the `grabbed … for 16 bindings` count, the `mod4 keycodes:` diagnosis and any `missing:` entries |
+| `xev -event keyboard` | press Super and check for a `KeyPress` event carrying the `Super_L` keysym |
+| `xmodmap -pm` | the Mod4 column: exactly which keycodes currently carry Mod4 |
+| `Ctrl+Space` | the launcher binding is Control-based — it still fires when the host captures Super |
+| `tessera --display :0 2>/tmp/claim.log` | a fresh claim log captured to a file for inspection |
+
+| Symptom | Cause | Action |
+|---|---|---|
+| claim log says `WARNING: no keycode mapped to Mod4` | no keycode carries Mod4 (SUP-1) | fix the keymap so a key maps to Mod4 |
+| claim log ends with `missing: <name> (0x…)` | the binding's keysym resolves to no keycode (KBR-3) | fix the keymap / keysym, or rebind via config |
+| `xmodmap -pm` shows the key under the wrong modifier | the key is not in the Mod4 column | remap the key with `xmodmap` or rebind via config |
+| `xev` shows no `KeyPress` for Super at all | the host captures the key — the guest never sees it | the only docs-only outcome: see the VM workaround below |
+
+#### Super in VM guests
+
+VirtualBox's Host key is Right Ctrl, so a bare Super usually reaches the
+guest; some hosts (VMware, remote-desktop servers) capture Super globally,
+and the guest never receives a `KeyPress` — no amount of guest-side remapping
+helps, because the key never arrives. The workaround is to rebind the
+affected bindings off Super in the config file (created on first run at
+`~/.config/Tessera/tessera.toml`, or wherever `--config` points), changing
+`mods = 64` (Super) to `mods = 4` (Control), then restart the WM (or SIGHUP
+to reload):
+
+```toml
+[keybindings.terminal]     # now Ctrl+Enter: open a terminal
+mods = 4
+key = 65293
+```
+
+The template's per-binding comments show the full table; `mods` is the X11
+modifier mask (Shift=1, Control=4, Mod1/Alt=8, Mod4/Super=64) and `key` is
+the keysym in decimal (Return=65293, space=32, 1..9=49..57, 0=48).
 
 ## Known v1 limits
 
