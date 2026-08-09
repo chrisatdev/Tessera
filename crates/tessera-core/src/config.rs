@@ -608,4 +608,127 @@ mod tests {
             }
         );
     }
+
+    // === Named keysyms + named modifiers — WU1 (tessera-test-debugging) ===
+
+    #[test]
+    fn named_key_and_mod_equal_legacy_ints() {
+        // NKB-1 "Named key equals legacy int": `mods = "super", key =
+        // "Return"` must parse to exactly the legacy `mods = 64, key = 65293`
+        // combo (0xff0d).
+        let named =
+            Config::parse("[keybindings.terminal]\nmods = \"super\"\nkey = \"Return\"\n")
+                .expect("named values must parse");
+        let legacy =
+            Config::parse("[keybindings.terminal]\nmods = 64\nkey = 65293\n").expect("legacy ints");
+        assert_eq!(
+            named.keybindings.terminal, legacy.keybindings.terminal,
+            "named values must resolve to the legacy int combo"
+        );
+        assert_eq!(
+            named.keybindings.terminal,
+            KeyCombo {
+                mods: MOD_SUPER,
+                key: KEY_RETURN,
+            }
+        );
+    }
+
+    #[test]
+    fn mod_combo_string_ors_masks() {
+        // NKB-1 "Mod combo OR": `"super+control"` (64 | 4) must become 68.
+        let c = Config::parse("[keybindings.terminal]\nmods = \"super+control\"\nkey = \"Return\"\n")
+            .expect("a+b mod list must parse");
+        assert_eq!(c.keybindings.terminal.mods, 68);
+        // Triangulation: a second combo exercises a different mask set.
+        let d = Config::parse("[keybindings.close]\nmods = \"mod1+lock\"\nkey = \"q\"\n")
+            .expect("mod1+lock must parse");
+        assert_eq!(d.keybindings.close.mods, 8 | 2);
+    }
+
+    #[test]
+    fn single_named_mod_maps_to_its_mask() {
+        // NKB-1 "Single named mod": `"ctrl"` (the control alias) is 4.
+        let c = Config::parse("[keybindings.launcher]\nmods = \"ctrl\"\nkey = \"space\"\n")
+            .expect("ctrl alias must parse");
+        assert_eq!(c.keybindings.launcher.mods, MOD_CONTROL);
+        assert_eq!(c.keybindings.launcher.key, KEY_SPACE);
+    }
+
+    #[test]
+    fn int_only_config_parses_unchanged() {
+        // NKB-1 "Ints still parse": an existing int-only config keeps
+        // working byte-for-byte — the named forms are additive.
+        let c = Config::parse(
+            "[keybindings.terminal]\nmods = 64\nkey = 65293\n\
+             [keybindings.close]\nmods = 64\nkey = 113\n",
+        )
+        .expect("legacy ints must keep parsing");
+        assert_eq!(
+            c.keybindings.terminal,
+            KeyCombo {
+                mods: 64,
+                key: 0xff0d,
+            }
+        );
+        assert_eq!(
+            c.keybindings.close,
+            KeyCombo {
+                mods: 64,
+                key: 0x0071,
+            }
+        );
+    }
+
+    #[test]
+    fn enter_esc_aliases_resolve_to_the_canonical_keysyms() {
+        // NKB-3: the lowercase aliases `enter`/`esc` resolve to the same
+        // keysyms as the canonical `Return`/`Escape`.
+        let c = Config::parse("[keybindings.terminal]\nmods = \"super\"\nkey = \"enter\"\n")
+            .expect("enter alias must parse");
+        assert_eq!(c.keybindings.terminal.key, KEY_RETURN);
+        let d = Config::parse("[keybindings.close]\nmods = \"super\"\nkey = \"esc\"\n")
+            .expect("esc alias must parse");
+        assert_eq!(d.keybindings.close.key, 0xff1b);
+    }
+
+    #[test]
+    fn unknown_key_name_errors_naming_field_and_accepted_list() {
+        // NKB-2 "Unknown key name": a typo'd key name fails strict parsing,
+        // naming `key` and listing the accepted dictionary. Lookup is
+        // exact-case, so lowercase "return" is rejected too.
+        for bad in ["Entery", "return"] {
+            let raw = format!("[keybindings.terminal]\nmods = \"super\"\nkey = \"{bad}\"\n");
+            let err = Config::parse(&raw).expect_err("unknown key name must be rejected");
+            let msg = format!("{err:?}");
+            assert!(msg.contains("key"), "error must name the field: {msg}");
+            assert!(msg.contains("accepted"), "error must list accepted names: {msg}");
+            assert!(
+                msg.contains("Return"),
+                "accepted list must include the canonical name: {msg}"
+            );
+            assert!(msg.contains(bad), "error must echo the offending name: {msg}");
+        }
+    }
+
+    #[test]
+    fn unknown_mod_name_errors_naming_field_and_accepted_list() {
+        // NKB-2 "Unknown mod name": "hyper" is a valid KEYSYM name but not a
+        // named modifier — the error names `mods` and lists the accepted
+        // modifiers (exact-case, including the ctrl alias).
+        let err = Config::parse("[keybindings.terminal]\nmods = \"hyper\"\nkey = \"Return\"\n")
+            .expect_err("unknown mod name must be rejected");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("mods"), "error must name the field: {msg}");
+        assert!(msg.contains("hyper"), "error must echo the offending name: {msg}");
+        for accepted in [
+            "super", "control", "ctrl", "shift", "alt", "mod1", "mod2", "mod3", "mod4", "mod5",
+            "lock",
+        ] {
+            assert!(
+                msg.contains(accepted),
+                "accepted list must include {accepted}: {msg}"
+            );
+        }
+    }
 }
