@@ -283,4 +283,48 @@ mod tests {
         assert!(matches!(spawn_program(&cmd), Err(DErr::Spawn(_))));
         assert!(!std::path::Path::new(payload).exists());
     }
+
+    // === spawn_program_args — PR3 / WU3 (tessera-keybinds-launcher) ===
+
+    #[test]
+    fn spawn_program_args_rejects_empty_argv() {
+        // ALA-1 / design D3: an empty argv has no program to exec — a
+        // misconfiguration that would silently spawn nothing. Must error.
+        assert!(matches!(
+            spawn_program_args(&[]),
+            Err(DErr::Spawn(_))
+        ));
+    }
+
+    #[test]
+    fn spawn_program_args_passes_argv_verbatim_without_a_shell() {
+        // ALA-1 "No shell interpretation": argv entries are passed VERBATIM
+        // to the program — `>` inside an argument is data, never redirection.
+        // echo prints it literally and NO file is created. (Task list 3.1:
+        // "no shell, no file" — the args-aware form succeeds; the string
+        // form above still errors.)
+        let payload = "/tmp/opencode/tessera-argv-no-shell-pwned";
+        let _ = std::fs::remove_file(payload);
+        assert!(spawn_program_args(&[
+            "echo".to_string(),
+            format!("hi > {payload}"),
+        ])
+        .is_ok());
+        assert!(!std::path::Path::new(payload).exists());
+    }
+
+    #[test]
+    fn spawn_program_args_uses_path_only_lookup() {
+        // A program that does not exist on PATH fails cleanly with DErr::Spawn.
+        assert!(matches!(
+            spawn_program_args(&["tessera-no-such-program-xyz".to_string()]),
+            Err(DErr::Spawn(_))
+        ));
+    }
+
+    #[test]
+    fn spawn_program_args_runs_an_absolute_path_without_a_shell() {
+        // A known binary via absolute path: spawned directly, no shell.
+        assert!(spawn_program_args(&["/bin/true".to_string()]).is_ok());
+    }
 }
