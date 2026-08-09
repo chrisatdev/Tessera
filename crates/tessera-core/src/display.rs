@@ -313,10 +313,7 @@ mod tests {
     fn spawn_program_args_rejects_empty_argv() {
         // ALA-1 / design D3: an empty argv has no program to exec — a
         // misconfiguration that would silently spawn nothing. Must error.
-        assert!(matches!(
-            spawn_program_args(&[]),
-            Err(DErr::Spawn(_))
-        ));
+        assert!(matches!(spawn_program_args(&[]), Err(DErr::Spawn(_))));
     }
 
     #[test]
@@ -328,11 +325,7 @@ mod tests {
         // form above still errors.)
         let payload = "/tmp/opencode/tessera-argv-no-shell-pwned";
         let _ = std::fs::remove_file(payload);
-        assert!(spawn_program_args(&[
-            "echo".to_string(),
-            format!("hi > {payload}"),
-        ])
-        .is_ok());
+        assert!(spawn_program_args(&["echo".to_string(), format!("hi > {payload}"),]).is_ok());
         assert!(!std::path::Path::new(payload).exists());
     }
 

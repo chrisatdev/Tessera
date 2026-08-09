@@ -682,7 +682,10 @@ mod tests {
             Config::default(),
         );
         app.run();
-        assert_eq!(calls(&log), vec![DisplayCall::Spawn(vec![TERM.to_string()])]);
+        assert_eq!(
+            calls(&log),
+            vec![DisplayCall::Spawn(vec![TERM.to_string()])]
+        );
     }
 
     #[test]
