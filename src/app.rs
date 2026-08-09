@@ -194,7 +194,15 @@ fn create_default_config(path: &Path) -> std::io::Result<()> {
 /// (CFG-5) or a failed creation (CFG-4) warns and falls back to defaults.
 /// Never aborts — only an explicit `--config` stays strict (CFG-2).
 fn bootstrap_config(path: &Path) -> Config {
-    if path.exists() {
+    // CFG-3: an existing NON-EMPTY file loads silently. A zero-byte file is
+    // treated as absent: it parses as empty TOML (all-defaults) yet carries
+    // no template, so the user would never get a commented config to edit.
+    // Empty files are almost always editor/touch accidents, not deliberate
+    // configs — regenerate the template instead (empty-config bugfix).
+    let non_empty = std::fs::metadata(path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false);
+    if non_empty {
         return match Config::load(path) {
             Ok(config) => config,
             Err(err) => {
@@ -535,6 +543,27 @@ mod tests {
                 "the template must load to the defaults"
             );
         });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bootstrap_config_regenerates_template_on_an_empty_existing_file() {
+        // Empty-config bugfix: a zero-byte file is treated as absent, so the
+        // commented template is written (it parses as all-defaults and would
+        // otherwise leave the user with an empty config nobody can edit).
+        let dir =
+            std::env::temp_dir().join(format!("tessera-bootstrap-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("Tessera").join("tessera.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+        let config = bootstrap_config(&path);
+        assert_eq!(config, Config::default());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            raw, DEFAULT_CONFIG_TEMPLATE,
+            "an empty existing file must be regenerated to the template"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
