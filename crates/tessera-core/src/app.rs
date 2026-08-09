@@ -676,7 +676,7 @@ mod tests {
             Config::default(),
         );
         app.run();
-        assert_eq!(calls(&log), vec![DisplayCall::Spawn(TERM.to_string())]);
+        assert_eq!(calls(&log), vec![DisplayCall::Spawn(vec![TERM.to_string()])]);
     }
 
     #[test]
@@ -803,8 +803,8 @@ mod tests {
         assert_eq!(
             calls(&log),
             vec![
-                DisplayCall::Spawn("tessera-no-such-program-xyz".to_string()),
-                DisplayCall::Spawn("tessera-no-such-program-xyz".to_string()),
+                DisplayCall::Spawn(vec!["tessera-no-such-program-xyz".to_string()]),
+                DisplayCall::Spawn(vec!["tessera-no-such-program-xyz".to_string()]),
             ]
         );
     }
@@ -826,7 +826,7 @@ mod tests {
         let calls = calls(&log);
         assert_eq!(
             calls.first(),
-            Some(&DisplayCall::Spawn("/bin/true".to_string()))
+            Some(&DisplayCall::Spawn(vec!["/bin/true".to_string()]))
         );
         assert!(calls.contains(&DisplayCall::Manage(1)));
     }

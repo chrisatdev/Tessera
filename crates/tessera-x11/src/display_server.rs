@@ -528,8 +528,8 @@ impl DisplayServer for X11Display {
         ewmh::set_desktops(conn, self.root, n, cur, names)
     }
 
-    fn spawn(&self, prog: &str) -> Result<(), DErr> {
-        tessera_core::spawn_program(prog)
+    fn spawn_with_args(&self, argv: &[String]) -> Result<(), DErr> {
+        tessera_core::spawn_program_args(argv)
     }
 }
 

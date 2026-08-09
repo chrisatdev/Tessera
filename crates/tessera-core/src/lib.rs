@@ -20,7 +20,7 @@ pub use app::{App, command_for_key};
 pub use bus::{EventBus, EventMask, WmState, WorkspaceState};
 pub use command::Command;
 pub use config::{BarConfig, BarPosition, Config, GeneralConfig, Keybindings};
-pub use display::{DErr, DisplayServer, FrameId, spawn_program};
+pub use display::{DErr, DisplayServer, FrameId, spawn_program, spawn_program_args};
 pub use event::{Event, KeyCombo};
 pub use geometry::{LayoutKind, Placement, Rect, WindowId, WorkspaceId};
 pub use layout::{Layout, MasterStack};
