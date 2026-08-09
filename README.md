@@ -120,8 +120,24 @@ Defaults (a TOML file is optional; `--config <path>` overrides):
 | `general.border_width` | 2 |
 | `general.gaps` | 0 |
 | `general.terminal` | `alacritty` |
+| `general.launcher` | `rofi -show drun` |
 | `general.theme` | (none — embedded ayu_dark) |
 | Layout | master-stack, master ratio 0.5 |
+
+### Launcher
+
+The `[general] launcher` configures the program that **Ctrl+Space** spawns
+(the default is `rofi -show drun`). It is an argv list — each entry is
+passed to the program verbatim, with **no shell** in between:
+
+```toml
+[general]
+launcher = ["dmenu_run"]
+```
+
+An explicitly empty list (`launcher = []`) is rejected at parse time: a
+launcher that silently does nothing is never accepted. A launcher that is
+missing from `PATH` is logged and the WM keeps running.
 
 ### Status bar
 
@@ -180,15 +196,20 @@ Frame borders are painted from a `Theme` palette owned by `tessera-core`:
   ayu_dark palette. (This differs from config files, which abort at boot:
   there is no "previous theme" to keep, and the palette is decorative.)
 
-Keybindings (all Super-based, configurable):
+Keybindings (configurable):
 
 | Keys | Action |
 |---|---|
 | Super+Enter | spawn terminal |
+| Ctrl+Space | spawn launcher (`[general] launcher`) |
 | Super+J / Super+K | focus next / previous |
 | Super+Q | close focused |
 | Super+1..9, Super+0 | switch to workspace 1..10 |
 | Super+Space | toggle layout |
+
+CapsLock, NumLock and ScrollLock states do not affect bindings: pressing a
+key with any lock modifier on still triggers its base binding (the WM
+matches the lock-variant grab and strips the lock bits before lookup).
 
 SIGHUP reloads the config; a bad file is rejected and the running config is
 kept.

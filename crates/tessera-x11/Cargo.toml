@@ -9,5 +9,8 @@ license.workspace = true
 tessera-core = { path = "../tessera-core" }
 # "xtest" is only used by the gated integration test (T21) for the XTEST
 # keypress fallback; "randr" backs the bar monitor resolution (task 2.3,
-# design D10). Neither extension is touched by the library unless asked.
-x11rb = { version = "0.14", features = ["xtest", "randr"] }
+# design D10); "xkb" lets the gated lock-variant tests drive the ScrollLock
+# Mod3 bit via XKB LatchLockState (Xvfb's default keymap has no toggleable
+# ScrollLock key) and assert locked_mods. None of the extensions are touched
+# by the library unless asked.
+x11rb = { version = "0.14", features = ["xtest", "randr", "xkb"] }

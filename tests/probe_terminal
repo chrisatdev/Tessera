@@ -1,0 +1,16 @@
+#!/bin/sh
+# Test-only probe fixture for tessera-keybinds-launcher PR4 (task 4.2).
+#
+# Never installed: the Makefile ships only the tessera binary and the
+# desktop entry, and this fixture is only reachable through a PATH that
+# the integration test hands to the WM under test.
+#
+# Records its arguments (the WM's configured argv minus argv[0] — for a
+# kernel #! exec the shell receives $1.. verbatim) to the sentinel file
+# named by $TESSERA_TEST_SENTINEL, then exits. The sentinel's existence
+# alone proves the WM spawned THIS probe; its content proves the args
+# passed through unchanged.
+set -eu
+if [ "$#" -gt 0 ]; then
+    printf '%s\n' "$@"
+fi > "$TESSERA_TEST_SENTINEL"
