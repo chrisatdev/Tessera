@@ -1335,7 +1335,9 @@ fn ctrl_space_spawns_the_launcher_probe_and_claims_16_bindings() {
     // the WM spawn the configured launcher with the args passed VERBATIM
     // (no shell, no interpretation — the probe records its full argument
     // list), and the WM's claim log must prove the 16-binding lock-variant
-    // grab table reached the server (KBR-3's "16 bindings" line on stderr).
+    // grab table reached the server (KBR-3's "16 bindings" line on stderr),
+    // diagnose Mod4 reachability (SUP-1's "mod4 keycodes:" line) and name
+    // no missing binding on a healthy mapping (KBR-3's no-tail contract).
     let display = display_name();
     let probes = probes_dir();
     let config =
@@ -1389,6 +1391,14 @@ fn ctrl_space_spawns_the_launcher_probe_and_claims_16_bindings() {
     assert!(
         stderr.contains("16 bindings"),
         "claim log must report the 16-binding grab table, got stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("mod4 keycodes:"),
+        "claim log must diagnose Mod4 reachability (SUP-1), got stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("missing:"),
+        "a healthy mapping must not name missing bindings (KBR-3), got stderr: {stderr:?}"
     );
 
     let _ = std::fs::remove_file(&config);
