@@ -394,9 +394,17 @@ impl DisplayServer for X11Display {
         // failed grab aborts startup loudly rather than silently dropping a
         // binding.
         let keymap = keyboard::Keymap::load(conn)?;
-        let grabbed = keyboard::grab_keybindings(conn, &keymap, self.root, &self.config)?;
+        let stats = keyboard::grab_keybindings(conn, &keymap, self.root, &self.config)?;
+        // KBR-3 (D6): the claim log surfaces the grab stats and any mapping
+        // holes — fewer grabs than `bindings * 8` (unresolved/duplicate
+        // bindings) or keycodes stuck at NoSymbol is never silent.
+        let holes = keymap.nosymbol_keycodes().len();
         self.keyboard = Some(keymap);
-        if grabbed == 0 {
+        eprintln!(
+            "tessera: grabbed {} lock-variant grabs for {} bindings; {} keycodes with NoSymbol keysym",
+            stats.grabs, stats.bindings, holes
+        );
+        if stats.grabs == 0 {
             eprintln!("tessera: no keybinding grabbed from config");
         }
         Ok(())
