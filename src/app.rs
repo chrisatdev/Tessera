@@ -71,8 +71,8 @@ impl CliArgs {
 /// deliberately WITHOUT `Serialize` derives — the file is never re-emitted
 /// after editing, so the comments survive.
 const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Tessera default configuration — created on first run. Edit and restart (or SIGHUP) to apply.
-# mods = X11 modifier mask: Shift=1, Control=4, Mod1/Alt=8, Mod4/Super=64. key = keysym in decimal
-# (Return=65293, space=32, j=106, k=107, q=113, 1..9=49..57, 0=48).
+# mods = a named modifier (super, control/ctrl, shift, alt, mod1..mod5, lock) or an integer mask.
+# key = a named keysym (Return, space, j, k, q, 1..9, 0) or an integer keysym.
 
 [general]
 border_width = 2
@@ -81,61 +81,61 @@ terminal = "alacritty"
 launcher = ["rofi", "-show", "drun"]
 
 [keybindings.terminal]     # Super+Enter: open a terminal
-mods = 64
-key = 65293
+mods = "super"
+key = "Return"
 
 [keybindings.focus_next]   # Super+J
-mods = 64
-key = 106
+mods = "super"
+key = "j"
 
 [keybindings.focus_prev]   # Super+K
-mods = 64
-key = 107
+mods = "super"
+key = "k"
 
 [keybindings.close]        # Super+Q
-mods = 64
-key = 113
+mods = "super"
+key = "q"
 
 [keybindings.toggle_layout]  # Super+Space
-mods = 64
-key = 32
+mods = "super"
+key = "space"
 
 [keybindings.launcher]     # Ctrl+Space: run [general] launcher
-mods = 4
-key = 32
+mods = "ctrl"
+key = "space"
 
 # Workspace 1..9, Super+0 = workspace 10. To rebind off Super (e.g. in a VM whose
 # host captures Super — see README "Super in VM guests"): change the mods of a binding to 4 (Control).
 [[keybindings.workspace]]  # workspace-1 (Super+1)
-mods = 64
-key = 49
+mods = "super"
+key = "1"
 [[keybindings.workspace]]  # workspace-2 (Super+2)
-mods = 64
-key = 50
+mods = "super"
+key = "2"
 [[keybindings.workspace]]  # workspace-3 (Super+3)
-mods = 64
-key = 51
+mods = "super"
+key = "3"
 [[keybindings.workspace]]  # workspace-4 (Super+4)
-mods = 64
-key = 52
+mods = "super"
+key = "4"
 [[keybindings.workspace]]  # workspace-5 (Super+5)
-mods = 64
-key = 53
+mods = "super"
+key = "5"
 [[keybindings.workspace]]  # workspace-6 (Super+6)
-mods = 64
-key = 54
+mods = "super"
+key = "6"
 [[keybindings.workspace]]  # workspace-7 (Super+7)
-mods = 64
-key = 55
+mods = "super"
+key = "7"
 [[keybindings.workspace]]  # workspace-8 (Super+8)
-mods = 64
-key = 56
+mods = "super"
+key = "8"
 [[keybindings.workspace]]  # workspace-9 (Super+9)
-mods = 64
-key = 57
+mods = "super"
+key = "9"
 [[keybindings.workspace]]  # workspace-10 (Super+0)
-mods = 64
-key = 48
+mods = "super"
+key = "0"
 "#;
 
 /// Resolves the auto-detected config path (CFG-1, design D6): an absolute
