@@ -12,24 +12,39 @@ use tessera_x11::bar_renderer::tiling_area;
 
 use crate::bar::Bar;
 
-/// Minimal CLI: `tessera [--config <path>] [--display <name>]`.
+/// Minimal CLI: `tessera [--config <path>] [--display <name>] [--version]`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CliArgs {
     /// Optional TOML config file path (`--config`).
     pub config_path: Option<PathBuf>,
     /// Optional X display name (`--display`); `None` means `$DISPLAY`.
     pub display: Option<String>,
+    /// `--version`: print the version to stdout and exit 0 before any
+    /// config or display work (VER-1). The parse loop short-circuits on it,
+    /// so no argument after it is ever validated (design D5).
+    pub version: bool,
 }
 
 impl CliArgs {
     /// Parses the CLI arguments (`--config <path>`, `--display <name>`).
-    /// Unknown flags and missing values are rejected.
+    /// Unknown flags and missing values are rejected; `--version` wins over
+    /// everything after it (VER-1) — once seen, parsing stops and returns
+    /// immediately.
     pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<CliArgs, String> {
         let mut args = args.into_iter();
         let mut config_path = None;
         let mut display = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--version" => {
+                    // VER-1: the winning flag — skip all later validation
+                    // (a trailing `--config` with a missing value must not
+                    // turn a version query into an error, design D5).
+                    return Ok(CliArgs {
+                        version: true,
+                        ..Default::default()
+                    });
+                }
                 "--config" => {
                     let value = args.next().ok_or("--config needs a config file path")?;
                     config_path = Some(PathBuf::from(value));
@@ -44,7 +59,104 @@ impl CliArgs {
         Ok(CliArgs {
             config_path,
             display,
+            version: false,
         })
+    }
+}
+
+/// Default configuration written to the auto-detected path on first run
+/// (CFG-3, design D6/D7): every value IS a [`Config::default()`] value, so
+/// `Config::parse(TEMPLATE) == Config::default()` is locked by
+/// `template_round_trips_to_default` (CFG-6). Hand-written, commented, and
+/// deliberately WITHOUT `Serialize` derives — the file is never re-emitted
+/// after editing, so the comments survive.
+const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Tessera default configuration — created on first run. Edit and restart (or SIGHUP) to apply.
+# mods = X11 modifier mask: Shift=1, Control=4, Mod1/Alt=8, Mod4/Super=64. key = keysym in decimal
+# (Return=65293, space=32, j=106, k=107, q=113, 1..9=49..57, 0=48).
+
+[general]
+border_width = 2
+gaps = 0
+terminal = "alacritty"
+launcher = ["rofi", "-show", "drun"]
+
+[keybindings.terminal]     # Super+Enter: open a terminal
+mods = 64
+key = 65293
+
+[keybindings.focus_next]   # Super+J
+mods = 64
+key = 106
+
+[keybindings.focus_prev]   # Super+K
+mods = 64
+key = 107
+
+[keybindings.close]        # Super+Q
+mods = 64
+key = 113
+
+[keybindings.toggle_layout]  # Super+Space
+mods = 64
+key = 32
+
+[keybindings.launcher]     # Ctrl+Space: run [general] launcher
+mods = 4
+key = 32
+
+# Workspace 1..9, Super+0 = workspace 10. To rebind off Super (e.g. in a VM whose
+# host captures Super — see README "Super in VM guests"): change the mods of a binding to 4 (Control).
+[[keybindings.workspace]]  # workspace-1 (Super+1)
+mods = 64
+key = 49
+[[keybindings.workspace]]  # workspace-2 (Super+2)
+mods = 64
+key = 50
+[[keybindings.workspace]]  # workspace-3 (Super+3)
+mods = 64
+key = 51
+[[keybindings.workspace]]  # workspace-4 (Super+4)
+mods = 64
+key = 52
+[[keybindings.workspace]]  # workspace-5 (Super+5)
+mods = 64
+key = 53
+[[keybindings.workspace]]  # workspace-6 (Super+6)
+mods = 64
+key = 54
+[[keybindings.workspace]]  # workspace-7 (Super+7)
+mods = 64
+key = 55
+[[keybindings.workspace]]  # workspace-8 (Super+8)
+mods = 64
+key = 56
+[[keybindings.workspace]]  # workspace-9 (Super+9)
+mods = 64
+key = 57
+[[keybindings.workspace]]  # workspace-10 (Super+0)
+mods = 64
+key = 48
+"#;
+
+/// Resolves the auto-detected config path (CFG-1, design D6): an absolute
+/// `$XDG_CONFIG_HOME` wins; an empty, relative or absent XDG falls back to
+/// `$HOME/.config`; with no usable `$HOME` there is no candidate at all
+/// (the caller warns and uses defaults). Pure — takes the env values as
+/// parameters so the whole table is testable without touching the process
+/// environment.
+fn auto_config_path(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    let xdg = xdg.filter(|v| !v.is_empty() && Path::new(v).is_absolute());
+    match xdg {
+        Some(xdg) => Some(PathBuf::from(xdg).join("Tessera").join("tessera.toml")),
+        None => {
+            let home = home.filter(|v| !v.is_empty())?;
+            Some(
+                PathBuf::from(home)
+                    .join(".config")
+                    .join("Tessera")
+                    .join("tessera.toml"),
+            )
+        }
     }
 }
 
@@ -57,6 +169,55 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, String> {
     match path {
         Some(path) => Config::load(path).map_err(|err| format!("cannot load config: {err:?}")),
         None => Ok(Config::default()),
+    }
+}
+
+/// The env wrapper around [`auto_config_path`] (CFG-1, design D6): reads
+/// `$XDG_CONFIG_HOME` and `$HOME` and resolves the auto-detected candidate.
+fn resolve_auto_config_path() -> Option<PathBuf> {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(|v| v.to_string_lossy().into_owned());
+    let home = std::env::var_os("HOME").map(|v| v.to_string_lossy().into_owned());
+    auto_config_path(xdg.as_deref(), home.as_deref())
+}
+
+/// Writes the default template at `path`, creating parent directories.
+fn create_default_config(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, DEFAULT_CONFIG_TEMPLATE)
+}
+
+/// Bootstraps the auto-detected config path (design D6) — the LENIENT path:
+/// a missing file is created from the template and logged (CFG-3); an
+/// existing file is loaded silently (CFG-3); a malformed existing file
+/// (CFG-5) or a failed creation (CFG-4) warns and falls back to defaults.
+/// Never aborts — only an explicit `--config` stays strict (CFG-2).
+fn bootstrap_config(path: &Path) -> Config {
+    if path.exists() {
+        return match Config::load(path) {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("tessera: warning: cannot parse {path:?} ({err:?}); using defaults");
+                Config::default()
+            }
+        };
+    }
+    if let Err(err) = create_default_config(path) {
+        eprintln!(
+            "tessera: warning: cannot create default config at {path:?} ({err:?}); using defaults"
+        );
+        return Config::default();
+    }
+    eprintln!("tessera: created default config at {path:?}");
+    match Config::load(path) {
+        Ok(config) => config,
+        // Unreachable in practice: the template is locked to the defaults
+        // by template_round_trips_to_default (CFG-6).
+        Err(err) => {
+            eprintln!("tessera: warning: cannot parse {path:?} ({err:?}); using defaults");
+            Config::default()
+        }
     }
 }
 
@@ -91,9 +252,22 @@ pub fn resolve_theme(config: &Config) -> Theme {
 /// (REQ-bus-004, T19): its renderer lives on a dedicated thread (task 2.7)
 /// drawing once per recompute (design D4).
 pub fn run(args: &CliArgs) -> Result<(), DErr> {
-    // Config: explicit file, or defaults. A bad file aborts startup (there is
-    // no previous config at boot to keep — D6 covers reloads only).
-    let config = Arc::new(load_config(args.config_path.as_deref()).map_err(DErr::X)?);
+    // Config precedence (CFG-1/2, design D6): an explicit `--config` is
+    // strict and never auto-created (missing/malformed aborts, unchanged);
+    // the auto-detected path is lenient — first run creates the commented
+    // template, a malformed file falls back to defaults; with neither
+    // $HOME nor $XDG_CONFIG_HOME there is no candidate at all, so defaults
+    // are used with a warning.
+    let config = Arc::new(match args.config_path.as_deref() {
+        Some(path) => load_config(Some(path)).map_err(DErr::X)?,
+        None => match resolve_auto_config_path() {
+            Some(path) => bootstrap_config(&path),
+            None => {
+                eprintln!("tessera: warning: $HOME and $XDG_CONFIG_HOME unset; using defaults");
+                Config::default()
+            }
+        },
+    });
     // REQ-thm-003: the theme is resolved ONCE at startup (T8). A custom
     // `theme = "path"` that is missing or unparseable falls back to the
     // embedded ayu_dark with a warning — startup never aborts (T9, ratified
@@ -160,9 +334,37 @@ pub fn run(args: &CliArgs) -> Result<(), DErr> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::path::Path;
+    use std::sync::Mutex;
 
     use super::*;
+
+    /// Serializes env-mutating tests (design D8): `std::env::set_var` /
+    /// `remove_var` are `unsafe` in edition 2024 precisely because
+    /// concurrent mutation is a data race; holding this mutex for the whole
+    /// read-modify-restore window makes the `unsafe` blocks sound.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Sets `key` to `value` for the duration of `f`, then restores the
+    /// previous value (or removes the var when it was unset). The ENV_MUTEX
+    /// guard is held across the whole call, so no two env-mutating tests can
+    /// interleave (D8).
+    fn with_env<K: AsRef<OsStr>, V: AsRef<OsStr>, R>(key: K, value: V, f: impl FnOnce() -> R) -> R {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let key = key.as_ref();
+        let previous = std::env::var_os(key);
+        // SAFETY: the ENV_MUTEX guard serializes every mutation across test
+        // threads, so no other code can read or write this variable while we
+        // hold the lock (design D8).
+        unsafe { std::env::set_var(key, value) };
+        let result = f();
+        match previous {
+            Some(previous) => unsafe { std::env::set_var(key, previous) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        result
+    }
 
     /// Writes `contents` to a uniquely named temp config file and returns
     /// its path (the caller removes it after the assertion).
@@ -222,6 +424,7 @@ mod tests {
             CliArgs {
                 config_path: None,
                 display: None,
+                version: false,
             }
         );
         assert_eq!(
@@ -238,7 +441,33 @@ mod tests {
             CliArgs {
                 config_path: Some("/tmp/tessera.toml".into()),
                 display: Some(":9".into()),
+                version: false,
             }
+        );
+    }
+
+    #[test]
+    fn parse_version_short_circuits() {
+        // VER-1: `--version` wins — once seen, no other argument validation
+        // runs (a trailing `--config` with a missing value, or any later
+        // unknown flag, must not error). VER-2: without `--version` first,
+        // unknown flags still fail.
+        for args in [
+            vec!["--version".to_string()],
+            vec!["--version".to_string(), "--config".to_string()],
+            vec!["--version".to_string(), "--bogus".to_string()],
+        ] {
+            let parsed = CliArgs::parse(args).expect("--version must short-circuit");
+            assert!(
+                parsed.version,
+                "--version must set version: true (got {parsed:?})"
+            );
+            assert_eq!(parsed.config_path, None);
+            assert_eq!(parsed.display, None);
+        }
+        assert!(
+            CliArgs::parse(["--bogus".to_string()].into_iter()).is_err(),
+            "an unknown flag without a preceding --version must still error"
         );
     }
 
@@ -246,6 +475,143 @@ mod tests {
     fn parse_rejects_unknown_flags_and_missing_values() {
         assert!(CliArgs::parse(["--bogus".to_string()]).is_err());
         assert!(CliArgs::parse(["--config".to_string()]).is_err()); // value missing
+    }
+
+    #[test]
+    fn auto_config_path_prefers_absolute_xdg() {
+        // CFG-1 scenario "XDG_CONFIG_HOME set": an absolute XDG wins.
+        assert_eq!(
+            auto_config_path(Some("/tmp/cfg"), Some("/home/u")),
+            Some(PathBuf::from("/tmp/cfg/Tessera/tessera.toml"))
+        );
+    }
+
+    #[test]
+    fn auto_config_path_falls_back_to_home() {
+        // CFG-1 scenario "XDG empty or relative": empty or relative XDG (or
+        // none at all) resolves under $HOME/.config instead.
+        let want = Some(PathBuf::from("/home/u/.config/Tessera/tessera.toml"));
+        for xdg in [Some(""), Some("rel/cfg"), None] {
+            assert_eq!(
+                auto_config_path(xdg, Some("/home/u")),
+                want,
+                "xdg={xdg:?} must fall back to $HOME/.config"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_config_path_returns_none_without_home() {
+        // CFG-1 scenario "HOME and XDG unset": no HOME, no candidate — the
+        // caller (run()) warns and uses defaults. An empty HOME is treated
+        // as unset: a relative $HOME would resolve to a cwd-relative path.
+        assert_eq!(auto_config_path(None, None), None);
+        assert_eq!(auto_config_path(Some(""), None), None);
+        assert_eq!(auto_config_path(None, Some("")), None);
+    }
+
+    #[test]
+    fn bootstrap_config_first_run_creates_the_template_and_loads_defaults() {
+        // CFG-3 scenario "First run": a missing auto-detected file is
+        // created verbatim from the template (dirs included) and loads to
+        // Config::default().
+        let dir =
+            std::env::temp_dir().join(format!("tessera-bootstrap-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        with_env("XDG_CONFIG_HOME", dir.to_str().unwrap(), || {
+            let path = resolve_auto_config_path().expect("xdg set -> a candidate");
+            let config = bootstrap_config(&path);
+            let raw = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+                panic!("template must be written at {}: {err}", path.display())
+            });
+            assert_eq!(
+                raw, DEFAULT_CONFIG_TEMPLATE,
+                "the written file must be the template"
+            );
+            assert_eq!(
+                config,
+                Config::default(),
+                "the template must load to the defaults"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bootstrap_config_loads_an_existing_file_without_rewriting() {
+        // CFG-3 scenario "Existing file loads": a valid file is loaded, and
+        // never touched (no creation, no rewrite to the template).
+        let dir =
+            std::env::temp_dir().join(format!("tessera-bootstrap-existing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("Tessera").join("tessera.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[general]\nborder_width = 7\nterminal = \"foot\"\n").unwrap();
+        let config = bootstrap_config(&path);
+        assert_eq!(config.general.border_width, 7);
+        assert_eq!(config.general.terminal, "foot");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("border_width = 7"),
+            "the existing file must not be rewritten to the template"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bootstrap_config_warns_and_uses_defaults_on_a_malformed_auto_config() {
+        // CFG-5: a malformed AUTO-detected file is lenient — defaults, and
+        // the garbage file is left untouched (only the log differs).
+        let dir = std::env::temp_dir().join(format!(
+            "tessera-bootstrap-malformed-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("Tessera").join("tessera.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not [valid toml").unwrap();
+        let config = bootstrap_config(&path);
+        assert_eq!(config, Config::default());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            raw, "not [valid toml",
+            "a malformed file must not be overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bootstrap_config_warns_and_uses_defaults_when_creation_fails() {
+        // CFG-4: when the parent directory cannot be created (here: the XDG
+        // parent is a FILE), creation failure is never fatal — defaults.
+        let dir =
+            std::env::temp_dir().join(format!("tessera-bootstrap-blocked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("xdg");
+        std::fs::write(&blocker, "i am a file, not a directory").unwrap();
+        with_env("XDG_CONFIG_HOME", blocker.to_str().unwrap(), || {
+            let path = resolve_auto_config_path().expect("xdg set -> a candidate");
+            let config = bootstrap_config(&path);
+            assert_eq!(config, Config::default());
+            assert!(
+                !path.exists(),
+                "a failed create must not leave a file behind"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn template_round_trips_to_default() {
+        // CFG-6: the hand-written commented template (D6/D7) must parse
+        // EXACTLY to Config::default() — [general] + the six nested
+        // [keybindings.<name>] tables + the ten [[keybindings.workspace]]
+        // array-of-tables blocks, all carrying the default values.
+        let parsed = Config::parse(DEFAULT_CONFIG_TEMPLATE)
+            .expect("the default template must parse as strict TOML");
+        assert_eq!(parsed, Config::default());
     }
 
     #[test]
