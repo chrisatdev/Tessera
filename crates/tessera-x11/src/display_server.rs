@@ -28,6 +28,7 @@ use x11rb::protocol::xproto::{
 use x11rb::rust_connection::RustConnection;
 
 use crate::event_loop::{next_x11_event, root_event_mask};
+use crate::keyboard::KeyboardOps;
 use crate::{ewmh, frames, keyboard};
 
 /// The x11rb display layer: one X connection plus the root window of the
@@ -399,14 +400,52 @@ impl DisplayServer for X11Display {
         // holes — fewer grabs than `bindings * 8` (unresolved/duplicate
         // bindings) or keycodes stuck at NoSymbol is never silent.
         let holes = keymap.nosymbol_keycodes().len();
-        self.keyboard = Some(keymap);
-        eprintln!(
+        let mut claim = format!(
             "tessera: grabbed {} lock-variant grabs for {} bindings; {} keycodes with NoSymbol keysym",
             stats.grabs, stats.bindings, holes
         );
+        // KBR-3 (D4): bindings whose keysym resolved to no keycode are named
+        // in the claim line as `; missing: <name> (0x<keysym>)`. The tail is
+        // only appended when something IS missing, so a healthy mapping keeps
+        // the plain line (the E2E pins "16 bindings" and the ABSENCE of
+        // "missing:" on Xvfb).
+        if !stats.missing.is_empty() {
+            let missing = stats
+                .missing
+                .iter()
+                .map(|(name, keysym)| format!("{name} (0x{keysym:x})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            claim.push_str(&format!("; missing: {missing}"));
+        }
+        eprintln!("{claim}");
         if stats.grabs == 0 {
             eprintln!("tessera: no keybinding grabbed from config");
         }
+        // SUP-1 (D3): best-effort Mod4 reachability check — every keycode
+        // carrying Mod4 is named with its keysym so a guest whose Super is
+        // captured by the host (or whose keymap lost Mod4) is obvious in the
+        // log. The query runs on the same connection used for the grabs; a
+        // failure only warns — claim and grabs already succeeded.
+        match conn.modifier_map() {
+            Ok((per, map)) => {
+                let mod4 = keyboard::mod4_keycodes(per, &map, &keymap);
+                if mod4.is_empty() {
+                    eprintln!(
+                        "tessera: WARNING: no keycode mapped to Mod4 — Super bindings will never fire"
+                    );
+                } else {
+                    let listed = mod4
+                        .iter()
+                        .map(|(keycode, name)| format!("{keycode} ({name})"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    eprintln!("tessera: mod4 keycodes: {listed}");
+                }
+            }
+            Err(err) => eprintln!("tessera: warning: cannot read modifier map ({err})"),
+        }
+        self.keyboard = Some(keymap);
         Ok(())
     }
 
