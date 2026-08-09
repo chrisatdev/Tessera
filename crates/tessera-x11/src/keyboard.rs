@@ -16,7 +16,9 @@
 
 use tessera_core::{Config, DErr, Event, KeyCombo};
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{GrabMode, ModMask, Window, get_keyboard_mapping, grab_key};
+use x11rb::protocol::xproto::{
+    GrabMode, ModMask, Window, get_keyboard_mapping, get_modifier_mapping, grab_key,
+};
 use x11rb::rust_connection::RustConnection;
 
 use crate::display_server::{map_conn_error, map_reply_error};
@@ -44,6 +46,11 @@ pub(crate) trait KeyboardOps {
     /// Grabs `keycode` with `modifiers` on `window` (owner_events = false,
     /// async pointer/keyboard modes — the press is consumed by the grab).
     fn grab_key(&self, window: Window, modifiers: u16, keycode: u8) -> Result<(), DErr>;
+    /// Fetches the server's raw `GetModifierMapping` reply as
+    /// `(keycodes_per_modifier, flat keycodes)` — the modifier map the
+    /// claim-time Mod4 diagnosis reads (SUP-1, D1). Same
+    /// `(count, flat slice)` seam shape as [`Self::keyboard_mapping`].
+    fn modifier_map(&self) -> Result<(u8, Vec<u8>), DErr>;
 }
 
 impl KeyboardOps for RustConnection {
@@ -67,6 +74,11 @@ impl KeyboardOps for RustConnection {
         )
         .map_err(map_conn_error)?;
         cookie.check().map_err(map_reply_error)
+    }
+    fn modifier_map(&self) -> Result<(u8, Vec<u8>), DErr> {
+        let cookie = get_modifier_mapping(self).map_err(map_conn_error)?;
+        let reply = cookie.reply().map_err(map_reply_error)?;
+        Ok((reply.keycodes_per_modifier(), reply.keycodes))
     }
 }
 
@@ -154,13 +166,72 @@ pub(crate) fn translate_key_press(keymap: &Keymap, raw: KeyCombo) -> Option<Even
     }))
 }
 
+/// X11 modifier keysym → name table for the claim-time Mod4 diagnosis
+/// (SUP-1, D2): the keysyms a modifier keycode commonly carries, so the
+/// claim line can print `133 (Super_L)` instead of `133 (0xffeb)`.
+const KEYSYM_NAMES: &[(u32, &str)] = &[
+    (0xffe1, "Shift_L"),
+    (0xffe2, "Shift_R"),
+    (0xffe3, "Control_L"),
+    (0xffe4, "Control_R"),
+    (0xffe7, "Meta_L"),
+    (0xffe8, "Meta_R"),
+    (0xffe9, "Alt_L"),
+    (0xffea, "Alt_R"),
+    (0xffeb, "Super_L"),
+    (0xffec, "Super_R"),
+    (0xffed, "Hyper_L"),
+    (0xffee, "Hyper_R"),
+];
+
+/// The X11 name for a modifier `keysym` (`"Super_L"`), or `0x{keysym:x}`
+/// when the keysym is not in [`KEYSYM_NAMES`] (D2 — never a panic, never
+/// an empty string; the hex fallback keeps the claim line readable for any
+/// layout).
+pub(crate) fn keysym_name(keysym: u32) -> String {
+    KEYSYM_NAMES
+        .iter()
+        .find(|(sym, _)| *sym == keysym)
+        .map(|(_, name)| (*name).to_string())
+        .unwrap_or_else(|| format!("0x{keysym:x}"))
+}
+
+/// The Mod4 row of a raw `GetModifierMapping` reply as
+/// `(keycode, keysym name)` pairs, ascending, skipping `0` (unused) slots
+/// (SUP-1, D2). The modifier map is `8 rows × keycodes_per_modifier` in
+/// Shift, Lock, Control, Mod1..Mod5 order — Mod4 is row 6. Each row
+/// keycode is resolved to its PRIMARY keysym's name through `keymap`, so
+/// the claim line can tell the user WHICH keys carry Super.
+pub(crate) fn mod4_keycodes(per: u8, map: &[u8], keymap: &Keymap) -> Vec<(u8, String)> {
+    if per == 0 {
+        return Vec::new();
+    }
+    let start = usize::from(per) * 6;
+    let end = (start + usize::from(per)).min(map.len());
+    if start >= map.len() {
+        return Vec::new();
+    }
+    map[start..end]
+        .iter()
+        .filter(|&&keycode| keycode != 0)
+        .map(|&keycode| (keycode, keysym_name(keymap.keysym(keycode))))
+        .collect()
+}
+
 /// Result of a keybinding grab pass (D6, KBR-3): the CONFIGURED binding count
 /// and the ACTUAL grab count — `grabs` drops below `bindings * 8` when a
 /// binding's keysym resolves nowhere in the mapping (unresolved) or two
-/// identical combos collapse onto one expanded (mods, keycode) pair.
+/// identical combos collapse onto one expanded (mods, keycode) pair. Each
+/// unresolved binding is named in [`GrabStats::missing`] so the claim log
+/// can say WHICH binding is dead, not just that the count dropped (KBR-3
+/// modified, D4).
 pub(crate) struct GrabStats {
     pub bindings: usize,
     pub grabs: usize,
+    /// `(binding name, keysym)` for every binding whose keysym resolved to
+    /// NO keycode in the mapping — empty on a healthy map, so the claim
+    /// line only gains a `missing:` tail when there is something to name.
+    pub missing: Vec<(String, u32)>,
 }
 
 /// Grabs every configured keybinding on `root` (REQ-x11-008): each binding's
@@ -168,10 +239,11 @@ pub(crate) struct GrabStats {
 /// every lock-variant mask (`base | variant` for each of the 8
 /// `LOCK_VARIANTS`) so an exact-modifier grab fires under any lock
 /// combination (KBR-1, D1). Bindings whose keysym exists nowhere in the
-/// mapping are skipped, and an expanded `(mods, keycode)` pair is only
-/// grabbed once. Returns the configured binding count plus how many grabs
-/// took effect (KBR-3). Grab failures abort loudly — a silent drop would
-/// recreate the silent-binding-death class this change exists to fix.
+/// mapping are skipped and NAMED in `missing` (KBR-3, D4), and an expanded
+/// `(mods, keycode)` pair is only grabbed once. Returns the configured
+/// binding count plus how many grabs took effect (KBR-3). Grab failures
+/// abort loudly — a silent drop would recreate the silent-binding-death
+/// class this change exists to fix.
 pub(crate) fn grab_keybindings(
     ops: &impl KeyboardOps,
     keymap: &Keymap,
@@ -187,9 +259,31 @@ pub(crate) fn grab_keybindings(
         k.toggle_layout,
         k.launcher,
     ];
+    // The claim-log names for the fixed bindings and the workspace 1..10
+    // bindings (D4) — zipped against the combos below, so every missing
+    // entry is reported as `<name> (0x<keysym:x>)`.
+    let names: Vec<String> = [
+        "terminal",
+        "focus_next",
+        "focus_prev",
+        "close",
+        "toggle_layout",
+        "launcher",
+    ]
+    .iter()
+    .map(|name| (*name).to_string())
+    .chain((1..=10).map(|i| format!("workspace-{i}")))
+    .collect();
+    let mut missing = Vec::new();
     let mut grabbed: Vec<(u16, u8)> = Vec::new();
-    for combo in fixed.iter().chain(k.workspace.iter()) {
-        for keycode in keymap.keycodes_for_keysym(combo.key) {
+    for (name, combo) in names.iter().zip(fixed.iter().chain(k.workspace.iter())) {
+        let keycodes = keymap.keycodes_for_keysym(combo.key);
+        if keycodes.is_empty() {
+            // KBR-3 (D4): the binding's keysym exists nowhere in the mapping
+            // — nothing to grab, and the claim line names it as missing.
+            missing.push((name.clone(), combo.key));
+        }
+        for keycode in keycodes {
             for variant in LOCK_VARIANTS {
                 let pair = (combo.mods as u16 | variant, keycode);
                 if !grabbed.contains(&pair) {
@@ -202,6 +296,7 @@ pub(crate) fn grab_keybindings(
     Ok(GrabStats {
         bindings: fixed.len() + k.workspace.len(),
         grabs: grabbed.len(),
+        missing,
     })
 }
 
@@ -236,15 +331,19 @@ mod tests {
             modifiers: u16,
             keycode: u8,
         },
+        ModifierMap,
     }
 
     /// Scripted `KeyboardOps`: a fixed (range, keysym table) pair plus a
-    /// recording grab log.
+    /// recording grab log and a scriptable `GetModifierMapping` reply (D1).
     struct FakeKeyboardOps {
         calls: RefCell<Vec<KeyboardCall>>,
         range: (u8, u8),
         keysyms_per_keycode: u8,
         keysyms: Vec<u32>,
+        /// The `(keycodes_per_modifier, flat keycodes)` reply
+        /// `modifier_map` returns (D1: raw `GetModifierMapping` shape).
+        modifier_map: RefCell<(u8, Vec<u8>)>,
     }
 
     impl FakeKeyboardOps {
@@ -254,11 +353,17 @@ mod tests {
                 range,
                 keysyms_per_keycode,
                 keysyms,
+                modifier_map: RefCell::new((0, Vec::new())),
             }
         }
 
         fn calls(&self) -> Vec<KeyboardCall> {
             self.calls.borrow().clone()
+        }
+
+        /// Scripts the `GetModifierMapping` reply `modifier_map` returns.
+        fn script_modifier_map(&self, keycodes_per_modifier: u8, keycodes: Vec<u8>) {
+            *self.modifier_map.borrow_mut() = (keycodes_per_modifier, keycodes);
         }
     }
 
@@ -280,6 +385,10 @@ mod tests {
                 keycode,
             });
             Ok(())
+        }
+        fn modifier_map(&self) -> Result<(u8, Vec<u8>), DErr> {
+            self.calls.borrow_mut().push(KeyboardCall::ModifierMap);
+            Ok(self.modifier_map.borrow().clone())
         }
     }
 
@@ -399,6 +508,10 @@ mod tests {
         let stats = grab_keybindings(&fake, &keymap, ROOT, &Config::default()).unwrap();
         assert_eq!(stats.bindings, 16);
         assert_eq!(stats.grabs, 128);
+        assert!(
+            stats.missing.is_empty(),
+            "a healthy mapping resolves every binding — nothing may be missing"
+        );
         let calls = fake.calls();
         assert!(
             calls
@@ -458,6 +571,10 @@ mod tests {
         let stats = grab_keybindings(&fake, &keymap, ROOT, &cfg).unwrap();
         assert_eq!(stats.bindings, 16);
         assert_eq!(stats.grabs, 120); // 15 distinct combos x 8 variants
+        assert!(
+            stats.missing.is_empty(),
+            "identical-but-resolved combos are deduped, not missing"
+        );
         let keycode_36_grabs = fake
             .calls()
             .iter()
@@ -483,12 +600,107 @@ mod tests {
         let stats = grab_keybindings(&fake, &keymap, ROOT, &cfg).unwrap();
         assert_eq!(stats.bindings, 16);
         assert_eq!(stats.grabs, 120);
+        assert_eq!(
+            stats.missing,
+            vec![("terminal".to_string(), 0x9999)],
+            "the unresolved terminal keysym is named with its binding name (KBR-3)"
+        );
         assert!(
             !fake
                 .calls()
                 .iter()
                 .any(|c| matches!(c, KeyboardCall::Grab { keycode: 36, .. })),
             "the unbound terminal keysym must not produce a grab"
+        );
+    }
+
+    #[test]
+    fn modifier_map_is_fetched_through_the_ops_seam() {
+        // D1: the Mod4 diagnosis reaches the server through the same
+        // KeyboardOps seam as the keysym table — a scripted
+        // `(keycodes_per_modifier, flat keycodes)` reply comes back verbatim
+        // and the call is recorded, so the claim flow can be reasoned about
+        // in call order.
+        let fake = FakeKeyboardOps::new((8, 67), 2, vec![0u32; 120]);
+        fake.script_modifier_map(4, vec![0u8; 32]);
+        assert_eq!(fake.modifier_map().unwrap(), (4, vec![0u8; 32]));
+        assert_eq!(fake.calls(), vec![KeyboardCall::ModifierMap]);
+    }
+
+    #[test]
+    fn keysym_name_resolves_the_modifier_names_table() {
+        // D2: known modifier keysyms resolve to their X11 names — Super_L is
+        // the SUP-1 spec scenario; the L/R variants of the common modifiers
+        // round out the table.
+        assert_eq!(keysym_name(0xffeb), "Super_L");
+        assert_eq!(keysym_name(0xffec), "Super_R");
+        assert_eq!(keysym_name(0xffe9), "Alt_L");
+        assert_eq!(keysym_name(0xffe3), "Control_L");
+    }
+
+    #[test]
+    fn keysym_name_falls_back_to_hex_for_unknown_keysyms() {
+        // D2: anything outside the table prints as `0x<keysym:hex>` — never
+        // a panic, never an empty string, so the claim line stays readable
+        // for ANY layout.
+        assert_eq!(keysym_name(0x9999), "0x9999");
+        assert_eq!(keysym_name(0xffffff), "0xffffff");
+    }
+
+    /// A modifier map with `per` keycodes per modifier: the Mod4 row (index
+    /// 6 of 8 — Shift, Lock, Control, Mod1, Mod2, Mod3, Mod4, Mod5) carries
+    /// `mod4`; every other slot is 0 (unused).
+    fn modifier_map_with(per: u8, mod4: &[u8]) -> Vec<u8> {
+        let mut map = vec![0u8; usize::from(per) * 8];
+        map[usize::from(per) * 6..usize::from(per) * 7].copy_from_slice(mod4);
+        map
+    }
+
+    #[test]
+    fn mod4_keycodes_lists_the_named_keycodes_in_the_mod4_row() {
+        // SUP-1 (D2): with 133 (Super_L) and 134 (Super_R) in Mod4, the
+        // helper reports exactly those two keycodes with their keysym names,
+        // skipping the unused 0 slots in the row.
+        let mut keysyms = vec![0u32; 254]; // keycodes 8..=134 (both rows)
+        keysyms[usize::from(133u8 - 8u8) * 2] = 0xffeb; // Super_L on 133
+        keysyms[usize::from(134u8 - 8u8) * 2] = 0xffec; // Super_R on 134
+        let keymap = Keymap::new(8, 2, keysyms);
+        let map = modifier_map_with(4, &[133, 134, 0, 0]);
+        let mod4 = mod4_keycodes(4, &map, &keymap);
+        assert_eq!(
+            mod4,
+            vec![(133, "Super_L".to_string()), (134, "Super_R".to_string())]
+        );
+    }
+
+    #[test]
+    fn mod4_keycodes_uses_the_hex_fallback_for_an_unknown_keysym() {
+        // Triangulation: a Mod4 keycode whose keysym is not in KEYSYM_NAMES
+        // still shows up, named by its hex keysym — the row really comes
+        // from the modifier map, not from a fixed answer.
+        let mut keysyms = vec![0u32; 254]; // keycodes 8..=134
+        keysyms[usize::from(133u8 - 8u8) * 2] = 0x9999;
+        let keymap = Keymap::new(8, 2, keysyms);
+        let map = modifier_map_with(4, &[133, 0, 0, 0]);
+        assert_eq!(
+            mod4_keycodes(4, &map, &keymap),
+            vec![(133, "0x9999".to_string())]
+        );
+    }
+
+    #[test]
+    fn mod4_keycodes_is_empty_when_nothing_is_mapped_to_mod4() {
+        // SUP-1 "Mod4 empty": an all-zero Mod4 row and a zero
+        // keycodes_per_modifier both yield no entries — the claim logs the
+        // WARNING line instead of a diagnosis list.
+        let keymap = keymap_with(&[(36, KEY_RETURN)]);
+        assert!(
+            mod4_keycodes(4, &modifier_map_with(4, &[0, 0, 0, 0]), &keymap).is_empty(),
+            "an all-zero Mod4 row must not produce keycode entries"
+        );
+        assert!(
+            mod4_keycodes(0, &[], &keymap).is_empty(),
+            "a zero keycodes_per_modifier reply has no rows at all"
         );
     }
 
