@@ -202,6 +202,17 @@ impl App {
     /// data flow step 3+4): unmap frames that left the visible set, map frames
     /// that joined it, configure each placement, focus the focused window,
     /// then publish `PlacementsChanged` and a fresh `WmState` snapshot.
+    ///
+    /// D4: one window's display failure never aborts the pass. Each of the
+    /// four steps below logs (`tessera: <err>`) and continues past a failed
+    /// call instead of returning early; `self.mapped` is mutated only after
+    /// the matching call succeeds, so a failed unmap KEEPS its entry
+    /// (retried next pass — dropping it would strand a visible window
+    /// floating over the layout) and a failed map is NOT pushed (also
+    /// retried next pass). The publish + snapshot + bar hook tail always
+    /// runs, and the pass always returns `Ok` once it has processed
+    /// everything it could — `App::run` must not log the same per-window
+    /// failure a second time.
     fn recompute(&mut self) -> Result<(), DErr> {
         let windows = self.wm.visible_windows();
         let focus = self.wm.focused_window();
@@ -214,27 +225,38 @@ impl App {
         // newly visible. `mapped` mirrors the display's map state.
         for &w in self.mapped.clone().iter() {
             if !windows.contains(&w) {
-                self.display.unmap_window(w)?;
-                self.mapped.retain(|&m| m != w);
+                match self.display.unmap_window(w) {
+                    Ok(()) => self.mapped.retain(|&m| m != w),
+                    Err(err) => eprintln!("tessera: {err}"),
+                }
             }
         }
         for &w in &windows {
             if !self.mapped.contains(&w) {
-                self.display.map_window(w)?;
-                self.mapped.push(w);
+                match self.display.map_window(w) {
+                    Ok(()) => self.mapped.push(w),
+                    Err(err) => eprintln!("tessera: {err}"),
+                }
             }
         }
         for p in &placements {
-            self.display.configure(p.window, p.rect)?;
+            if let Err(err) = self.display.configure(p.window, p.rect) {
+                eprintln!("tessera: {err}");
+            }
         }
-        if let Some(f) = focus {
-            self.display.focus_window(f)?;
+        if let Some(f) = focus
+            && let Err(err) = self.display.focus_window(f)
+        {
+            eprintln!("tessera: {err}");
         }
         self.bus
             .publish(Event::PlacementsChanged(self.wm.current_id(), placements));
         self.publish_state();
         // D4: the bar hook fires here — after the fresh snapshot is on the
-        // watch — once per recompute, and only here (never on idle polling).
+        // watch — once per recompute, and only here (never on idle
+        // polling). It always fires, even when one or more of the calls
+        // above failed: one dying client must never silence the rest of the
+        // pass.
         if let Some(cb) = self.on_recompute.as_mut() {
             cb();
         }
@@ -293,7 +315,7 @@ mod tests {
 
     use crate::bus::WorkspaceState;
     use crate::config::Config;
-    use crate::display::test_double::{DisplayCall, MockDisplay};
+    use crate::display::test_double::{DisplayCall, FailAt, MockDisplay};
     use crate::geometry::{LayoutKind, Placement, Rect};
     use crate::theme::Theme;
 
@@ -331,6 +353,20 @@ mod tests {
         w: 396,
         h: 596,
     };
+    /// Upper stack slot for three windows at ratio 0.5 (D4 resilience tests).
+    const STACK_TOP: Rect = Rect {
+        x: 402,
+        y: 2,
+        w: 396,
+        h: 296,
+    };
+    /// Lower stack slot for three windows at ratio 0.5 (D4 resilience tests).
+    const STACK_BOTTOM: Rect = Rect {
+        x: 402,
+        y: 302,
+        w: 396,
+        h: 296,
+    };
 
     fn app_with(script: Vec<Event>, config: Config) -> (App, Arc<Mutex<Vec<DisplayCall>>>) {
         let (mock, log) = MockDisplay::new(script);
@@ -352,6 +388,30 @@ mod tests {
     ) -> (App, Arc<Mutex<Vec<DisplayCall>>>) {
         let (mock, log) = MockDisplay::new(script);
         (App::new(Box::new(mock), Arc::new(config), theme, AREA), log)
+    }
+
+    /// Sibling of [`app_with`] that scripts `failures` on the underlying
+    /// [`MockDisplay`] before the app ever sees it (D4 resilience tests).
+    /// Kept separate so `app_with`'s signature — and every test already
+    /// calling it — stays untouched.
+    fn app_with_failures(
+        script: Vec<Event>,
+        config: Config,
+        failures: Vec<FailAt>,
+    ) -> (App, Arc<Mutex<Vec<DisplayCall>>>) {
+        let (mut mock, log) = MockDisplay::new(script);
+        for at in failures {
+            mock.fail_at(at);
+        }
+        (
+            App::new(
+                Box::new(mock),
+                Arc::new(config),
+                Arc::new(Theme::default()),
+                AREA,
+            ),
+            log,
+        )
     }
 
     fn calls(log: &Arc<Mutex<Vec<DisplayCall>>>) -> Vec<DisplayCall> {
@@ -940,5 +1000,128 @@ mod tests {
             calls(&log),
             vec![DisplayCall::Spawn(vec![TERM.to_string()])]
         );
+    }
+
+    // === recompute log-and-continue — PR3 / WU4 (core-recompute-resilience, D4) ===
+
+    #[test]
+    fn recompute_configure_failure_for_one_window_still_configures_the_rest_and_reaches_focus() {
+        // D4 / task list "cover at minimum": a failing configure for one
+        // window must not abort the pass — the remaining placements are
+        // still applied, and focus is still attempted afterward.
+        let (mut app, log) = app_with_failures(
+            vec![
+                Event::WindowMapRequested(1),
+                Event::WindowMapRequested(2),
+                Event::WindowMapRequested(3),
+            ],
+            Config::default(),
+            vec![FailAt::Configure(2)],
+        );
+        app.run();
+        let calls = calls(&log);
+        // Windows attach most-recent-first, so after mapping 1, 2, 3 the
+        // final pass's placements are: 3 (master), 2 (upper stack), 1
+        // (lower stack) — window 2's configure was attempted and recorded
+        // despite failing...
+        assert!(calls.contains(&DisplayCall::Configure(2, STACK_TOP)));
+        // ...and the pass continued: window 1's configure (ordered AFTER
+        // the failing one) still ran...
+        assert!(calls.contains(&DisplayCall::Configure(1, STACK_BOTTOM)));
+        // ...and focus of the master window (3) was still reached last.
+        assert_eq!(calls.last(), Some(&DisplayCall::Focus(3)));
+    }
+
+    #[test]
+    fn recompute_publishes_state_and_fires_the_bar_hook_after_a_failed_focus() {
+        // D4 task 3.1: a failing focus call must not skip the state publish
+        // or the bar hook — only the individual display call is allowed to
+        // fail.
+        let (mut app, log) = app_with_failures(
+            vec![Event::WindowMapRequested(1)],
+            Config::default(),
+            vec![FailAt::Focus(1)],
+        );
+        let rx = app.bus().subscribe_all();
+        let state_rx = app.bus().state_rx();
+        let fires = Arc::new(Mutex::new(0));
+        let hook = Arc::clone(&fires);
+        app.set_on_recompute(Box::new(move || *hook.lock().unwrap() += 1));
+        app.run();
+
+        // The focus attempt was still made and recorded despite the
+        // scripted failure.
+        assert!(calls(&log).contains(&DisplayCall::Focus(1)));
+        // The bar hook still fires exactly once — a focus failure does not
+        // skip it.
+        assert_eq!(*fires.lock().unwrap(), 1);
+        // A fresh WmState snapshot was still published.
+        assert_eq!(state_rx.borrow().focused, Some(1));
+        // PlacementsChanged was still published on the bus.
+        assert!(
+            drain(&rx)
+                .iter()
+                .any(|ev| matches!(ev, Event::PlacementsChanged(..)))
+        );
+    }
+
+    #[test]
+    fn recompute_keeps_the_mapped_mirror_when_unmap_fails() {
+        // D4 task 3.3: a failed unmap must not drop the window from
+        // `mapped` (it is retried on a later pass instead of stranding a
+        // visible frame with no display-side liveness tracking), AND it
+        // must not block the unmap of the OTHER windows leaving visibility
+        // in the same pass. Two windows both go hidden in one switch;
+        // window 1's unmap is scripted to fail and is ordered FIRST in
+        // `mapped`, so the current `?`-abort bug would also swallow
+        // window 2's unmap entirely.
+        let (mut app, log) = app_with_failures(
+            vec![
+                Event::WindowMapRequested(1),
+                Event::WindowMapRequested(2),
+                Event::Command(Command::SwitchWorkspace(2)),
+            ],
+            Config::default(),
+            vec![FailAt::Unmap(1)],
+        );
+        app.run();
+        let calls = calls(&log);
+        // Window 1's unmap was attempted and recorded despite failing...
+        assert!(calls.contains(&DisplayCall::Unmap(1)));
+        // ...and the pass continued: window 2's unmap (ordered AFTER the
+        // failing one) still ran.
+        assert!(calls.contains(&DisplayCall::Unmap(2)));
+        // `mapped` keeps window 1 (failed, retried next pass) but drops
+        // window 2 (succeeded).
+        assert!(app.mapped.contains(&1));
+        assert!(!app.mapped.contains(&2));
+    }
+
+    #[test]
+    fn recompute_retries_the_map_next_pass_when_map_fails() {
+        // D4 task 3.2: window 1 already has a live frame and is attached +
+        // Managed, but is not yet reflected in `mapped` — exactly the state
+        // recompute's own map loop must handle (distinct from
+        // `on_map_request`'s unrelated first-map path, out of D4's scope).
+        // A failing map here must not abort the pass and must not push the
+        // window into `mapped` anyway.
+        let (mut app, log) = app_with_failures(Vec::new(), Config::default(), vec![FailAt::Map(1)]);
+        app.wm().map_request(1);
+        app.wm().managed(1);
+        app.frames.insert(1, FrameId(1));
+        let _ = app.handle(Event::WindowConfigureRequested(1, AREA));
+
+        // The map attempt was made and recorded despite the scripted
+        // failure...
+        assert!(calls(&log).contains(&DisplayCall::Map(1)));
+        // ...and recompute still continued past it: the window was
+        // configured and focus was still attempted, instead of the pass
+        // aborting silently.
+        assert!(calls(&log).contains(&DisplayCall::Configure(1, SOLO)));
+        assert!(calls(&log).contains(&DisplayCall::Focus(1)));
+        // A failed map must not be mirrored into `mapped` — pushing it
+        // anyway would desync the mirror from the display's real state and
+        // skip the retry on the next pass permanently.
+        assert!(!app.mapped.contains(&1));
     }
 }
