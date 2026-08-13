@@ -51,6 +51,9 @@ const KEY_RELEASE: u8 = 3;
 /// (workspace 2, XK_2), matching the config defaults.
 const KEY_J: u32 = 0x006a;
 const KEY_2: u32 = 0x0032;
+/// XK_1 — the workspace-1 binding, used to switch BACK after an
+/// auto-created-workspace switch.
+const KEY_1: u32 = 0x0031;
 /// Mod4 keysym (XK_Super_L) — every default binding is Super-based.
 const SUPER_L: u32 = 0xffeb;
 /// Keysyms the launcher/lock E2E (PR4) drives: Return (terminal), Space
@@ -658,26 +661,32 @@ fn map_request_tiles_to_real_geometry_and_keys_drive_focus_and_switch() {
         frame_is(&conn, fa, master) && frame_is(&conn, fb, stack)
     });
 
-    // Super+2 (SwitchWorkspace(2)): workspace 2 cannot exist in v1 (a
-    // workspace is auto-opened only when none exist, and there is no command
-    // to open an empty one), so the switch is a documented no-op — nothing
-    // unmaps and the WM survives. The unmap/map/focus mechanics of SC-ws-06
-    // itself are asserted at the core seam
-    // (`switching_workspaces_unmaps_and_maps_frames`).
+    // Super+2 (SwitchWorkspace(2)): dynamic workspaces — switching to a tag
+    // that does not exist yet auto-creates it EMPTY and switches to it, so
+    // both frames leave the visible set and unmap (SC-ws-06). This replaced
+    // the v1 contract where an unknown tag was a documented no-op; the
+    // no-op assertion outlived the behavior it described.
     press_super(&conn, KEY_2, "2", "workspace switch");
-    wait_until("the WM to settle after the workspace-switch key", || {
-        frame_is(&conn, fa, master) && frame_is(&conn, fb, stack)
-    });
-    assert_eq!(
-        map_state(&conn, fa),
-        MapState::VIEWABLE,
-        "windows must stay mapped when switching to an unknown workspace"
+    wait_until(
+        "both frames to unmap after switching to the empty ws 2",
+        || map_state(&conn, fa) != MapState::VIEWABLE && map_state(&conn, fb) != MapState::VIEWABLE,
     );
-    assert_eq!(map_state(&conn, fb), MapState::VIEWABLE);
     assert!(
         wm.alive(),
-        "the WM must survive an unknown-workspace switch"
+        "the WM must survive a switch to an auto-created workspace"
     );
+
+    // Super+1: switching back must remap BOTH frames, which is what makes an
+    // auto-created workspace usable rather than a one-way trip off the
+    // visible set. Only the X-level map state is asserted here — the
+    // placement mechanics of a switch are pinned at the core seam
+    // (`switching_workspaces_unmaps_and_maps_frames`), so re-asserting exact
+    // geometry would duplicate that contract at the slower layer.
+    press_super(&conn, KEY_1, "1", "workspace switch back");
+    wait_until("both frames to come back mapped", || {
+        map_state(&conn, fa) == MapState::VIEWABLE && map_state(&conn, fb) == MapState::VIEWABLE
+    });
+    assert!(wm.alive(), "the WM must survive switching back");
 }
 
 #[test]
