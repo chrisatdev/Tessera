@@ -23,8 +23,14 @@ fn binary_version_exits_successfully() {
         .arg("--version")
         .output()
         .expect("failed to execute tessera binary");
-    assert!(output.status.success(), "binary exited with non-zero status");
+    assert!(
+        output.status.success(),
+        "binary exited with non-zero status"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     // The version string should start with "tessera " and contain the crate version.
-    assert!(stdout.starts_with("tessera "), "unexpected version output: {stdout}");
+    assert!(
+        stdout.starts_with("tessera "),
+        "unexpected version output: {stdout}"
+    );
 }

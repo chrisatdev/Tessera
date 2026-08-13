@@ -520,7 +520,10 @@ mod tests {
         assert_eq!(wm.apply_command(Command::FocusPrev), CommandEffect::Ignored);
         // Switch to the (already current) workspace the managed window
         // auto-opened: no state change, ignored.
-        assert_eq!(wm.apply_command(Command::SwitchWorkspace(1)), CommandEffect::Ignored);
+        assert_eq!(
+            wm.apply_command(Command::SwitchWorkspace(1)),
+            CommandEffect::Ignored
+        );
         assert_eq!(wm.focused_window(), Some(1)); // state untouched
     }
 
