@@ -550,20 +550,18 @@ impl DisplayServer for X11Display {
     }
 
     fn focus_window(&mut self, w: WindowId) -> Result<(), DErr> {
-        // REQ-x11-005 (modified) / SC-x11-13: on a focus change the previously
-        // focused frame repaints inactive and the newly focused frame repaints
-        // active, then input focus moves to the client (D5 — X11Display owns
-        // `focused`, so the repaint is local, no trait/bus change).
+        // REQ-x11-005 (modified) / SC-x11-13 / D2: the whole focus order —
+        // commit `focused`, focus the client (falling back to PointerRoot,
+        // D3), then best-effort repaint the borders — lives in
+        // `frames::apply_focus`. This method keeps only the connection
+        // precondition, so it has no untested logic of its own.
         let conn = self
             .conn
             .as_deref()
             .ok_or_else(|| DErr::X("connect() must succeed before focus_window()".to_string()))?;
-        let previous = self.focused;
         let active = self.active_border_pixel();
         let inactive = self.inactive_border_pixel();
-        frames::repaint_focus(conn, &self.frames, previous, w, active, inactive)?;
-        self.focused = Some(w);
-        frames::focus_client(conn, w)
+        frames::apply_focus(conn, &self.frames, &mut self.focused, w, active, inactive)
     }
 
     fn destroy_frame(&mut self, f: FrameId) -> Result<(), DErr> {

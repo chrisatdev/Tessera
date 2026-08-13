@@ -26,6 +26,13 @@ use crate::display_server::{map_conn_error, map_reply_error};
 /// the gap before the first configure).
 pub(crate) const FRAME_BACKGROUND_PIXEL: u32 = 0;
 
+/// The X11 `PointerRoot` pseudo-window id (`#define PointerRoot ((Window)1)`
+/// in `X.h`) — not a real window, but the value X expects as the `focus`
+/// argument of `SetInputFocus` when `revert_to` is `InputFocus::POINTER_ROOT`
+/// (D3 fallback: focus reverts to whichever window the pointer is over,
+/// keeping input focus set even when no client can be focused directly).
+const POINTER_ROOT: Window = 1;
+
 /// Packs a theme [`Color`] into the 24-bit `border_pixel` X expects
 /// (D2): on TrueColor roots the low 24 bits are R/G/B as `0xRRGGBB`, and
 /// bits ≥ 24 are ignored. The conversion lives at the X boundary so
@@ -76,6 +83,11 @@ pub(crate) trait FrameOps {
     fn set_border_pixel(&self, window: Window, border_pixel: u32) -> Result<(), DErr>;
     /// Sets input focus to `window`.
     fn focus(&self, window: Window) -> Result<(), DErr>;
+    /// Sets X input focus to `PointerRoot` (D3 fallback): a genuinely new X
+    /// request, kept as its own verb rather than reusing `focus` with the
+    /// `PointerRoot` magic window id, so the fallback is directly assertable
+    /// in a test double's call log.
+    fn focus_pointer_root(&self) -> Result<(), DErr>;
     /// Destroys `window`.
     fn destroy(&self, window: Window) -> Result<(), DErr>;
 }
@@ -154,6 +166,16 @@ impl FrameOps for RustConnection {
     fn focus(&self, window: Window) -> Result<(), DErr> {
         let cookie = set_input_focus(self, InputFocus::PARENT, window, x11rb::CURRENT_TIME)
             .map_err(map_conn_error)?;
+        cookie.check().map_err(map_reply_error)
+    }
+    fn focus_pointer_root(&self) -> Result<(), DErr> {
+        let cookie = set_input_focus(
+            self,
+            InputFocus::POINTER_ROOT,
+            POINTER_ROOT,
+            x11rb::CURRENT_TIME,
+        )
+        .map_err(map_conn_error)?;
         cookie.check().map_err(map_reply_error)
     }
     fn destroy(&self, window: Window) -> Result<(), DErr> {
@@ -291,6 +313,38 @@ pub(crate) fn destroy_frame(ops: &impl FrameOps, frame: Window) -> Result<(), DE
     ops.destroy(frame)
 }
 
+/// Owns the whole focus-change order (design D2): `X11Display::focus_window`
+/// shrinks to a connection precondition plus a delegate to this pure
+/// function. `focused` is committed to `next` *before* anything fallible
+/// runs, so no later failure can ever strand it at a destroyed client again
+/// (REQ x11-focus-lifecycle). Only a total focus failure — the client focus
+/// call AND the `PointerRoot` fallback both failing — returns `Err`; a
+/// repaint failure is logged and never blocks.
+pub(crate) fn apply_focus(
+    ops: &impl FrameOps,
+    frames: &HashMap<WindowId, FrameId>,
+    focused: &mut Option<WindowId>,
+    next: WindowId,
+    active_pixel: u32,
+    inactive_pixel: u32,
+) -> Result<(), DErr> {
+    let previous = *focused;
+    // Commit intent before anything fallible (D2 step 2): `focused` records
+    // what the WM meant to focus, not confirmed X state. If the focus call
+    // below fails, the next pass repaints `next` inactive — harmless —
+    // whereas keeping the old value would re-create the exact stale-pointer
+    // bug this change fixes.
+    *focused = Some(next);
+    let focus_result = focus_client(ops, next).or_else(|err| {
+        eprintln!("tessera: {err}");
+        ops.focus_pointer_root()
+    });
+    if let Err(err) = repaint_focus(ops, frames, previous, next, active_pixel, inactive_pixel) {
+        eprintln!("tessera: {err}");
+    }
+    focus_result
+}
+
 #[cfg(test)]
 mod tests {
     //! RED (T17): frame creation, reparenting, mapping and configure must
@@ -357,14 +411,20 @@ mod tests {
             border_pixel: u32,
         },
         Focus(Window),
+        FocusPointerRoot,
         Destroy(Window),
     }
 
     /// Scripted `FrameOps`: records every call and hands out sequential window
-    /// ids for the frame.
+    /// ids for the frame. `fail_focus`/`fail_border` (D6) script a failure for
+    /// `focus`/`set_border_pixel` respectively — the call is still recorded
+    /// first, matching the record-then-check ordering the display-layer test
+    /// double (`MockDisplay`, D5) already uses.
     struct FakeFrameOps {
         calls: RefCell<Vec<FrameCall>>,
         next_id: Cell<Window>,
+        fail_focus: Cell<bool>,
+        fail_border: Cell<bool>,
     }
 
     impl FakeFrameOps {
@@ -372,11 +432,24 @@ mod tests {
             FakeFrameOps {
                 calls: RefCell::new(Vec::new()),
                 next_id: Cell::new(FIRST_FRAME),
+                fail_focus: Cell::new(false),
+                fail_border: Cell::new(false),
             }
         }
 
         fn calls(&self) -> Vec<FrameCall> {
             self.calls.borrow().clone()
+        }
+
+        /// Scripts `focus` to fail (D6): the call is still recorded.
+        fn fail_focus(&self) {
+            self.fail_focus.set(true);
+        }
+
+        /// Scripts `set_border_pixel` to fail (D6): the call is still
+        /// recorded.
+        fn fail_border(&self) {
+            self.fail_border.set(true);
         }
     }
 
@@ -452,6 +525,13 @@ mod tests {
         }
         fn focus(&self, window: Window) -> Result<(), DErr> {
             self.calls.borrow_mut().push(FrameCall::Focus(window));
+            if self.fail_focus.get() {
+                return Err(DErr::X("scripted focus failure".to_string()));
+            }
+            Ok(())
+        }
+        fn focus_pointer_root(&self) -> Result<(), DErr> {
+            self.calls.borrow_mut().push(FrameCall::FocusPointerRoot);
             Ok(())
         }
         fn set_border_pixel(&self, window: Window, border_pixel: u32) -> Result<(), DErr> {
@@ -459,6 +539,9 @@ mod tests {
                 window,
                 border_pixel,
             });
+            if self.fail_border.get() {
+                return Err(DErr::X("scripted border repaint failure".to_string()));
+            }
             Ok(())
         }
         fn destroy(&self, window: Window) -> Result<(), DErr> {
@@ -771,5 +854,105 @@ mod tests {
         let fake = FakeFrameOps::new();
         destroy_frame(&fake, FIRST_FRAME).unwrap();
         assert_eq!(fake.calls(), vec![FrameCall::Destroy(FIRST_FRAME)]);
+    }
+
+    #[test]
+    fn apply_focus_focuses_the_client_then_repaints_borders_in_order() {
+        // Happy path (D2): `focused` moves to `next`, the client is focused
+        // (no PointerRoot fallback needed), and only then are the borders
+        // repainted — old frame inactive, new frame active (SC-x11-13).
+        let fake = FakeFrameOps::new();
+        let frames = HashMap::from([
+            (CLIENT, FrameId(FIRST_FRAME)),
+            (43u32, FrameId(0x0000_1002)),
+        ]);
+        let mut focused = Some(CLIENT);
+        apply_focus(
+            &fake,
+            &frames,
+            &mut focused,
+            43u32,
+            ACTIVE_PIXEL,
+            INACTIVE_PIXEL,
+        )
+        .unwrap();
+        assert_eq!(focused, Some(43u32));
+        assert_eq!(
+            fake.calls(),
+            vec![
+                FrameCall::Focus(43u32),
+                FrameCall::SetBorderPixel {
+                    window: FIRST_FRAME,
+                    border_pixel: INACTIVE_PIXEL,
+                },
+                FrameCall::SetBorderPixel {
+                    window: 0x0000_1002,
+                    border_pixel: ACTIVE_PIXEL,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_focus_commits_focused_and_focuses_the_client_when_the_repaint_fails() {
+        // REQ x11-focus-lifecycle: a border repaint failure must never gate
+        // the recorded focused client or the input-focus attempt — it is
+        // logged and swallowed (D2 step 4).
+        let fake = FakeFrameOps::new();
+        fake.fail_border();
+        let frames = HashMap::from([(CLIENT, FrameId(FIRST_FRAME))]);
+        let mut focused = None;
+        let result = apply_focus(
+            &fake,
+            &frames,
+            &mut focused,
+            CLIENT,
+            ACTIVE_PIXEL,
+            INACTIVE_PIXEL,
+        );
+        assert!(result.is_ok());
+        assert_eq!(focused, Some(CLIENT));
+        assert_eq!(
+            fake.calls(),
+            vec![
+                FrameCall::Focus(CLIENT),
+                FrameCall::SetBorderPixel {
+                    window: FIRST_FRAME,
+                    border_pixel: ACTIVE_PIXEL,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_focus_falls_back_to_pointer_root_when_the_client_focus_fails() {
+        // REQ x11-focus-lifecycle: when focusing the client itself fails, X
+        // input focus must never be left at `None` — the PointerRoot
+        // fallback keeps it set (D3), and `focused` still records intent.
+        let fake = FakeFrameOps::new();
+        fake.fail_focus();
+        let frames = HashMap::from([(CLIENT, FrameId(FIRST_FRAME))]);
+        let mut focused = None;
+        let result = apply_focus(
+            &fake,
+            &frames,
+            &mut focused,
+            CLIENT,
+            ACTIVE_PIXEL,
+            INACTIVE_PIXEL,
+        );
+        assert!(result.is_ok());
+        assert_eq!(focused, Some(CLIENT));
+        assert_eq!(
+            fake.calls(),
+            vec![
+                FrameCall::Focus(CLIENT),
+                FrameCall::FocusPointerRoot,
+                FrameCall::SetBorderPixel {
+                    window: FIRST_FRAME,
+                    border_pixel: ACTIVE_PIXEL,
+                },
+            ]
+        );
     }
 }
