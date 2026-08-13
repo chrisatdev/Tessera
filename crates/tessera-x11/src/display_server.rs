@@ -115,6 +115,25 @@ impl X11Display {
             .ok_or_else(|| DErr::X(format!("no frame for client {w}; manage() must run first")))
     }
 
+    /// Removes the client owning frame `f` from the client -> frame table
+    /// and returns it, clearing `focused` when it named that client (design
+    /// D1). A linear scan over the managed windows (tens, at most) is far
+    /// cheaper than the X round trip `destroy_frame` also performs, and it
+    /// avoids a second parallel representation of the same client<->frame
+    /// truth (the exact stale-bookkeeping bug this fixes).
+    fn forget_frame(&mut self, f: FrameId) -> Option<WindowId> {
+        let owner = self
+            .frames
+            .iter()
+            .find(|&(_, &frame)| frame == f)
+            .map(|(&w, _)| w)?;
+        self.frames.remove(&owner);
+        if self.focused == Some(owner) {
+            self.focused = None;
+        }
+        Some(owner)
+    }
+
     /// Queries the root window's current geometry (T21): the tiling area the
     /// binary passes to the core is the REAL screen size, not a hardcoded
     /// constant. Called after `connect` (guarded like every method here).
@@ -549,7 +568,14 @@ impl DisplayServer for X11Display {
 
     fn destroy_frame(&mut self, f: FrameId) -> Result<(), DErr> {
         // REQ-x11-007: the client already died (DestroyNotify); destroy the
-        // orphaned frame window.
+        // orphaned frame window. D1: `forget_frame` commits the in-memory
+        // bookkeeping BEFORE anything fallible runs, so no failure path can
+        // leave a stale client->frame entry (or a stale `focused`) naming a
+        // resource that no longer exists. Forgetting first also keeps the
+        // `&mut self` call clear of the `conn` borrow, so the guard below
+        // stays the same `ok_or_else` shape as every other method here —
+        // this file has no panic paths in production code.
+        self.forget_frame(f);
         let conn = self
             .conn
             .as_deref()
@@ -858,6 +884,50 @@ mod tests {
             Some(1),
             "an unknown primary must not shadow the connected output"
         );
+    }
+
+    // === forget_frame — PR1 / WU2 (x11-frame-lifecycle, D1) ===
+    //
+    // D6: exercised directly through `X11Display::new(None)` and private
+    // field access — no live X connection required, since `forget_frame`
+    // never touches the connection.
+
+    #[test]
+    fn destroy_frame_forgets_the_client_and_clears_focus() {
+        // REQ-x11-frame-lifecycle: destroying the focused client's frame
+        // removes its client->frame entry AND clears the recorded focused
+        // client — a destroyed frame must never be found again.
+        let mut d = X11Display::new(None);
+        let client: WindowId = 10;
+        let frame = FrameId(1);
+        d.frames.insert(client, frame);
+        d.focused = Some(client);
+
+        let forgotten = d.forget_frame(frame);
+
+        assert_eq!(forgotten, Some(client));
+        assert!(!d.frames.contains_key(&client));
+        assert_eq!(d.focused, None);
+    }
+
+    #[test]
+    fn destroy_frame_keeps_the_frames_of_other_clients() {
+        // Repeated closes each clean up independently: destroying one of
+        // three managed clients' frames must not disturb the other two.
+        let mut d = X11Display::new(None);
+        d.frames.insert(10, FrameId(1));
+        d.frames.insert(20, FrameId(2));
+        d.frames.insert(30, FrameId(3));
+        d.focused = Some(20);
+
+        let forgotten = d.forget_frame(FrameId(2));
+
+        assert_eq!(forgotten, Some(20));
+        assert_eq!(d.frames.get(&10), Some(&FrameId(1)));
+        assert_eq!(d.frames.get(&30), Some(&FrameId(3)));
+        assert!(!d.frames.contains_key(&20));
+        // The forgotten client was the focused one, so focus is cleared too.
+        assert_eq!(d.focused, None);
     }
 
     #[test]
