@@ -1579,3 +1579,150 @@ fn configured_rofi_launcher_spawns_or_skips_when_missing() {
 
     wm.kill();
 }
+
+// ----------------------------------------------------------------------
+// WU6 (PR4, tessera-focus-lifecycle-repair): the ORIGINAL user-reported
+// freeze, reproduced end-to-end and proven fixed (T7 / design D6).
+// ----------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn closing_a_window_keeps_keybindings_alive() {
+    // Reproduces the exact bug this change fixes (verified live pre-fix,
+    // engram obs #65): with three managed clients, destroying the FOCUSED
+    // one used to leave a stale client->frame entry in `X11Display`. The
+    // very next focus attempt then issued its border-repaint
+    // `ChangeWindowAttributes` against that dead frame, got a BadWindow, and
+    // the old `?`-propagating code aborted the WHOLE focus pass before ever
+    // reaching `SetInputFocus`. X input focus stayed pointed at the
+    // already-destroyed window, which the server immediately reverts to
+    // `None` once the window is gone — and once focus is `None`, X discards
+    // every keyboard event, including the WM's own passive root grabs
+    // (SC-x11-04's `GrabKey` calls). The whole WM went keyboard-dead after
+    // exactly one close of its focused window.
+    let display = display_name();
+    let (mut wm, conn, root) = spawn_wm(&display, None);
+    let screen = &conn.setup().roots[0];
+
+    // Step 1: three managed clients, each reparented into its own frame
+    // (mirrors the live repro: "three managed xterms").
+    let windows = [
+        map_client(&conn, root, screen.root_depth, screen.root_visual),
+        map_client(&conn, root, screen.root_depth, screen.root_visual),
+        map_client(&conn, root, screen.root_depth, screen.root_visual),
+    ];
+    let frame_of = |w: Window| parent_of(&conn, w);
+    wait_until(
+        "all three clients to be reparented into distinct frames",
+        || {
+            let (fa, fb, fc) = (
+                frame_of(windows[0]),
+                frame_of(windows[1]),
+                frame_of(windows[2]),
+            );
+            fa != root && fb != root && fc != root && fa != fb && fa != fc && fb != fc
+        },
+    );
+
+    // Step 2: record which client currently holds X input focus.
+    // `frames::apply_focus` sets focus directly on the CLIENT window (design
+    // D2), never on the frame, so `GetInputFocus` reports one of `windows`
+    // here.
+    let mut focused_idx = 0;
+    wait_until("input focus to settle on one of the three clients", || {
+        let f = conn.get_input_focus().unwrap().reply().unwrap().focus;
+        match windows.iter().position(|&w| w == f) {
+            Some(idx) => {
+                focused_idx = idx;
+                true
+            }
+            None => false,
+        }
+    });
+    let focused_window = windows[focused_idx];
+    let survivors: Vec<Window> = windows
+        .iter()
+        .copied()
+        .filter(|&w| w != focused_window)
+        .collect();
+
+    // Step 3: destroy the focused client. The test owns these windows
+    // directly, so `destroy_window` here produces the SAME X event a real
+    // killed process's window produces — a `DestroyNotify` delivered to
+    // whoever selected `SubstructureNotify` on its parent, which is the
+    // WM's own frame (`App::handle`'s `Event::WindowDestroyNotify` arm).
+    conn.destroy_window(focused_window)
+        .unwrap()
+        .check()
+        .unwrap();
+
+    // Step 4 — THE assertion that fails pre-fix: X input focus must move to
+    // a SURVIVING client. Never `None` (window id 0, what the server reverts
+    // to once the previously-focused window is destroyed) and never the
+    // destroyed window itself. Before the fix this polls to timeout: the
+    // aborted focus pass never issues a fresh `SetInputFocus`, so the reply
+    // never leaves 0.
+    wait_until(
+        "X input focus to move to a surviving client after the close",
+        || {
+            let f = conn.get_input_focus().unwrap().reply().unwrap().focus;
+            survivors.contains(&f)
+        },
+    );
+    let focus_after_close = conn.get_input_focus().unwrap().reply().unwrap().focus;
+    assert_ne!(
+        focus_after_close, 0,
+        "X input focus must never be left at None after closing the focused client"
+    );
+    assert_ne!(
+        focus_after_close, focused_window,
+        "X input focus must not still name the destroyed window"
+    );
+    assert!(
+        survivors.contains(&focus_after_close),
+        "X input focus must land on a surviving client, got {focus_after_close}"
+    );
+
+    // Step 5: the fix is "log and continue", not just "don't crash" — the WM
+    // process and the two surviving frames must still be alive/mapped.
+    assert!(wm.alive(), "the WM must survive closing its focused client");
+    for &survivor in &survivors {
+        let frame = frame_of(survivor);
+        assert_ne!(
+            frame, root,
+            "surviving client {survivor} must still be reparented into a frame"
+        );
+        assert_eq!(
+            map_state(&conn, frame),
+            MapState::VIEWABLE,
+            "surviving client {survivor}'s frame must still be mapped"
+        );
+    }
+
+    // Step 6: the WM's keybinding grabs must still fire after the close —
+    // the second half of the original bug (focus reverting to `None` makes X
+    // discard all keyboard events, so even the passive grabs stop firing).
+    // We drive Super+J (focus_next, a default binding already exercised
+    // elsewhere in this file) through the existing XTEST/xdotool path
+    // instead of the terminal/launcher binding: it needs no extra config
+    // file or PATH-probe plumbing, so it isolates the ONE thing this test
+    // proves (a keypress still reaches the WM's grab and dispatches a
+    // command) from the spawn machinery already covered by
+    // `lock_variant_press_with_locks_on_spawns_the_terminal_probe` and
+    // `ctrl_space_spawns_the_launcher_probe_and_claims_16_bindings`.
+    let other_survivor = survivors
+        .iter()
+        .copied()
+        .find(|&w| w != focus_after_close)
+        .expect("two survivors remain after closing the focused client");
+    press_super(
+        &conn,
+        KEY_J,
+        "j",
+        "focus_next after closing the previously focused client",
+    );
+    wait_until(
+        "Super+J to move focus to the other surviving client",
+        || conn.get_input_focus().unwrap().reply().unwrap().focus == other_survivor,
+    );
+}
