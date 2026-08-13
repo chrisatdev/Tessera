@@ -1,1 +1,4 @@
 /target
+
+# CodeGraph index (per-checkout, never shared)
+.codegraph/
