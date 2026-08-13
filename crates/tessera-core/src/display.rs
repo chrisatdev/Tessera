@@ -113,12 +113,23 @@ pub fn spawn_program_args(argv: &[String]) -> Result<(), DErr> {
 #[cfg(test)]
 pub(crate) mod test_double {
     //! Headless [`DisplayServer`] for loop tests (the U3 harness).
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::{Arc, Mutex};
 
     use super::{DErr, DisplayServer, FrameId, spawn_program_args};
     use crate::event::Event;
     use crate::geometry::{Rect, WindowId};
+
+    /// A single display call to script as failing (design D5). Each variant
+    /// names the call and the window it targets; `Configure` matches on the
+    /// window alone (the [`Rect`] argument does not vary the outcome).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub(crate) enum FailAt {
+        Map(WindowId),
+        Unmap(WindowId),
+        Configure(WindowId),
+        Focus(WindowId),
+    }
 
     /// One recorded display call, in order (manage -> map -> configure ->
     /// focus). Tests assert the loop's behavior on this log.
@@ -144,11 +155,13 @@ pub(crate) mod test_double {
         calls: Arc<Mutex<Vec<DisplayCall>>>,
         frames: HashMap<WindowId, FrameId>,
         next_frame: u32,
+        failures: HashSet<FailAt>,
     }
 
     impl MockDisplay {
         /// Creates a double that yields `script` then `Ok(None)`, returning
-        /// the shared call log alongside it.
+        /// the shared call log alongside it. The failure set starts empty, so
+        /// every existing test keeps its all-`Ok` default (D5).
         pub(crate) fn new(script: Vec<Event>) -> (Self, Arc<Mutex<Vec<DisplayCall>>>) {
             let calls = Arc::new(Mutex::new(Vec::new()));
             (
@@ -157,6 +170,7 @@ pub(crate) mod test_double {
                     calls: Arc::clone(&calls),
                     frames: HashMap::new(),
                     next_frame: 1,
+                    failures: HashSet::new(),
                 },
                 calls,
             )
@@ -170,6 +184,14 @@ pub(crate) mod test_double {
         /// Snapshot of the recorded calls, in order.
         pub(crate) fn calls(&self) -> Vec<DisplayCall> {
             self.calls.lock().unwrap().clone()
+        }
+
+        /// Scripts `at` to return `Err` on EVERY invocation from now on
+        /// (D5) — the entry is never consumed, so a retried call fails
+        /// again. The scripted call still records its [`DisplayCall`]
+        /// first — see each method below.
+        pub(crate) fn fail_at(&mut self, at: FailAt) {
+            self.failures.insert(at);
         }
     }
 
@@ -194,10 +216,16 @@ pub(crate) mod test_double {
         }
         fn map_window(&mut self, w: WindowId) -> Result<(), DErr> {
             self.calls.lock().unwrap().push(DisplayCall::Map(w));
+            if self.failures.contains(&FailAt::Map(w)) {
+                return Err(DErr::X(format!("scripted failure: map {w}")));
+            }
             Ok(())
         }
         fn unmap_window(&mut self, w: WindowId) -> Result<(), DErr> {
             self.calls.lock().unwrap().push(DisplayCall::Unmap(w));
+            if self.failures.contains(&FailAt::Unmap(w)) {
+                return Err(DErr::X(format!("scripted failure: unmap {w}")));
+            }
             Ok(())
         }
         fn configure(&mut self, w: WindowId, r: Rect) -> Result<(), DErr> {
@@ -205,10 +233,16 @@ pub(crate) mod test_double {
                 .lock()
                 .unwrap()
                 .push(DisplayCall::Configure(w, r));
+            if self.failures.contains(&FailAt::Configure(w)) {
+                return Err(DErr::X(format!("scripted failure: configure {w}")));
+            }
             Ok(())
         }
         fn focus_window(&mut self, w: WindowId) -> Result<(), DErr> {
             self.calls.lock().unwrap().push(DisplayCall::Focus(w));
+            if self.failures.contains(&FailAt::Focus(w)) {
+                return Err(DErr::X(format!("scripted failure: focus {w}")));
+            }
             Ok(())
         }
         fn destroy_frame(&mut self, f: FrameId) -> Result<(), DErr> {
@@ -237,8 +271,28 @@ pub(crate) mod test_double {
 
 #[cfg(test)]
 mod tests {
-    use super::test_double::{DisplayCall, MockDisplay};
+    use super::test_double::{DisplayCall, FailAt, MockDisplay};
     use super::*;
+
+    #[test]
+    fn mock_display_scripts_a_single_call_failure() {
+        // D5: scripting one call must not change the default all-`Ok`
+        // behavior of every other call, and the scripted call must still
+        // record its `DisplayCall` despite returning `Err` (SC: "default
+        // behavior is unchanged" / "a single call can be scripted to fail").
+        let (mut d, log) = MockDisplay::new(Vec::new());
+        d.fail_at(FailAt::Focus(10));
+
+        // Unscripted call for the same window stays `Ok`, as before.
+        assert!(d.manage(10).is_ok());
+        // The scripted call returns the configured `Err`...
+        assert!(matches!(d.focus_window(10), Err(DErr::X(_))));
+        // ...but is still recorded in order alongside the successful call.
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![DisplayCall::Manage(10), DisplayCall::Focus(10)]
+        );
+    }
 
     #[test]
     fn mock_records_connect_claim_and_ewmh_sync_calls() {
