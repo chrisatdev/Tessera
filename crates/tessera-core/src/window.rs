@@ -511,15 +511,16 @@ mod tests {
     #[test]
     fn dispatch_ignores_noop_commands() {
         // Commands with no target are ignored, never fatal: no windows to
-        // cycle, a sole window, or an unknown workspace.
+        // cycle, or a sole window. Switching to an unknown workspace is NOT
+        // a no-op anymore — it auto-creates the empty workspace (dynamic
+        // workspaces), so only "already current" can be ignored.
         let (_, _, mut wm) = setup();
         assert_eq!(wm.apply_command(Command::FocusNext), CommandEffect::Ignored);
         manage(&mut wm, 1);
         assert_eq!(wm.apply_command(Command::FocusPrev), CommandEffect::Ignored);
-        assert_eq!(
-            wm.apply_command(Command::SwitchWorkspace(9)),
-            CommandEffect::Ignored
-        );
+        // Switch to the (already current) workspace the managed window
+        // auto-opened: no state change, ignored.
+        assert_eq!(wm.apply_command(Command::SwitchWorkspace(1)), CommandEffect::Ignored);
         assert_eq!(wm.focused_window(), Some(1)); // state untouched
     }
 

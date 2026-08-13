@@ -289,8 +289,8 @@ the keysym in decimal (Return=65293, space=32, 1..9=49..57, 0=48).
   primary output, the first connected output is used.
 - The theme is resolved once at startup; SIGHUP reloads the config but not a
   changed `theme` path (restart the WM to pick up a new theme file).
-- A workspace is auto-created on demand only when none exist; there is no
-  command yet to open or switch to an empty workspace.
+- A workspace is auto-created on demand when none exist, and switching to an
+  empty workspace tag (Super+2..0) auto-creates it empty (dynamic workspaces).
 - EWMH desktop-property writes are wired as a display-layer delegate but not
   yet driven by the loop.
 - Master-stack is the only layout.
@@ -299,4 +299,5 @@ the keysym in decimal (Return=65293, space=32, 1..9=49..57, 0=48).
 
 - Bar content: clock, tray, and a layout indicator.
 - The remaining four layouts (tall, spiral, grid, ...).
-- Workspace UX: opening/renaming workspaces, switching to empty ones.
+- Workspace UX: renaming workspaces, and creating workspaces beyond the
+  Super+1..0 tags (e.g. numbered/unbounded workspace sets).

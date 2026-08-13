@@ -79,8 +79,17 @@ impl WorkspaceManager {
     /// Creates a workspace with the next auto name and publishes
     /// `WorkspaceOpened`; the first one becomes current (REQ-ws-001).
     pub fn open(&mut self) -> WorkspaceId {
-        let id = self.next_id;
-        self.next_id += 1;
+        self.open_with_id(self.next_id)
+    }
+
+    /// Creates workspace `id` (no-op when it already exists) and publishes
+    /// `WorkspaceOpened`; the first one becomes current. Advances `next_id`
+    /// past `id` so a later sequential [`WorkspaceManager::open`] never
+    /// collides with an id created out of band (switch auto-create).
+    fn open_with_id(&mut self, id: WorkspaceId) -> WorkspaceId {
+        if let Some(&existing) = self.workspaces.keys().find(|&&k| k == id) {
+            return existing;
+        }
         let ws = Workspace {
             id,
             name: id.to_string(),
@@ -93,6 +102,9 @@ impl WorkspaceManager {
         self.bump_mru(id);
         if self.current == 0 {
             self.current = id; // first workspace becomes current
+        }
+        if id >= self.next_id {
+            self.next_id = id + 1;
         }
         self.bus.publish(Event::WorkspaceOpened(id));
         id
@@ -117,15 +129,18 @@ impl WorkspaceManager {
     }
 
     /// Switches the current workspace to `id`, publishing `WorkspaceChanged`.
-    /// Returns false (no-op) when `id` is unknown or already current.
+    /// Returns false (no-op) only when `id` is already current; an unknown
+    /// `id` is auto-created empty first (dynamic workspaces, README "auto-create
+    /// on demand"), so switching to any workspace tag always works.
     ///
     /// Full switch semantics (REQ-ws-004): the old workspace's windows are no
     /// longer visible, the new one's become visible, and the new workspace's
     /// MRU window regains focus — repairing any stale focus left by a detach.
     pub fn switch(&mut self, id: WorkspaceId) -> bool {
-        if !self.workspaces.contains_key(&id) || id == self.current {
+        if id == self.current {
             return false;
         }
+        self.open_with_id(id);
         self.current = id;
         self.bump_mru(id);
         // focus new.mru[0]: windows are in focus-history order, so the MRU
@@ -287,6 +302,28 @@ mod tests {
         assert_eq!(ws.windows, vec![1]);
         assert_eq!(ws.focus, Some(1));
         assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(1)));
+    }
+
+    #[test]
+    fn switch_auto_creates_unknown_workspace() {
+        // Dynamic workspaces: switching to a tag that does not exist yet
+        // creates it empty (publishing WorkspaceOpened), switches to it, and
+        // advances the sequential id so a later open() never collides.
+        let (_, rx, mut wm) = setup();
+        let a = wm.open(); // 1, current
+        assert!(wm.switch(5)); // unknown -> auto-created, switched
+        assert_eq!(wm.current_id(), 5);
+        assert_eq!(wm.len(), 2); // 1 and 5, no 2..4
+        assert!(wm.workspace(5).expect("5 exists").windows.is_empty());
+        let c = wm.open(); // sequential id must skip past 5
+        assert_eq!(c, 6);
+        assert!(wm.switch(a)); // back to the original workspace
+        assert_eq!(wm.current_id(), a);
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(1)));
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(5)));
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceChanged(5)));
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceOpened(6)));
+        assert_eq!(rx.recv(), Ok(Event::WorkspaceChanged(1)));
     }
 
     #[test]
