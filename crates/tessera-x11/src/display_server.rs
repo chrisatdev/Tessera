@@ -594,6 +594,19 @@ impl DisplayServer for X11Display {
     fn spawn_with_args(&self, argv: &[String]) -> Result<(), DErr> {
         tessera_core::spawn_program_args(argv)
     }
+
+    fn map_unmanaged(&mut self, w: WindowId) -> Result<(), DErr> {
+        // Design D3/D6: `window_kind` keeps the trait default (`Normal`)
+        // until Unit 2 wires the real `_NET_WM_WINDOW_TYPE` read (D5), so
+        // this path is unreachable live in this PR — but `map_unmanaged` has
+        // no default (a no-op default would leave the window invisible), so
+        // `tessera-x11` would not compile without it.
+        let conn = self
+            .conn
+            .as_deref()
+            .ok_or_else(|| DErr::X("connect() must succeed before map_unmanaged()".to_string()))?;
+        frames::map_unframed(conn, w)
+    }
 }
 
 #[cfg(test)]

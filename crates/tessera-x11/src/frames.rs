@@ -15,8 +15,8 @@ use tessera_core::{Color, DErr, FrameId, Rect, WindowId};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     ChangeWindowAttributesAux, ConfigureWindowAux, CreateWindowAux, EventMask, InputFocus,
-    Visualid, Window, WindowClass, change_window_attributes, configure_window, create_window,
-    destroy_window, map_window, reparent_window, set_input_focus, unmap_window,
+    StackMode, Visualid, Window, WindowClass, change_window_attributes, configure_window,
+    create_window, destroy_window, map_window, reparent_window, set_input_focus, unmap_window,
 };
 use x11rb::rust_connection::RustConnection;
 
@@ -90,6 +90,10 @@ pub(crate) trait FrameOps {
     fn focus_pointer_root(&self) -> Result<(), DErr>;
     /// Destroys `window`.
     fn destroy(&self, window: Window) -> Result<(), DErr>;
+    /// Raises `window` to the top of the stacking order (D3/D6): EWMH puts
+    /// NOTIFICATION in the top layer, and an occluded notification would
+    /// hide the very feature this seam exists for.
+    fn raise(&self, window: Window) -> Result<(), DErr>;
 }
 
 impl FrameOps for RustConnection {
@@ -180,6 +184,11 @@ impl FrameOps for RustConnection {
     }
     fn destroy(&self, window: Window) -> Result<(), DErr> {
         let cookie = destroy_window(self, window).map_err(map_conn_error)?;
+        cookie.check().map_err(map_reply_error)
+    }
+    fn raise(&self, window: Window) -> Result<(), DErr> {
+        let aux = ConfigureWindowAux::default().stack_mode(StackMode::ABOVE);
+        let cookie = configure_window(self, window, &aux).map_err(map_conn_error)?;
         cookie.check().map_err(map_reply_error)
     }
 }
@@ -273,6 +282,16 @@ pub(crate) fn map_frame(ops: &impl FrameOps, frame: Window, client: WindowId) ->
 /// Unmaps the frame (and with it the client) — one call, SC-ws-06.
 pub(crate) fn unmap_frame(ops: &impl FrameOps, frame: Window) -> Result<(), DErr> {
     ops.unmap_window(frame)
+}
+
+/// The negative of [`create_frame`] + [`map_frame`] (design D6): makes an
+/// UNFRAMED client visible on top. No frame is created, none is looked up —
+/// only a raise and a map, ever (spec "No Geometry Requests for an Ignored
+/// Window"). Raise before map so the window appears already on top instead
+/// of flashing behind the tiled layout for one frame.
+pub(crate) fn map_unframed(ops: &impl FrameOps, client: WindowId) -> Result<(), DErr> {
+    ops.raise(client)?;
+    ops.map_window(client)
 }
 
 /// Places `frame` at the layout placement `r` and `client` at the frame
@@ -413,6 +432,7 @@ mod tests {
         Focus(Window),
         FocusPointerRoot,
         Destroy(Window),
+        Raise(Window),
     }
 
     /// Scripted `FrameOps`: records every call and hands out sequential window
@@ -546,6 +566,10 @@ mod tests {
         }
         fn destroy(&self, window: Window) -> Result<(), DErr> {
             self.calls.borrow_mut().push(FrameCall::Destroy(window));
+            Ok(())
+        }
+        fn raise(&self, window: Window) -> Result<(), DErr> {
+            self.calls.borrow_mut().push(FrameCall::Raise(window));
             Ok(())
         }
     }
@@ -921,6 +945,20 @@ mod tests {
                     border_pixel: ACTIVE_PIXEL,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn map_unframed_raises_then_maps_the_client_only() {
+        // D6/D3: a raw (unframed) map is raise-then-map and NOTHING else — no
+        // frame lookup, no reparent, no border, no focus. Raising first means
+        // the window appears already on top, avoiding a one-frame occlusion
+        // flicker (spec "Ignored Windows Are Raised Above Tiled Frames").
+        let fake = FakeFrameOps::new();
+        map_unframed(&fake, CLIENT).unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![FrameCall::Raise(CLIENT), FrameCall::Map(CLIENT)]
         );
     }
 
