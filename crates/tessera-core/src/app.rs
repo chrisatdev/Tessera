@@ -1124,4 +1124,60 @@ mod tests {
         // skip the retry on the next pass permanently.
         assert!(!app.mapped.contains(&1));
     }
+
+    #[test]
+    fn recompute_log_and_continue_survives_the_second_and_third_sequential_close() {
+        // core-recompute-resilience scenario "second and third close in a
+        // row keep working": D4's log-and-continue must not be a one-shot
+        // fix that only covers the FIRST failing pass. The original bug's
+        // `?` early-return aborted on the very first failure, so a test
+        // that closes once cannot tell "fixed" from "still broken from the
+        // second close onward". Window 1 stays managed and visible for the
+        // whole test and its configure is scripted to fail on EVERY
+        // invocation (not just once), so the assertions below prove the
+        // failure is logged-and-continued identically on the first,
+        // second, AND third sequential close.
+        let (mut app, log) =
+            app_with_failures(Vec::new(), Config::default(), vec![FailAt::Configure(1)]);
+        let fires = Arc::new(Mutex::new(0));
+        let hook = Arc::clone(&fires);
+        app.set_on_recompute(Box::new(move || *hook.lock().unwrap() += 1));
+
+        for w in [1, 2, 3, 4] {
+            app.handle(Event::WindowMapRequested(w)).unwrap();
+        }
+
+        // Close windows 4, 3, and 2 one after another; window 1 is never
+        // closed, so it remains visible (and its configure keeps failing)
+        // through all three passes.
+        for (which, closed) in [("first", 4u32), ("second", 3), ("third", 2)] {
+            log.lock().unwrap().clear();
+            *fires.lock().unwrap() = 0;
+
+            app.handle(Event::WindowDestroyNotify(closed)).unwrap();
+
+            let calls_now = calls(&log);
+            assert!(
+                calls_now
+                    .iter()
+                    .any(|c| matches!(c, DisplayCall::Configure(1, _))),
+                "{which} close: window 1's configure was attempted despite its \
+                 persistent scripted failure"
+            );
+            assert!(
+                calls_now.iter().any(|c| matches!(c, DisplayCall::Focus(_))),
+                "{which} close: focus was still attempted after the configure \
+                 failure instead of the pass aborting early"
+            );
+            assert_eq!(
+                *fires.lock().unwrap(),
+                1,
+                "{which} close: the bar hook still fires exactly once despite \
+                 the persistent configure failure"
+            );
+        }
+
+        // Window 1 itself was never closed; it stays managed the whole time.
+        assert!(app.frames.contains_key(&1));
+    }
 }

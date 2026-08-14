@@ -929,6 +929,49 @@ mod tests {
     }
 
     #[test]
+    fn repeated_closes_each_forget_their_client_independently() {
+        // REQ-x11-frame-lifecycle scenario "repeated closes each clean up
+        // independently": `forget_frame` (D1) is a pure per-call linear
+        // scan with no persisted state, so a SECOND and THIRD sequential
+        // close must behave exactly like the first one — this is the
+        // literal chained-calls proof the two single-call tests above
+        // cannot give: the original bug was permanent from the FIRST close
+        // onward, so a test that only closes once cannot distinguish
+        // "fixed" from "delayed".
+        let mut d = X11Display::new(None);
+        d.frames.insert(10, FrameId(1));
+        d.frames.insert(20, FrameId(2));
+        d.frames.insert(30, FrameId(3));
+        d.focused = Some(20);
+
+        // First close: an unfocused client's frame.
+        assert_eq!(d.forget_frame(FrameId(1)), Some(10));
+        assert!(!d.frames.contains_key(&10));
+        assert_eq!(d.frames.get(&20), Some(&FrameId(2)));
+        assert_eq!(d.frames.get(&30), Some(&FrameId(3)));
+        assert_eq!(
+            d.focused,
+            Some(20),
+            "closing an unfocused frame must not disturb focus"
+        );
+
+        // Second close: the currently-focused client's frame.
+        assert_eq!(d.forget_frame(FrameId(2)), Some(20));
+        assert!(!d.frames.contains_key(&20));
+        assert_eq!(d.frames.get(&30), Some(&FrameId(3)));
+        assert_eq!(d.focused, None, "closing the focused frame clears focus");
+
+        // Third close: the last remaining client's frame.
+        assert_eq!(d.forget_frame(FrameId(3)), Some(30));
+        assert!(d.frames.is_empty());
+        assert_eq!(d.focused, None);
+
+        // A fourth call naming an already-forgotten frame must not resurrect
+        // a stale match: nothing in `forget_frame` remembers past calls.
+        assert_eq!(d.forget_frame(FrameId(1)), None);
+    }
+
+    #[test]
     fn pick_bar_output_returns_none_with_no_connected_output() {
         // D10: nothing usable -> None, and the caller falls back to the root
         // geometry (never refuses to start).
