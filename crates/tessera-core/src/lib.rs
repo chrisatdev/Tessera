@@ -14,6 +14,7 @@ pub mod layout;
 pub mod theme;
 pub mod watch;
 pub mod window;
+pub mod window_kind;
 pub mod workspace;
 
 pub use app::{App, command_for_key};
@@ -26,4 +27,5 @@ pub use geometry::{LayoutKind, Placement, Rect, WindowId, WorkspaceId};
 pub use layout::{Layout, MasterStack};
 pub use theme::{Color, Theme};
 pub use window::{CommandEffect, WindowManager, WindowState};
+pub use window_kind::{ManagePolicy, WindowKind};
 pub use workspace::{Workspace, WorkspaceManager};
