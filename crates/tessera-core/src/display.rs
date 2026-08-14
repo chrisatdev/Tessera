@@ -91,10 +91,20 @@ pub fn spawn_program(prog: &str) -> Result<(), DErr> {
 /// The first entry is resolved through `PATH` by [`std::process::Command`] —
 /// no shell, no string interpretation, no argument injection — and every
 /// entry is passed through unchanged: an argument containing spaces or shell
-/// metacharacters stays ONE argument (never split, never interpreted). The
-/// stdio is detached (`null`): a spawned GUI program must never inherit the
-/// WM's (or a test harness's) pipes. The child is not waited on. An empty
-/// argv (nothing to exec) and a bogus program are both returned as
+/// metacharacters stays ONE argument (never split, never interpreted).
+///
+/// The DATA channels are detached (`null`) — a spawned GUI program must never
+/// read the WM's stdin or write into its stdout — but `stderr` is INHERITED
+/// on purpose: it is the child's only way to say why it refused to run, and
+/// the display manager already captures the WM's stderr for the session
+/// (`~/.xsession-errors`). Nulling it turned every failing terminal into a
+/// window that "closed instantly" with no explanation anywhere, which is the
+/// exact class of bug that costs hours. A child that dies now leaves its
+/// reason in the session log.
+///
+/// The child is not waited on (so a long session accumulates zombie entries
+/// until the WM exits — reaping is a separate concern). An empty argv
+/// (nothing to exec) and a bogus program are both returned as
 /// [`DErr::Spawn`] so the caller logs them and the loop keeps running.
 pub fn spawn_program_args(argv: &[String]) -> Result<(), DErr> {
     let Some(prog) = argv.first() else {
@@ -104,7 +114,7 @@ pub fn spawn_program_args(argv: &[String]) -> Result<(), DErr> {
         .args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .map(|_| ())
         .map_err(|err| DErr::Spawn(err.to_string()))
