@@ -1372,6 +1372,72 @@ mod tests {
     }
 
     #[test]
+    fn dialog_window_map_request_is_framed_tiled_and_focused() {
+        // Spec "A DIALOG window is still tiled" / design's "Tiled Policy Is
+        // Unchanged": verify-report obs #97 (WARNING) found this scenario
+        // proven only compositionally — via the generic policy-table test
+        // (`ignore_group_is_map_only_and_tiled_group_is_tile`, which proves
+        // Dialog -> Tile as DATA) plus a Normal-kind Tile-path test (which
+        // proves the Tile branch's *behavior* but only ever instantiated
+        // with `WindowKind::Normal`). Neither drives `on_map_request` with
+        // `WindowKind::Dialog` itself. This test closes that gap directly,
+        // with the same exact-sequence shape as
+        // `map_request_manages_maps_and_places_focus`: a DIALOG-classified
+        // window is framed, tiled, and focused exactly like NORMAL — pinning
+        // today's deliberate interim decision (no floating layout yet) so a
+        // future floating-layout change has a concrete scenario to
+        // supersede instead of an inferred one.
+        let (mut app, log) = app_with_kinds(
+            vec![Event::WindowMapRequested(1)],
+            Config::default(),
+            vec![(1, WindowKind::Dialog)],
+        );
+        app.run();
+        assert_eq!(
+            calls(&log),
+            vec![
+                DisplayCall::Manage(1),
+                DisplayCall::Map(1),
+                DisplayCall::Configure(1, SOLO),
+                DisplayCall::Focus(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_distinct_ignored_windows_never_produce_a_configure_call() {
+        // Headless companion to the E2E
+        // `distinct_notifications_keep_their_own_distinct_sizes` (spec
+        // "Different notifications keep their own distinct sizes" / "No
+        // Geometry Requests for an Ignored Window", verify-report obs #97
+        // finding CRITICAL): every pre-existing test here mapped exactly ONE
+        // MapOnly window, which cannot distinguish "the WM never configures
+        // an ignored window" from "the WM configures it but both happen to
+        // match". Two MapOnly windows in one run prove there is no shared
+        // sizing/configure path: the display-call log contains zero
+        // `Configure` calls for EITHER of them (the real on-screen geometry
+        // claim itself is proven at the E2E layer, which can observe actual
+        // pixel sizes; this test proves the WM issues no geometry request at
+        // all, for any ignored window, not just the first).
+        let (mut app, log) = app_with_kinds(
+            vec![Event::WindowMapRequested(1), Event::WindowMapRequested(2)],
+            Config::default(),
+            vec![(1, WindowKind::Notification), (2, WindowKind::Notification)],
+        );
+        app.run();
+        assert_eq!(
+            calls(&log),
+            vec![DisplayCall::MapUnmanaged(1), DisplayCall::MapUnmanaged(2)]
+        );
+        assert!(
+            !calls(&log)
+                .iter()
+                .any(|c| matches!(c, DisplayCall::Configure(..))),
+            "no ignore-but-map window may ever receive a Configure call"
+        );
+    }
+
+    #[test]
     fn iconified_remap_is_not_reclassified() {
         // Spec "A later type change is ignored" / design D7's `!pending`
         // gate: a window already managed and merely iconified (not a fresh

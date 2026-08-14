@@ -1901,3 +1901,85 @@ fn notification_window_is_mapped_but_never_framed_tiled_or_focused() {
         "the WM must survive the notification's destruction"
     );
 }
+
+#[test]
+#[ignore]
+fn distinct_notifications_keep_their_own_distinct_sizes() {
+    // Spec "Different notifications keep their own distinct sizes" — the one
+    // scenario the verify pass (verify-report obs #97, finding CRITICAL)
+    // found with zero covering test: every other test in this suite and in
+    // `tessera-core::app` maps exactly ONE ignore-but-map window, which
+    // cannot distinguish "the WM leaves geometry alone" from "the WM happens
+    // to normalize every notification to the same computed size" (obs #81's
+    // original bug: a 632x770 master-stack half applied to EVERY mapped
+    // window regardless of kind). Two NOTIFICATION clients with deliberately
+    // different self-chosen sizes prove there is no shared/global sizing
+    // path: each keeps exactly what it requested, and the two differ from
+    // each other.
+    let display = display_name();
+    let (_wm, conn, root) = spawn_wm(&display, None);
+    let screen = &conn.setup().roots[0];
+
+    const FIRST_WIDTH: u16 = 300;
+    const FIRST_HEIGHT: u16 = 80;
+    const SECOND_WIDTH: u16 = 420;
+    const SECOND_HEIGHT: u16 = 140;
+    assert_ne!(
+        (FIRST_WIDTH, FIRST_HEIGHT),
+        (SECOND_WIDTH, SECOND_HEIGHT),
+        "the two fixtures must request genuinely different sizes"
+    );
+
+    let first = map_client_with_window_type(
+        &conn,
+        root,
+        screen.root_depth,
+        screen.root_visual,
+        "_NET_WM_WINDOW_TYPE_NOTIFICATION",
+        FIRST_WIDTH,
+        FIRST_HEIGHT,
+    );
+    wait_until("the first notification to become viewable", || {
+        map_state(&conn, first) == MapState::VIEWABLE
+    });
+
+    let second = map_client_with_window_type(
+        &conn,
+        root,
+        screen.root_depth,
+        screen.root_visual,
+        "_NET_WM_WINDOW_TYPE_NOTIFICATION",
+        SECOND_WIDTH,
+        SECOND_HEIGHT,
+    );
+    wait_until("the second notification to become viewable", || {
+        map_state(&conn, second) == MapState::VIEWABLE
+    });
+
+    let first_geom = geom(&conn, first);
+    let second_geom = geom(&conn, second);
+
+    // Each keeps exactly its own requested size...
+    assert_eq!(
+        (first_geom.width, first_geom.height),
+        (FIRST_WIDTH, FIRST_HEIGHT),
+        "the first notification's size must equal what it requested"
+    );
+    assert_eq!(
+        (second_geom.width, second_geom.height),
+        (SECOND_WIDTH, SECOND_HEIGHT),
+        "the second notification's size must equal what it requested"
+    );
+    // ...and neither is silently normalized, clamped, or equalized to the
+    // other's (or to any shared/computed) size.
+    assert_ne!(
+        (first_geom.width, first_geom.height),
+        (second_geom.width, second_geom.height),
+        "distinct notifications must not be coerced to a common size"
+    );
+
+    // Neither was reparented into a frame — both took the ignore-but-map
+    // path, not the tiled one.
+    assert_eq!(parent_of(&conn, first), root);
+    assert_eq!(parent_of(&conn, second), root);
+}
