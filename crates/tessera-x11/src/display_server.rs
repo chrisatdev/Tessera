@@ -18,7 +18,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Once};
 
-use tessera_core::{Config, DErr, DisplayServer, Event, FrameId, Rect, Theme, WindowId};
+use tessera_core::{
+    Config, DErr, DisplayServer, Event, FrameId, Rect, Theme, WindowId, WindowKind,
+};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::{ConnectError, ConnectionError, ReplyError};
 use x11rb::protocol::randr::{Connection as RandRConnection, ConnectionExt as _};
@@ -29,7 +31,7 @@ use x11rb::rust_connection::RustConnection;
 
 use crate::event_loop::{next_x11_event, root_event_mask};
 use crate::keyboard::KeyboardOps;
-use crate::{ewmh, frames, keyboard};
+use crate::{ewmh, frames, keyboard, window_type};
 
 /// The x11rb display layer: one X connection plus the root window of the
 /// screen it was opened on.
@@ -596,16 +598,26 @@ impl DisplayServer for X11Display {
     }
 
     fn map_unmanaged(&mut self, w: WindowId) -> Result<(), DErr> {
-        // Design D3/D6: `window_kind` keeps the trait default (`Normal`)
-        // until Unit 2 wires the real `_NET_WM_WINDOW_TYPE` read (D5), so
-        // this path is unreachable live in this PR — but `map_unmanaged` has
-        // no default (a no-op default would leave the window invisible), so
-        // `tessera-x11` would not compile without it.
+        // Design D3/D6: raise-then-map, no reparent, no geometry, no focus.
         let conn = self
             .conn
             .as_deref()
             .ok_or_else(|| DErr::X("connect() must succeed before map_unmanaged()".to_string()))?;
         frames::map_unframed(conn, w)
+    }
+
+    fn window_kind(&mut self, w: WindowId) -> Result<WindowKind, DErr> {
+        // Design D5/D6: reads `_NET_WM_WINDOW_TYPE` and resolves it to a
+        // `WindowKind` before `App::on_map_request` decides whether to
+        // manage `w` at all. This is the exact point obs #81 closes: until
+        // this override existed, every real window classified as the
+        // trait's `Normal` default (D2) and the `MapOnly` branch was
+        // unreachable live.
+        let conn = self
+            .conn
+            .as_deref()
+            .ok_or_else(|| DErr::X("connect() must succeed before window_kind()".to_string()))?;
+        window_type::window_kind(conn, w)
     }
 }
 
