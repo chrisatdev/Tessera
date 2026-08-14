@@ -27,6 +27,7 @@ use crate::geometry::{Rect, WindowId, WorkspaceId};
 use crate::layout::{Layout, MasterStack};
 use crate::theme::Theme;
 use crate::window::{CommandEffect, WindowManager, WindowState};
+use crate::window_kind::ManagePolicy;
 
 /// The core window manager: one [`DisplayServer`] plus the pure state
 /// machines, driven by [`App::run`].
@@ -150,11 +151,26 @@ impl App {
         }
     }
 
-    /// Fresh MapRequest: attach the window, create and map its frame, confirm
-    /// it managed, then re-tile. An iconified (`UnmanagePending`) MapRequest
-    /// only returns the window to `Managed` — its frame was never unmapped.
+    /// Fresh MapRequest: classify the window (design D7), and for an
+    /// ignore-but-map kind, map it raw and return BEFORE the function's only
+    /// workspace mutation — so it never attaches, is never framed, never
+    /// enters `mapped`, and `recompute` never runs for it (spec "Ignore-But-
+    /// Map Policy", "No Geometry Requests for an Ignored Window", "Focus
+    /// Survives an Ignored Window's Whole Life", "No Workspace Opens for an
+    /// Ignored Window" — all four fall out of this one early return, not
+    /// separate skip logic).
+    ///
+    /// Otherwise: attach the window, create and map its frame, confirm it
+    /// managed, then re-tile — byte-identical to before this change. An
+    /// iconified (`UnmanagePending`) MapRequest is never (re)classified (spec
+    /// "A later type change is ignored"): `!pending` gates the classification
+    /// check, so it only returns the window to `Managed` — its frame was
+    /// never unmapped.
     fn on_map_request(&mut self, w: WindowId) -> Result<(), DErr> {
         let pending = self.wm.state_of(w) == Some(WindowState::UnmanagePending);
+        if !pending && self.policy_for(w) == ManagePolicy::MapOnly {
+            return self.display.map_unmanaged(w);
+        }
         self.wm.map_request(w);
         if !pending {
             let frame = self.display.manage(w)?;
@@ -164,6 +180,21 @@ impl App {
             self.wm.managed(w);
         }
         self.recompute()
+    }
+
+    /// Fail-safe policy lookup (design D8): a classification failure logs
+    /// through the loop's existing `tessera: <err>` pattern (see
+    /// [`App::run`]) and resolves to [`ManagePolicy::Tile`] — the direction
+    /// that keeps a misclassified window visible, framed, and closable
+    /// instead of silently dropping it.
+    fn policy_for(&mut self, w: WindowId) -> ManagePolicy {
+        match self.display.window_kind(w) {
+            Ok(kind) => kind.policy(),
+            Err(err) => {
+                eprintln!("tessera: {err}");
+                ManagePolicy::Tile
+            }
+        }
     }
 
     /// Applies a user [`Command`]: core state changes are re-applied to the
@@ -318,6 +349,7 @@ mod tests {
     use crate::display::test_double::{DisplayCall, FailAt, MockDisplay};
     use crate::geometry::{LayoutKind, Placement, Rect};
     use crate::theme::Theme;
+    use crate::window_kind::WindowKind;
 
     use super::*;
 
@@ -402,6 +434,30 @@ mod tests {
         let (mut mock, log) = MockDisplay::new(script);
         for at in failures {
             mock.fail_at(at);
+        }
+        (
+            App::new(
+                Box::new(mock),
+                Arc::new(config),
+                Arc::new(Theme::default()),
+                AREA,
+            ),
+            log,
+        )
+    }
+
+    /// Sibling of [`app_with`] that scripts `kinds` on the underlying
+    /// [`MockDisplay`] before the app ever sees it (D9 window-type-awareness
+    /// tests). Kept separate so `app_with`'s signature — and every test
+    /// already calling it — stays untouched, matching [`app_with_failures`].
+    fn app_with_kinds(
+        script: Vec<Event>,
+        config: Config,
+        kinds: Vec<(WindowId, WindowKind)>,
+    ) -> (App, Arc<Mutex<Vec<DisplayCall>>>) {
+        let (mut mock, log) = MockDisplay::new(script);
+        for (w, kind) in kinds {
+            mock.set_kind(w, kind);
         }
         (
             App::new(
@@ -1179,5 +1235,172 @@ mod tests {
 
         // Window 1 itself was never closed; it stays managed the whole time.
         assert!(app.frames.contains_key(&1));
+    }
+
+    // === Window-type awareness — PR1 / WU1 (tessera-window-type-awareness) ===
+    //
+    // NOTE (framing, tasks Work Unit 1): `MockDisplay::window_kind` defaults
+    // to `WindowKind::Normal` (D2), and these tests script the classification
+    // headless through `set_kind`/`app_with_kinds`. `X11Display` has no
+    // override yet (Unit 2), so in production every real window still
+    // classifies `Normal` and this branch is UNREACHABLE live — proven here,
+    // not yet wired to a real X server.
+
+    #[test]
+    fn notification_map_request_maps_raw_and_never_enters_workspace_state() {
+        // Spec "Notification is visible but untracked" / "No Geometry
+        // Requests for an Ignored Window": D7's early return at statement 3
+        // fires BEFORE the function's only workspace mutation, so the
+        // ignored window's MapRequest issues exactly one raw-map call
+        // (`MapUnmanaged`) and nothing else — no `Configure`, and the
+        // workspace's window list never gains it.
+        let (mut app, log) = app_with_kinds(
+            vec![Event::WindowMapRequested(1), Event::WindowMapRequested(2)],
+            Config::default(),
+            vec![(2, WindowKind::Notification)],
+        );
+        app.run();
+        assert_eq!(
+            calls(&log),
+            vec![
+                DisplayCall::Manage(1),
+                DisplayCall::Map(1),
+                DisplayCall::Configure(1, SOLO),
+                DisplayCall::Focus(1),
+                DisplayCall::MapUnmanaged(2),
+            ]
+        );
+        assert_eq!(app.wm().workspace(1).unwrap().windows, vec![1]);
+    }
+
+    #[test]
+    fn normal_window_map_request_still_issues_configure_call() {
+        // Spec "A NORMAL window is still configured to its layout
+        // placement": the regression guard for D7 — "no Configure" must
+        // stay scoped to the ignore-but-map path and never leak into the
+        // tiled path. First direct `on_map_request` coverage (exploration
+        // #86 found none existed before this change).
+        let (mut app, log) = app_with_kinds(
+            vec![Event::WindowMapRequested(1), Event::WindowMapRequested(2)],
+            Config::default(),
+            vec![(1, WindowKind::Normal), (2, WindowKind::Normal)],
+        );
+        app.run();
+        let calls = calls(&log);
+        assert!(calls.contains(&DisplayCall::Configure(2, MASTER)));
+        assert!(calls.contains(&DisplayCall::Configure(1, STACK)));
+    }
+
+    #[test]
+    fn notification_map_request_does_not_steal_focus() {
+        // Spec "Focus Survives an Ignored Window's Whole Life": because the
+        // `MapOnly` path returns before `recompute` ever runs, no `Focus`
+        // call is issued for the ignored window, and the previously focused
+        // NORMAL window stays focused.
+        let (mut app, log) = app_with_kinds(
+            vec![Event::WindowMapRequested(1), Event::WindowMapRequested(2)],
+            Config::default(),
+            vec![(2, WindowKind::Notification)],
+        );
+        app.run();
+        assert!(!calls(&log).contains(&DisplayCall::Focus(2)));
+        assert_eq!(app.wm().focused_window(), Some(1));
+    }
+
+    #[test]
+    fn notification_as_first_window_opens_no_workspace() {
+        // Spec "First-ever window is a notification": mapping an
+        // ignore-but-map window as the very first window must not create a
+        // workspace as a side effect — `recompute` (the only path that would
+        // touch workspace state indirectly) never runs for it.
+        let (mut app, log) = app_with_kinds(
+            vec![Event::WindowMapRequested(1)],
+            Config::default(),
+            vec![(1, WindowKind::Notification)],
+        );
+        app.run();
+        assert_eq!(calls(&log), vec![DisplayCall::MapUnmanaged(1)]);
+        assert_eq!(app.wm().current_id(), 0); // sentinel: no workspace opened
+    }
+
+    #[test]
+    fn unreadable_window_type_falls_back_to_tiling() {
+        // Spec "Unreadable type property defaults to tiled" / design D8: a
+        // classification failure must not drop the window — it is logged in
+        // place and resolves to `Tile`, so the window is framed, tiled, and
+        // focused exactly like a NORMAL window.
+        let (mut app, log) = app_with_failures(
+            vec![Event::WindowMapRequested(1)],
+            Config::default(),
+            vec![FailAt::WindowKind(1)],
+        );
+        app.run();
+        assert_eq!(
+            calls(&log),
+            vec![
+                DisplayCall::Manage(1),
+                DisplayCall::Map(1),
+                DisplayCall::Configure(1, SOLO),
+                DisplayCall::Focus(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn map_unmanaged_failure_is_reported_and_mutates_nothing() {
+        // Design D8: `map_unmanaged`'s `Err` is the terminal statement of
+        // the ignore-but-map path — propagated as `Err` from
+        // `on_map_request`, with zero residue (no workspace opened, no
+        // frame, no `mapped` entry) since nothing before it mutated state.
+        let (mut mock, log) = MockDisplay::new(Vec::new());
+        mock.set_kind(1, WindowKind::Notification);
+        mock.fail_at(FailAt::MapUnmanaged(1));
+        let mut app = App::new(
+            Box::new(mock),
+            Arc::new(Config::default()),
+            Arc::new(Theme::default()),
+            AREA,
+        );
+
+        let result = app.handle(Event::WindowMapRequested(1));
+
+        assert!(matches!(result, Err(DErr::X(_))));
+        assert_eq!(calls(&log), vec![DisplayCall::MapUnmanaged(1)]);
+        assert_eq!(app.wm().current_id(), 0);
+        assert!(app.frames.is_empty());
+        assert!(app.mapped.is_empty());
+    }
+
+    #[test]
+    fn iconified_remap_is_not_reclassified() {
+        // Spec "A later type change is ignored" / design D7's `!pending`
+        // gate: a window already managed and merely iconified (not a fresh
+        // MapRequest) must never be reclassified on remap, even if its
+        // scripted kind would now resolve to `MapOnly`. The window is put
+        // directly into the `Managed` + framed + mapped state a real
+        // MapRequest would have produced (bypassing `on_map_request` itself,
+        // matching `recompute_retries_the_map_next_pass_when_map_fails`
+        // above), so the only event under test is the iconify + remap pair.
+        let (mut app, log) = app_with_kinds(
+            vec![Event::WindowUnmapNotify(1), Event::WindowMapRequested(1)],
+            Config::default(),
+            vec![(1, WindowKind::Notification)],
+        );
+        app.wm().map_request(1);
+        app.wm().managed(1);
+        app.frames.insert(1, FrameId(1));
+        app.mapped.push(1);
+
+        app.run();
+
+        let calls = calls(&log);
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, DisplayCall::MapUnmanaged(_))),
+            "a pending (iconified) remap must never be reclassified"
+        );
+        assert!(calls.contains(&DisplayCall::Configure(1, SOLO)));
+        assert_eq!(app.wm().state_of(1), Some(WindowState::Managed));
     }
 }
