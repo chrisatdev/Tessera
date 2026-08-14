@@ -12,6 +12,7 @@ pub mod ewmh;
 pub mod frames;
 pub mod keyboard;
 pub mod translate;
+pub mod window_type;
 
 pub use bar_renderer::{BarPosition, BarRenderer};
 pub use display_server::X11Display;
