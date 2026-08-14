@@ -11,6 +11,7 @@ use std::process::Stdio;
 
 use crate::event::Event;
 use crate::geometry::{Rect, WindowId};
+use crate::window_kind::WindowKind;
 
 /// Identifier of a reparenting frame window created by
 /// [`DisplayServer::manage`] (REQ-x11-005).
@@ -76,6 +77,23 @@ pub trait DisplayServer {
     /// A failure is returned as [`DErr::Spawn`] so the caller logs it and the
     /// loop keeps running (ALA-1, D3).
     fn spawn_with_args(&self, argv: &[String]) -> Result<(), DErr>;
+    /// The EWMH type of window `w` (`_NET_WM_WINDOW_TYPE`), read by the
+    /// display layer before the core decides whether to manage it (design
+    /// D2). The default returns [`WindowKind::Normal`] — EWMH's own mandated
+    /// fallback and the fail-safe direction: an implementor that cannot
+    /// classify keeps today's exact behavior (frame + tile + focus) instead
+    /// of making a real application invisible. Mirrors the `spawn` default
+    /// above.
+    fn window_kind(&mut self, _w: WindowId) -> Result<WindowKind, DErr> {
+        Ok(WindowKind::Normal)
+    }
+    /// Maps client `w` DIRECTLY, without a frame: no reparent, no border, no
+    /// geometry, no focus, no bookkeeping (design D3). The window is raised
+    /// to the top of the stacking order first (spec "Ignored Windows Are
+    /// Raised Above Tiled Frames"). NO default: a no-op default would leave
+    /// the window unmapped — invisible, unclosable — which is fail-UNSAFE;
+    /// every implementor must be explicit.
+    fn map_unmanaged(&mut self, w: WindowId) -> Result<(), DErr>;
 }
 
 /// Spawns `prog` as a child process (T13, process boundary).
@@ -129,20 +147,27 @@ pub(crate) mod test_double {
     use super::{DErr, DisplayServer, FrameId, spawn_program_args};
     use crate::event::Event;
     use crate::geometry::{Rect, WindowId};
+    use crate::window_kind::WindowKind;
 
-    /// A single display call to script as failing (design D5). Each variant
-    /// names the call and the window it targets; `Configure` matches on the
-    /// window alone (the [`Rect`] argument does not vary the outcome).
+    /// A single display call to script as failing (design D5, extended D9).
+    /// Each variant names the call and the window it targets; `Configure`
+    /// matches on the window alone (the [`Rect`] argument does not vary the
+    /// outcome).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub(crate) enum FailAt {
         Map(WindowId),
         Unmap(WindowId),
         Configure(WindowId),
         Focus(WindowId),
+        WindowKind(WindowId),
+        MapUnmanaged(WindowId),
     }
 
     /// One recorded display call, in order (manage -> map -> configure ->
-    /// focus). Tests assert the loop's behavior on this log.
+    /// focus). Tests assert the loop's behavior on this log. `window_kind`
+    /// is deliberately NOT represented here (D9): it is a query, not a side
+    /// effect, and recording it would break every existing exact-sequence
+    /// assertion in `app.rs`.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) enum DisplayCall {
         Connect,
@@ -155,6 +180,7 @@ pub(crate) mod test_double {
         DestroyFrame(FrameId),
         SetDesktops(u32, u32, Vec<String>),
         Spawn(Vec<String>),
+        MapUnmanaged(WindowId),
     }
 
     /// Yields scripted [`Event`]s through [`DisplayServer::next_event`] and
@@ -166,6 +192,9 @@ pub(crate) mod test_double {
         frames: HashMap<WindowId, FrameId>,
         next_frame: u32,
         failures: HashSet<FailAt>,
+        /// Scripted classification per window (D9); a window with no entry
+        /// defaults to [`WindowKind::Normal`], matching the trait default.
+        kinds: HashMap<WindowId, WindowKind>,
     }
 
     impl MockDisplay {
@@ -181,6 +210,7 @@ pub(crate) mod test_double {
                     frames: HashMap::new(),
                     next_frame: 1,
                     failures: HashSet::new(),
+                    kinds: HashMap::new(),
                 },
                 calls,
             )
@@ -202,6 +232,13 @@ pub(crate) mod test_double {
         /// first — see each method below.
         pub(crate) fn fail_at(&mut self, at: FailAt) {
             self.failures.insert(at);
+        }
+
+        /// Scripts window `w` to classify as `kind` (D9). A window with no
+        /// scripted kind classifies as [`WindowKind::Normal`] — the same
+        /// fail-safe default [`DisplayServer::window_kind`] documents.
+        pub(crate) fn set_kind(&mut self, w: WindowId, kind: WindowKind) {
+            self.kinds.insert(w, kind);
         }
     }
 
@@ -276,6 +313,25 @@ pub(crate) mod test_double {
                 .push(DisplayCall::Spawn(argv.to_vec()));
             spawn_program_args(argv)
         }
+        fn window_kind(&mut self, w: WindowId) -> Result<WindowKind, DErr> {
+            // D9: deliberately NOT recorded as a `DisplayCall` — this is a
+            // query, not a side effect, and recording it would break every
+            // existing exact-sequence assertion in `app.rs`.
+            if self.failures.contains(&FailAt::WindowKind(w)) {
+                return Err(DErr::X(format!("scripted failure: window_kind {w}")));
+            }
+            Ok(self.kinds.get(&w).copied().unwrap_or(WindowKind::Normal))
+        }
+        fn map_unmanaged(&mut self, w: WindowId) -> Result<(), DErr> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(DisplayCall::MapUnmanaged(w));
+            if self.failures.contains(&FailAt::MapUnmanaged(w)) {
+                return Err(DErr::X(format!("scripted failure: map_unmanaged {w}")));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -283,6 +339,27 @@ pub(crate) mod test_double {
 mod tests {
     use super::test_double::{DisplayCall, FailAt, MockDisplay};
     use super::*;
+    use crate::window_kind::WindowKind;
+
+    #[test]
+    fn mock_defaults_to_normal_kind_and_records_map_unmanaged() {
+        // D2/D3/D9: an unscripted window classifies as `Normal` (the
+        // fail-safe default), a scripted one reports its scripted kind, and
+        // `map_unmanaged` is recorded like any other side effect — but
+        // `window_kind` is a QUERY and must NOT appear in the call log
+        // (D9's deliberate exception to record-then-check).
+        let (mut d, log) = MockDisplay::new(Vec::new());
+        d.set_kind(2, WindowKind::Notification);
+
+        assert_eq!(d.window_kind(1).unwrap(), WindowKind::Normal);
+        assert_eq!(d.window_kind(2).unwrap(), WindowKind::Notification);
+        assert!(d.map_unmanaged(2).is_ok());
+
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![DisplayCall::MapUnmanaged(2)]
+        );
+    }
 
     #[test]
     fn mock_display_scripts_a_single_call_failure() {
