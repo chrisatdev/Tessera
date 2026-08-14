@@ -35,11 +35,12 @@ use x11rb::protocol::randr::Connection as RandRConnection;
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xkb::{ConnectionExt as _, Group, ID};
 use x11rb::protocol::xproto::{
-    Atom, ConnectionExt, CreateWindowAux, EventMask, GetGeometryReply, ImageFormat, MapState,
-    ModMask, Window, WindowClass,
+    Atom, AtomEnum, ConnectionExt, CreateWindowAux, EventMask, GetGeometryReply, ImageFormat,
+    MapState, ModMask, PropMode, Window, WindowClass,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
 
 use tessera_core::{BarConfig, Rect};
 use tessera_x11::bar_renderer::tiling_area;
@@ -377,6 +378,57 @@ fn map_client(conn: &RustConnection, root: Window, depth: u8, visual: u32) -> Wi
         WindowClass::INPUT_OUTPUT,
         visual,
         &aux,
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    conn.map_window(win).unwrap().check().unwrap();
+    conn.flush().unwrap();
+    win
+}
+
+/// Creates a client and sets `_NET_WM_WINDOW_TYPE` to `type_name` BEFORE
+/// `map_window` (design D10): the property must exist when the WM processes
+/// the MapRequest, since classification happens once, at map time (spec
+/// "Map-Time Classification, Once"). `width`/`height` are the client's OWN
+/// chosen geometry, standing in for a notification daemon's content-based
+/// sizing — the E2E proves the WM never overrides it (spec "No Geometry
+/// Requests for an Ignored Window").
+fn map_client_with_window_type(
+    conn: &RustConnection,
+    root: Window,
+    depth: u8,
+    visual: u32,
+    type_name: &str,
+    width: u16,
+    height: u16,
+) -> Window {
+    let win = conn.generate_id().unwrap();
+    let aux = CreateWindowAux::default().background_pixel(0x0040_4040);
+    conn.create_window(
+        depth,
+        win,
+        root,
+        0,
+        0,
+        width,
+        height,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        visual,
+        &aux,
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    let net_wm_window_type = intern(conn, b"_NET_WM_WINDOW_TYPE");
+    let type_atom = intern(conn, type_name.as_bytes());
+    conn.change_property32(
+        PropMode::REPLACE,
+        win,
+        net_wm_window_type,
+        AtomEnum::ATOM,
+        &[type_atom],
     )
     .unwrap()
     .check()
@@ -1733,5 +1785,119 @@ fn closing_a_window_keeps_keybindings_alive() {
     wait_until(
         "Super+J to move focus to the other surviving client",
         || conn.get_input_focus().unwrap().reply().unwrap().focus == other_survivor,
+    );
+}
+
+#[test]
+#[ignore]
+fn notification_window_is_mapped_but_never_framed_tiled_or_focused() {
+    // Reproduces obs #81 hermetically (design D10): a synthetic client
+    // declares `_NET_WM_WINDOW_TYPE_NOTIFICATION` before mapping — no
+    // xfce4-notifyd, no dbus. Live, the daemon's notification used to be
+    // framed and tiled to the WM's OWN computed placement (632x770 on a
+    // 1280x800 screen, exactly a master-stack half — matching no daemon's
+    // content-based size) and it stole and kept input focus. This is the
+    // closing proof: the WM must map it raw, never reparent it, never touch
+    // its geometry, and never move focus onto it.
+    let display = display_name();
+    let (mut wm, conn, root) = spawn_wm(&display, None);
+    let screen = &conn.setup().roots[0];
+
+    // A normal client maps first, is framed/tiled, and takes focus — the
+    // pre-existing state a notification must not disturb.
+    let normal = map_client(&conn, root, screen.root_depth, screen.root_visual);
+    wait_until("the normal client to be reparented into a frame", || {
+        parent_of(&conn, normal) != root
+    });
+    let normal_frame = parent_of(&conn, normal);
+    wait_until("the normal client's frame to be viewable", || {
+        map_state(&conn, normal_frame) == MapState::VIEWABLE
+    });
+    wait_until("the normal client to hold input focus", || {
+        conn.get_input_focus().unwrap().reply().unwrap().focus == normal
+    });
+    let normal_geom_before: Geom = {
+        let g = geom(&conn, normal_frame);
+        (g.x, g.y, g.width, g.height)
+    };
+
+    // The notification's own self-chosen geometry (spec "No Geometry
+    // Requests for an Ignored Window" — arbitrary, but distinct from any
+    // layout placement the WM could compute).
+    const NOTIF_WIDTH: u16 = 300;
+    const NOTIF_HEIGHT: u16 = 80;
+    let notif = map_client_with_window_type(
+        &conn,
+        root,
+        screen.root_depth,
+        screen.root_visual,
+        "_NET_WM_WINDOW_TYPE_NOTIFICATION",
+        NOTIF_WIDTH,
+        NOTIF_HEIGHT,
+    );
+
+    // It becomes visible without ever being reparented into a frame.
+    wait_until("the notification to become viewable", || {
+        map_state(&conn, notif) == MapState::VIEWABLE
+    });
+    assert_eq!(
+        parent_of(&conn, notif),
+        root,
+        "a NOTIFICATION window must never be reparented into a frame"
+    );
+
+    // Its geometry is exactly what it requested — the WM issued no Configure
+    // (spec "An ignored window's size is untouched by the WM").
+    let notif_geom = geom(&conn, notif);
+    assert_eq!(
+        (notif_geom.width, notif_geom.height),
+        (NOTIF_WIDTH, NOTIF_HEIGHT),
+        "the WM must not resize an ignore-but-map window"
+    );
+    assert_eq!(
+        (notif_geom.x, notif_geom.y),
+        (0, 0),
+        "the WM must not move an ignore-but-map window"
+    );
+
+    // Focus never left the normal client (spec "Focus Survives an Ignored
+    // Window's Whole Life").
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        conn.get_input_focus().unwrap().reply().unwrap().focus,
+        normal,
+        "a NOTIFICATION window must never steal input focus"
+    );
+
+    // Regression guard: the pre-existing normal client is still framed and
+    // tiled exactly as before — the notification triggered no re-tile, no
+    // recompute, no workspace mutation (spec "No Workspace Opens for an
+    // Ignored Window").
+    assert_eq!(
+        parent_of(&conn, normal),
+        normal_frame,
+        "the normal client must remain framed"
+    );
+    assert_eq!(
+        map_state(&conn, normal_frame),
+        MapState::VIEWABLE,
+        "the normal client's frame must remain viewable"
+    );
+    assert!(
+        frame_is(&conn, normal_frame, normal_geom_before),
+        "the normal client's tiled placement must be unchanged by the notification"
+    );
+    assert!(
+        wm.alive(),
+        "the WM must survive the notification's lifecycle"
+    );
+
+    // Clean destruction leaves no residual state (spec "Clean Destruction of
+    // Ignored Windows").
+    conn.destroy_window(notif).unwrap().check().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        wm.alive(),
+        "the WM must survive the notification's destruction"
     );
 }
