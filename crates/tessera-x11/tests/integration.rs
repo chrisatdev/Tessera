@@ -72,9 +72,12 @@ const CAPS_LOCK: u32 = 0xffe5;
 /// strips (LOCK_STRIP=178) before the command lookup, so a locked press
 /// still matches the base combo.
 const LOCK_BITS: u16 = 2 | 16 | 32;
-/// Default frame border (`config.general.border_width`), baked into every
-/// layout placement.
+/// Default frame border (`config.general.border_width`), drawn OUTSIDE the
+/// frame's configured `w x h` by X.
 const BORDER: u16 = 2;
+/// Default layout gap (`config.general.gaps`), applied by the layout on
+/// every side of every cell.
+const GAPS: u16 = 3;
 /// ayu_dark (the embedded default theme): focused-frame border pixel =
 /// accent `#FF8F40`, unfocused = comment `#626A73`, packed into the low
 /// 24 bits (SC-thm-09).
@@ -337,26 +340,31 @@ fn border_pixel(conn: &RustConnection, frame: Window) -> u32 {
 /// 1920x1080 area (or the full screen) places its frames elsewhere on the
 /// pinned 1280x1024 Xvfb screen.
 fn expected_placements(area: Rect) -> (Geom, Geom) {
-    // Mirrors MasterStack::arrange with ratio 0.5: the placements are already
-    // border-inset (MasterStack::inset), offset by the tiling area's origin.
+    // Mirrors MasterStack::arrange with ratio 0.5: the area is cut into two
+    // cells that tile it exactly, each shrunk by GAPS on all four sides to
+    // give the OUTER footprint. `get_geometry` reports a window's size
+    // WITHOUT its border (X draws that outside), and `configure_frame` sizes
+    // the frame so `w + 2 * BORDER` equals the footprint — so the expected
+    // frame size is the footprint minus twice the border.
     let area_w = area.w;
     let area_h = area.h;
     let master_w = ((f64::from(area_w) * 0.5).round() as i32).clamp(0, i32::from(area_w)) as u16;
     let stack_w = area_w - master_w;
-    let border_x = i16::try_from(BORDER).unwrap_or(i16::MAX);
+    let inset = 2 * (GAPS + BORDER);
+    let gap_x = i16::try_from(GAPS).unwrap_or(i16::MAX);
     let area_x = i16::try_from(area.x).unwrap_or(i16::MAX);
     let area_y = i16::try_from(area.y).unwrap_or(i16::MAX);
     let master = (
-        area_x + border_x,
-        area_y + border_x,
-        master_w - 2 * BORDER,
-        area_h - 2 * BORDER,
+        area_x + gap_x,
+        area_y + gap_x,
+        master_w - inset,
+        area_h - inset,
     );
     let stack = (
-        area_x + i16::try_from(i32::from(master_w) + i32::from(BORDER)).unwrap_or(i16::MAX),
-        area_y + border_x,
-        stack_w - 2 * BORDER,
-        area_h - 2 * BORDER,
+        area_x + i16::try_from(i32::from(master_w) + i32::from(GAPS)).unwrap_or(i16::MAX),
+        area_y + gap_x,
+        stack_w - inset,
+        area_h - inset,
     );
     (master, stack)
 }
@@ -692,16 +700,15 @@ fn map_request_tiles_to_real_geometry_and_keys_drive_focus_and_switch() {
     let gfa = geom(&conn, fa);
     assert_eq!(
         (ga.x, ga.y),
-        (
-            i16::try_from(BORDER).unwrap(),
-            i16::try_from(BORDER).unwrap()
-        ),
-        "the client must sit at the frame's border offset (SC-x11-07)"
+        (0, 0),
+        "the client must fill the frame from its interior origin (SC-x11-09)"
     );
     assert_eq!(
         (ga.width, ga.height),
-        (gfa.width - 2 * BORDER, gfa.height - 2 * BORDER),
-        "the client must be inset by the 2px border on every side"
+        (gfa.width, gfa.height),
+        "the client must fill the frame interior exactly — the border already \
+         sits outside the frame's own w x h, so insetting again would leave a \
+         frame-background moat around the client"
     );
 
     // Super+J (focus_next): focus moves to A, so A becomes the master — the

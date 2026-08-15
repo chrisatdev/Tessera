@@ -83,8 +83,12 @@ impl Default for GeneralConfig {
 fn default_border_width() -> u32 {
     2
 }
+/// Gap applied by the layout on every side of every cell (REQ-lay-004).
+/// Cells touch, so `3` renders as 6px between two windows and 3px against
+/// the screen edge — a visible default now that the layout actually reads
+/// this value (it was parsed but dead before).
 fn default_gaps() -> u32 {
-    0
+    3
 }
 fn default_terminal() -> String {
     "alacritty".to_string()
@@ -483,10 +487,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_border_2_gaps_0_alacritty() {
+    fn defaults_are_border_2_gaps_3_alacritty() {
         let c = Config::default();
         assert_eq!(c.general.border_width, 2);
-        assert_eq!(c.general.gaps, 0);
+        assert_eq!(c.general.gaps, 3);
         assert_eq!(c.general.terminal, "alacritty");
     }
 

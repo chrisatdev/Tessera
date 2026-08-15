@@ -294,10 +294,24 @@ pub(crate) fn map_unframed(ops: &impl FrameOps, client: WindowId) -> Result<(), 
     ops.map_window(client)
 }
 
-/// Places `frame` at the layout placement `r` and `client` at the frame
-/// interior (REQ-x11-006, SC-x11-09): the client is inset by `border` on
-/// every side and keeps no border of its own. A frame smaller than twice the
-/// border clamps the client to zero size instead of underflowing.
+/// Places `frame` so that its TOTAL occupied box equals the layout placement
+/// `r`, and fills its interior with `client` (REQ-x11-006, SC-x11-09).
+///
+/// This is the ONE place the border is subtracted, and the reason it has to
+/// be here: X's `ConfigureWindow` `x,y` is the window's outer upper-left
+/// corner and the border is drawn OUTSIDE the configured `w x h`, so a frame
+/// really occupies `w + 2b` by `h + 2b`. `Placement::rect` is the outer
+/// footprint (see `tessera_core::Placement`), so the frame is sized
+/// `r.w - 2b` by `r.h - 2b` and its border ring lands exactly on `r`'s
+/// perimeter — inside the tiling area, never off the screen edge.
+///
+/// The client then fills that interior EXACTLY: `(0, 0)`, the frame's own
+/// inner size, no border of its own. It is not inset a second time; doing so
+/// (with the frame already sized to the full placement) is what left an
+/// 8294-pixel black frame-background moat around every client.
+///
+/// A footprint narrower than twice the border clamps to zero size instead of
+/// underflowing `u32`.
 pub(crate) fn configure_frame(
     ops: &impl FrameOps,
     frame: Window,
@@ -308,15 +322,8 @@ pub(crate) fn configure_frame(
     let b = i32::from(border);
     let inner_w = (i32::from(r.w) - 2 * b).max(0) as u32;
     let inner_h = (i32::from(r.h) - 2 * b).max(0) as u32;
-    ops.configure(
-        frame,
-        r.x,
-        r.y,
-        i32::from(r.w) as u32,
-        i32::from(r.h) as u32,
-        i32::from(border) as u32,
-    )?;
-    ops.configure(client, b, b, inner_w, inner_h, 0)
+    ops.configure(frame, r.x, r.y, inner_w, inner_h, u32::from(border))?;
+    ops.configure(client, 0, 0, inner_w, inner_h, 0)
 }
 
 /// Sets input focus to `client` (the core calls `focus_window` with the
@@ -804,8 +811,8 @@ mod tests {
 
     #[test]
     fn configure_frame_places_frame_and_client_interior() {
-        // SC-x11-09: the frame gets the layout placement; the client is sized
-        // to the frame interior, offset by the border on every side.
+        // SC-x11-09: the frame is sized so its border ring lands INSIDE the
+        // layout placement, and the client fills the resulting interior.
         let fake = FakeFrameOps::new();
         let r = Rect {
             x: 10,
@@ -821,14 +828,14 @@ mod tests {
                     window: FIRST_FRAME,
                     x: 10,
                     y: 20,
-                    width: 100,
-                    height: 80,
+                    width: 96,
+                    height: 76,
                     border_width: 2,
                 },
                 FrameCall::Configure {
                     window: CLIENT,
-                    x: 2,
-                    y: 2,
+                    x: 0,
+                    y: 0,
                     width: 96,
                     height: 76,
                     border_width: 0,
@@ -838,9 +845,63 @@ mod tests {
     }
 
     #[test]
+    fn configure_frame_footprint_equals_the_placement_at_every_border() {
+        // The invariant behind the whole geometry model: whatever `border`
+        // is, the frame's REAL occupied box — `(x, y)` plus `w + 2b` by
+        // `h + 2b`, because X draws the border outside the configured size —
+        // must equal the placement rect exactly. The old code configured the
+        // frame to `r.w x r.h`, so its footprint was `r.w + 2b` wide and the
+        // last 2px of border fell off the screen.
+        let r = Rect {
+            x: 3,
+            y: 3,
+            w: 394,
+            h: 594,
+        };
+        for border in [0u16, 1, 2, 4, 17] {
+            let fake = FakeFrameOps::new();
+            configure_frame(&fake, FIRST_FRAME, CLIENT, r, border).unwrap();
+            let b = u32::from(border);
+            let (frame_call, client_call) = (fake.calls()[0].clone(), fake.calls()[1].clone());
+            let FrameCall::Configure {
+                x,
+                y,
+                width,
+                height,
+                border_width,
+                ..
+            } = frame_call
+            else {
+                panic!("the first call must configure the frame");
+            };
+            assert_eq!((x, y), (r.x, r.y), "border {border}: origin");
+            assert_eq!(border_width, b, "border {border}: frame border");
+            assert_eq!(
+                (width + 2 * b, height + 2 * b),
+                (u32::from(r.w), u32::from(r.h)),
+                "border {border}: the frame's real footprint must equal the placement"
+            );
+            // ...and the client fills that interior exactly: same size as the
+            // frame, at its origin, with no border of its own.
+            assert_eq!(
+                client_call,
+                FrameCall::Configure {
+                    window: CLIENT,
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                    border_width: 0,
+                },
+                "border {border}: the client must fill the frame interior"
+            );
+        }
+    }
+
+    #[test]
     fn configure_frame_clamps_client_size_on_tiny_frames() {
-        // A frame smaller than 2x the border must not underflow the client
-        // size (u16): it clamps to zero instead.
+        // A placement narrower than 2x the border must not underflow the
+        // frame/client size (u32): both clamp to zero instead.
         let fake = FakeFrameOps::new();
         let r = Rect {
             x: 0,
@@ -850,15 +911,25 @@ mod tests {
         };
         configure_frame(&fake, FIRST_FRAME, CLIENT, r, 2).unwrap();
         assert_eq!(
-            fake.calls()[1],
-            FrameCall::Configure {
-                window: CLIENT,
-                x: 2,
-                y: 2,
-                width: 0,
-                height: 0,
-                border_width: 0,
-            }
+            fake.calls(),
+            vec![
+                FrameCall::Configure {
+                    window: FIRST_FRAME,
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                    border_width: 2,
+                },
+                FrameCall::Configure {
+                    window: CLIENT,
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                    border_width: 0,
+                },
+            ]
         );
     }
 

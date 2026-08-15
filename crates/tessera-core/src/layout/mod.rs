@@ -20,4 +20,4 @@ pub trait Layout: Send + Sync {
 
 mod master_stack;
 
-pub use master_stack::MasterStack;
+pub use master_stack::{DEFAULT_MASTER_RATIO, MasterStack};

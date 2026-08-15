@@ -136,7 +136,7 @@ Defaults (all values in the first-run template):
 | Setting | Default |
 |---|---|
 | `general.border_width` | 2 |
-| `general.gaps` | 0 |
+| `general.gaps` | 3 (6px between windows, 3px at the screen edge) |
 | `general.terminal` | `alacritty` |
 | `general.launcher` | `rofi -show drun` |
 | `general.theme` | (none — embedded ayu_dark) |

@@ -24,7 +24,7 @@ use crate::config::Config;
 use crate::display::{DErr, DisplayServer, FrameId};
 use crate::event::{Event, KeyCombo};
 use crate::geometry::{Direction, Rect, WindowId, WorkspaceId, resolve_direction};
-use crate::layout::{Layout, MasterStack};
+use crate::layout::{DEFAULT_MASTER_RATIO, Layout, MasterStack};
 use crate::theme::Theme;
 use crate::window::{CommandEffect, WindowManager, WindowState};
 use crate::window_kind::ManagePolicy;
@@ -62,6 +62,7 @@ impl App {
     ) -> Self {
         let bus = Arc::new(EventBus::new(Arc::clone(&config), Arc::clone(&theme)));
         let wm = WindowManager::new(Arc::clone(&bus));
+        let layout = layout_for(&config);
         App {
             bus,
             wm,
@@ -69,7 +70,7 @@ impl App {
             config,
             theme,
             area,
-            layout: MasterStack::default(),
+            layout,
             frames: HashMap::new(),
             mapped: Vec::new(),
             on_recompute: None,
@@ -143,6 +144,14 @@ impl App {
             },
             Event::Command(cmd) => self.on_command(cmd),
             Event::ConfigReloaded(cfg) => {
+                // The layout is rebuilt with the config it was derived from
+                // (REQ-lay-002/004): `X11Display::configure` reads
+                // `general.border_width` out of the SHARED config on every
+                // pass, so a layout left on the old border/gaps after a
+                // SIGHUP reload would recreate the exact mismatch this
+                // change fixes — frames drawn at one width, space reserved
+                // for another.
+                self.layout = layout_for(&cfg);
                 self.config = cfg;
                 self.publish_state();
                 Ok(())
@@ -337,6 +346,22 @@ impl App {
     }
 }
 
+/// Builds the tiling layout FROM `config` (REQ-lay-002/004) — never
+/// `MasterStack::default()`, whose values are only the config defaults.
+///
+/// The X layer sizes every frame with `general.border_width`
+/// (`X11Display::configure`, saturating through the same `u16::try_from`),
+/// so a layout hardcoding border 2 reserves the wrong footprint for any
+/// other configured width, and one ignoring `general.gaps` renders the key
+/// inert. `ratio` has no config key yet and stays at the design default.
+fn layout_for(config: &Config) -> MasterStack {
+    MasterStack::new(
+        DEFAULT_MASTER_RATIO,
+        u16::try_from(config.general.border_width).unwrap_or(u16::MAX),
+        u16::try_from(config.general.gaps).unwrap_or(u16::MAX),
+    )
+}
+
 /// Pure keybinding lookup (REQ-x11-008): the [`Command`] bound to `combo`
 /// under `cfg`, if any. `workspace[i]` maps to workspace `i + 1` (Super+0,
 /// index 9, maps to workspace 10).
@@ -417,40 +442,45 @@ mod tests {
     /// Default terminal (config default).
     const TERM: &str = "alacritty";
 
-    /// Solo-window placement: the full area inset by the border.
+    /// Every constant below is the OUTER footprint the default config
+    /// produces over `AREA` (border 2, gaps 3): the area cut into cells that
+    /// tile it exactly, each shrunk by 3 on all four sides. Borders are NOT
+    /// subtracted — `configure_frame` does that once, at the X boundary.
+    ///
+    /// Solo-window placement: the whole area, minus the edge gap.
     const SOLO: Rect = Rect {
-        x: 2,
-        y: 2,
-        w: 796,
-        h: 596,
+        x: 3,
+        y: 3,
+        w: 794,
+        h: 594,
     };
     /// Master placement for two windows at ratio 0.5.
     const MASTER: Rect = Rect {
-        x: 2,
-        y: 2,
-        w: 396,
-        h: 596,
+        x: 3,
+        y: 3,
+        w: 394,
+        h: 594,
     };
     /// Stack placement for two windows at ratio 0.5.
     const STACK: Rect = Rect {
-        x: 402,
-        y: 2,
-        w: 396,
-        h: 596,
+        x: 403,
+        y: 3,
+        w: 394,
+        h: 594,
     };
     /// Upper stack slot for three windows at ratio 0.5 (D4 resilience tests).
     const STACK_TOP: Rect = Rect {
-        x: 402,
-        y: 2,
-        w: 396,
-        h: 296,
+        x: 403,
+        y: 3,
+        w: 394,
+        h: 294,
     };
     /// Lower stack slot for three windows at ratio 0.5 (D4 resilience tests).
     const STACK_BOTTOM: Rect = Rect {
-        x: 402,
-        y: 302,
-        w: 396,
-        h: 296,
+        x: 403,
+        y: 303,
+        w: 394,
+        h: 294,
     };
 
     fn app_with(script: Vec<Event>, config: Config) -> (App, Arc<Mutex<Vec<DisplayCall>>>) {
@@ -549,6 +579,42 @@ mod tests {
                 DisplayCall::Configure(1, SOLO),
                 DisplayCall::Focus(1),
             ]
+        );
+    }
+
+    #[test]
+    fn layout_is_built_from_the_configured_border_and_gaps() {
+        // REQ-lay-002/004: the layout must be built FROM the config, not from
+        // `MasterStack::default()`. Before this change `App::new` hardcoded
+        // border 2 and ignored `gaps` entirely, so a user configuring
+        // `border_width = 4, gaps = 10` got frames the X layer drew with a
+        // 4px border inside a layout that had reserved 2 — and no gap at
+        // all. The single-window placement is the sharpest probe: its
+        // footprint is the whole area minus one gap per side, and its
+        // published border must be the CONFIGURED width.
+        let mut cfg = Config::default();
+        cfg.general.border_width = 4;
+        cfg.general.gaps = 10;
+        let (mut app, log) = app_with(vec![Event::WindowMapRequested(1)], cfg);
+        let rx = app.bus().subscribe_all();
+        app.run();
+        let wide = Rect {
+            x: 10,
+            y: 10,
+            w: 780,
+            h: 580,
+        };
+        assert!(calls(&log).contains(&DisplayCall::Configure(1, wide)));
+        assert!(
+            drain(&rx).contains(&Event::PlacementsChanged(
+                1,
+                vec![Placement {
+                    window: 1,
+                    rect: wide,
+                    border: 4,
+                }],
+            )),
+            "the published placement must carry the configured border width"
         );
     }
 
@@ -1048,6 +1114,46 @@ mod tests {
         app.run();
         assert_eq!(app.wm().state_of(2), None);
         assert!(!calls(&log).contains(&DisplayCall::Manage(2)));
+    }
+
+    #[test]
+    fn config_reload_rebuilds_the_layout_from_the_new_config() {
+        // A SIGHUP reload is a supported way to apply `border_width`/`gaps`
+        // (README "restart (or SIGHUP)"), and `X11Display::configure` reads
+        // the border out of the shared config on the very next pass — so a
+        // layout kept at the OLD values would leave the WM drawing 4px
+        // borders inside space reserved for 2px, the mismatch this change
+        // exists to remove. The re-tile after the reload must use the new
+        // geometry.
+        let (mut app, log) = app_with(vec![Event::WindowMapRequested(1)], Config::default());
+        app.run();
+        assert!(calls(&log).contains(&DisplayCall::Configure(1, SOLO)));
+
+        let mut reloaded = Config::default();
+        reloaded.general.border_width = 4;
+        reloaded.general.gaps = 10;
+        app.handle(Event::ConfigReloaded(Arc::new(reloaded)))
+            .unwrap();
+        app.handle(Event::WindowConfigureRequested(1, AREA))
+            .unwrap();
+
+        assert_eq!(
+            calls(&log).last(),
+            Some(&DisplayCall::Focus(1)),
+            "the reload must still end in a normal re-tile pass"
+        );
+        assert!(
+            calls(&log).contains(&DisplayCall::Configure(
+                1,
+                Rect {
+                    x: 10,
+                    y: 10,
+                    w: 780,
+                    h: 580,
+                }
+            )),
+            "the placement after a reload must use the reloaded border and gaps"
+        );
     }
 
     #[test]

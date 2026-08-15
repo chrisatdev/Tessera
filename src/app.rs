@@ -76,7 +76,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Tessera default configuration — cre
 
 [general]
 border_width = 2
-gaps = 0
+gaps = 3
 terminal = "alacritty"
 launcher = ["rofi", "-show", "drun"]
 
@@ -400,7 +400,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(cfg.general.border_width, 7);
         assert_eq!(cfg.general.terminal, "foot");
-        assert_eq!(cfg.general.gaps, 0); // unset keeps the default
+        assert_eq!(cfg.general.gaps, 3); // unset keeps the default
     }
 
     #[test]

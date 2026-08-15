@@ -16,7 +16,27 @@ pub struct Rect {
     pub h: u16,
 }
 
-/// Placement of one window inside a layout area, including its frame border.
+/// Placement of one window inside a layout area.
+///
+/// `rect` is the OUTER footprint: the exact box the window occupies on
+/// screen, its `border`-wide frame ring INCLUDED. This is the whole geometry
+/// contract between the layout and the X boundary, so it is worth being
+/// precise about why:
+///
+/// - X11's `ConfigureWindow` `x,y` is a window's OUTER upper-left corner and
+///   the border is drawn OUTSIDE the `w x h` box, so a frame configured to
+///   `(x, y, w, h)` with border `b` really occupies `w + 2b` by `h + 2b`.
+/// - A layout therefore CANNOT hand X its `w x h` directly. `Layout::arrange`
+///   partitions `area` into cells that tile it exactly, applies only the
+///   configured gap, and reports the result here; adjacent placements SHARE
+///   an edge and (at gap 0) their union is exactly `area`.
+/// - The single border subtraction lives at the X boundary
+///   (`tessera-x11::frames::configure_frame`): it configures the frame to
+///   `w - 2b` by `h - 2b` so the frame's real footprint equals `rect`, and
+///   fills that frame's interior with the client at `(0, 0)`.
+///
+/// Subtracting the border here as well would inset the window twice and push
+/// its border ring off the far screen edges — the bug this model replaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
     pub window: WindowId,
@@ -50,8 +70,9 @@ fn edges(r: Rect) -> (i64, i64, i64, i64) {
 }
 
 /// A placement is visible iff both dimensions are non-zero (D4).
-/// `MasterStack::inset` and `configure_frame` both clamp to zero on a tiny
-/// frame, so a degenerate rect is reachable, not hypothetical.
+/// `MasterStack::gapped` (a gap wider than its cell) and `configure_frame`
+/// (a footprint narrower than twice the border) both clamp to zero, so a
+/// degenerate rect is reachable, not hypothetical.
 fn is_visible(p: &Placement) -> bool {
     p.rect.w > 0 && p.rect.h > 0
 }
@@ -67,9 +88,10 @@ fn is_visible(p: &Placement) -> bool {
 /// lands.
 ///
 /// Admission (D2) is a same-direction edge test PLUS strictly positive
-/// perpendicular-axis overlap; the edge test uses `>=`, not `>`, because a
-/// zero-border config puts two adjacent windows' touching edges at the same
-/// coordinate. Ranking (D3) is the lexicographic minimum of `(gap,
+/// perpendicular-axis overlap; the edge test uses `>=`, not `>`, because
+/// placements are OUTER footprints that tile their area contiguously, so a
+/// zero-gap config puts two adjacent windows' touching edges at the same
+/// coordinate at ANY border width. Ranking (D3) is the lexicographic minimum of `(gap,
 /// perpendicular_start, window_id)` — nearest edge, then topmost/leftmost
 /// (reading order), then the id as a totality backstop (needed for the
 /// permutation-invariance proof, unreachable while placements are disjoint).
@@ -122,17 +144,21 @@ mod tests {
         h: 600,
     };
 
-    /// D5 case-table input: `MasterStack::new(0.5, 2).arrange(&[1, 2, 3], AREA, 0)`,
-    /// never hand-typed rects — so the goldens cannot drift from the layout.
+    /// D5 case-table input: `MasterStack::default().arrange(&[1, 2, 3], AREA,
+    /// 0)`, never hand-typed rects — so the goldens cannot drift from the
+    /// layout. The DEFAULT layout (border 2, gaps 3) is deliberate: the case
+    /// table then describes the placements a user of the shipped config
+    /// actually gets, gaps included.
     fn goldens() -> Vec<Placement> {
-        MasterStack::new(0.5, 2).arrange(&[1, 2, 3], AREA, 0)
+        MasterStack::default().arrange(&[1, 2, 3], AREA, 0)
     }
 
     #[test]
     fn resolve_direction_over_the_master_stack_goldens() {
         let p = goldens();
-        // C1: master -> right is THE TIE (gap and overlap both equal between
-        // the two stack windows); key 2 (topmost) separates them (D3).
+        // C1: master -> right is THE TIE (gap 6 = 2 * gaps, and overlap, both
+        // equal between the two stack windows); key 2 (topmost) separates
+        // them (D3).
         assert_eq!(resolve_direction(&p, 1, Direction::Right), Some(2));
         // C2: master -> left has no candidate at all.
         assert_eq!(resolve_direction(&p, 1, Direction::Left), None);
@@ -155,8 +181,10 @@ mod tests {
 
     #[test]
     fn resolve_direction_breaks_the_stack_tie_by_topmost() {
-        // C1 isolated (D3 key 2): both stack candidates admit at the SAME
-        // gap (4) and the SAME perpendicular overlap (296) — largest-overlap
+        // C1 isolated (D3 key 2), hand-typed at gaps 2 (the footprints
+        // `MasterStack::new(0.5, 2, 2)` emits over AREA): both stack
+        // candidates admit at the SAME gap (4 = 2 * gaps) and the SAME
+        // perpendicular overlap (296) — largest-overlap
         // could not separate them even if it were a rank key (and D3
         // deliberately rejects overlap magnitude as one, see resolve_direction's
         // doc comment). Only `t(c)` (topmost) tells them apart: window 2 must
@@ -196,13 +224,21 @@ mod tests {
     }
 
     #[test]
-    fn resolve_direction_admits_a_touching_edge_at_zero_border() {
-        // C10: with border 0, the master's right edge and the stack's left
-        // edge are the SAME coordinate (gap 0) — proves admission uses `>=`,
-        // not `>`. A strict `>` would leave directional focus dead on any
-        // zero-border config.
-        let p = MasterStack::new(0.5, 0).arrange(&[1, 2, 3], AREA, 0);
-        assert_eq!(resolve_direction(&p, 1, Direction::Right), Some(2));
+    fn resolve_direction_admits_a_touching_edge_at_zero_gaps() {
+        // C10: with gaps 0 the master's right edge and the stack's left edge
+        // are the SAME coordinate (gap 0) — proves admission uses `>=`, not
+        // `>`. A strict `>` would leave directional focus dead on any
+        // gapless config. Under the outer-footprint model this is now true
+        // at ANY border width, so both a zero and a non-zero border are
+        // exercised: the border no longer separates adjacent placements.
+        for border in [0u16, 2] {
+            let p = MasterStack::new(0.5, border, 0).arrange(&[1, 2, 3], AREA, 0);
+            assert_eq!(
+                resolve_direction(&p, 1, Direction::Right),
+                Some(2),
+                "border {border}: touching edges must admit"
+            );
+        }
     }
 
     #[test]
@@ -210,7 +246,7 @@ mod tests {
         // C2-C4, isolated: no candidate in `dir` is a no-op, not a wrap — a
         // lone window (nothing exists in any direction) proves the "no
         // candidate" path never invents one, in every direction at once.
-        let solo = MasterStack::new(0.5, 2).arrange(&[1], AREA, 0);
+        let solo = MasterStack::default().arrange(&[1], AREA, 0);
         for dir in [
             Direction::Left,
             Direction::Right,
