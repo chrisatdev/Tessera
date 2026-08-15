@@ -225,6 +225,62 @@ impl Default for Keybindings {
     }
 }
 
+impl Keybindings {
+    /// The claim-log name paired with every configured binding (KBR-3, D8).
+    ///
+    /// The destructure below is EXHAUSTIVE and deliberately has no `..` rest
+    /// pattern: adding a field to `Keybindings` must fail to compile here
+    /// until that field is given a claim-log name (`E0027`).
+    /// `#[deny(unused_variables)]` closes the other half of the same guard —
+    /// binding a field without emitting it into `pairs` is a build error too.
+    /// Together these are the entire point of this registry, which exists
+    /// because a `zip` of two hand-maintained lists (the config field array
+    /// and a parallel names `Vec`) used to truncate silently on any length
+    /// mismatch, leaving a binding ungrabbed, unnamed, AND still counted as
+    /// healthy in `GrabStats.bindings` (D2, D7).
+    ///
+    /// DO NOT add `..` to silence a compile error here after adding a field.
+    /// That error IS the feature: it is telling you a binding would
+    /// otherwise be grabbed under no name, or not grabbed at all, while the
+    /// claim line still reports it healthy. Give the new field a name in
+    /// BOTH the destructure below AND the `pairs` list, in the position
+    /// where it should actually be grabbed.
+    ///
+    /// Emission order is WRITTEN, not derived from struct-declaration order
+    /// (D4): `workspace` is the 5th declared field but grabs LAST here,
+    /// because the ratified grab-order test pins the first eight grab calls
+    /// to the terminal binding's lock-variant masks. Workspace names are
+    /// GENERATED from the array's own index (D5) via `enumerate`, never a
+    /// second parallel list, so they cannot truncate or shift independently.
+    #[deny(unused_variables)]
+    pub fn named_bindings(&self) -> Vec<(String, KeyCombo)> {
+        let Keybindings {
+            terminal,
+            focus_next,
+            focus_prev,
+            close,
+            workspace,
+            toggle_layout,
+            launcher,
+        } = self;
+        let mut pairs: Vec<(String, KeyCombo)> = vec![
+            ("terminal".to_string(), *terminal),
+            ("focus_next".to_string(), *focus_next),
+            ("focus_prev".to_string(), *focus_prev),
+            ("close".to_string(), *close),
+            ("toggle_layout".to_string(), *toggle_layout),
+            ("launcher".to_string(), *launcher),
+        ];
+        pairs.extend(
+            workspace
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (format!("workspace-{}", i + 1), *c)),
+        );
+        pairs
+    }
+}
+
 fn default_terminal_combo() -> KeyCombo {
     KeyCombo {
         mods: MOD_SUPER,
@@ -715,6 +771,63 @@ mod tests {
                 "error must echo the offending name: {msg}"
             );
         }
+    }
+
+    // === Named-bindings registry (KBR-3, D8) — tessera-keybinding-registry ===
+
+    #[test]
+    fn named_bindings_pairs_every_field_in_grab_order() {
+        // T-A: the exact 16-name sequence in registry (grab) order, and each
+        // pair's combo equals the field read through ITS OWN path — never the
+        // registry itself. This is the one test that can catch the D4 grab-
+        // order trap: `workspace` is Keybindings' 5th declared field but must
+        // land LAST here, after toggle_layout and launcher.
+        let k = Keybindings::default();
+        let pairs = k.named_bindings();
+        let expected_names: Vec<String> = [
+            "terminal",
+            "focus_next",
+            "focus_prev",
+            "close",
+            "toggle_layout",
+            "launcher",
+        ]
+        .iter()
+        .map(|n| (*n).to_string())
+        .chain((1..=10).map(|i| format!("workspace-{i}")))
+        .collect();
+        let names: Vec<String> = pairs.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(names, expected_names);
+        assert_eq!(pairs.len(), 16);
+        assert_eq!(pairs[0], ("terminal".to_string(), k.terminal));
+        assert_eq!(pairs[1], ("focus_next".to_string(), k.focus_next));
+        assert_eq!(pairs[2], ("focus_prev".to_string(), k.focus_prev));
+        assert_eq!(pairs[3], ("close".to_string(), k.close));
+        assert_eq!(pairs[4], ("toggle_layout".to_string(), k.toggle_layout));
+        assert_eq!(pairs[5], ("launcher".to_string(), k.launcher));
+        for i in 0..10 {
+            assert_eq!(
+                pairs[6 + i],
+                (format!("workspace-{}", i + 1), k.workspace[i]),
+                "workspace-{} must pair with k.workspace[{}], read directly from the field",
+                i + 1,
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn named_bindings_names_are_unique() {
+        // T-B: no two entries share a claim-log name. This closes the one
+        // hole the compiler guards (D2) cannot see — a field emitted under
+        // the WRONG or a DUPLICATE label, which would make `missing:`
+        // misname a binding at claim time.
+        let pairs = Keybindings::default().named_bindings();
+        let mut names: Vec<&String> = pairs.iter().map(|(n, _)| n).collect();
+        let before = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), before, "every binding name must be unique");
     }
 
     #[test]
