@@ -13,4 +13,9 @@ pub enum Command {
     CloseFocused,
     SwitchWorkspace(WorkspaceId),
     ToggleLayout,
+    /// Step to the neighbouring workspace in ascending id order, wrapping
+    /// (WS-1). `-1` = previous, `1` = next.
+    CycleWorkspace(i8),
+    /// Send the focused window to `WorkspaceId` WITHOUT following it (MV-1/2).
+    MoveToWorkspace(WorkspaceId),
 }

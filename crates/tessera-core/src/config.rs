@@ -19,12 +19,18 @@ const MOD_SUPER: u32 = 1 << 6;
 /// the default launcher binding; mask 4 is disjoint from Super (64), so the
 /// two default sets never collide in grab-variant space.
 const MOD_CONTROL: u32 = 1 << 2;
+/// Modifier mask for the "Shift" key (X11 bit 0, `1 << 0`). Combined with
+/// `MOD_SUPER` for the default `move_to_workspace` bindings (Super+Shift+N);
+/// disjoint from every other default mask.
+const MOD_SHIFT: u32 = 1 << 0;
 // Keysyms for the default keybindings (X11 keysym table).
 const KEY_RETURN: u32 = 0xff0d;
 const KEY_J: u32 = 0x006a;
 const KEY_K: u32 = 0x006b;
 const KEY_Q: u32 = 0x0071;
 const KEY_SPACE: u32 = 0x0020;
+const KEY_H: u32 = 0x0068;
+const KEY_L: u32 = 0x006c;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -209,6 +215,18 @@ pub struct Keybindings {
     /// collide with the existing Super+Space/Super+Enter defaults.
     #[serde(default = "default_launcher_combo")]
     pub launcher: KeyCombo,
+    /// Steps to the previous/next workspace in ascending numeric-id order,
+    /// wrapping at both ends (WS-1, D11). Default Super+H / Super+L; `h`/`l`
+    /// must be in `KEY_NAMES` (D13) for these defaults to be nameable.
+    #[serde(default = "default_workspace_prev")]
+    pub workspace_prev: KeyCombo,
+    #[serde(default = "default_workspace_next")]
+    pub workspace_next: KeyCombo,
+    /// Super+Shift+{1..9,0} sends the focused window to workspace {1..10}
+    /// without following it (MV-1/2, D6/D7). Index `i` maps to workspace
+    /// `i + 1`, mirroring `workspace` exactly.
+    #[serde(default = "default_move_to_workspace")]
+    pub move_to_workspace: [KeyCombo; 10],
 }
 
 impl Default for Keybindings {
@@ -221,6 +239,9 @@ impl Default for Keybindings {
             workspace: default_workspace(),
             toggle_layout: default_toggle_layout(),
             launcher: default_launcher_combo(),
+            workspace_prev: default_workspace_prev(),
+            workspace_next: default_workspace_next(),
+            move_to_workspace: default_move_to_workspace(),
         }
     }
 }
@@ -262,6 +283,9 @@ impl Keybindings {
             workspace,
             toggle_layout,
             launcher,
+            workspace_prev,
+            workspace_next,
+            move_to_workspace,
         } = self;
         let mut pairs: Vec<(String, KeyCombo)> = vec![
             ("terminal".to_string(), *terminal),
@@ -270,12 +294,20 @@ impl Keybindings {
             ("close".to_string(), *close),
             ("toggle_layout".to_string(), *toggle_layout),
             ("launcher".to_string(), *launcher),
+            ("workspace_prev".to_string(), *workspace_prev),
+            ("workspace_next".to_string(), *workspace_next),
         ];
         pairs.extend(
             workspace
                 .iter()
                 .enumerate()
                 .map(|(i, c)| (format!("workspace-{}", i + 1), *c)),
+        );
+        pairs.extend(
+            move_to_workspace
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (format!("move-to-workspace-{}", i + 1), *c)),
         );
         pairs
     }
@@ -321,6 +353,26 @@ fn default_launcher_combo() -> KeyCombo {
 fn default_workspace() -> [KeyCombo; 10] {
     std::array::from_fn(|i| KeyCombo {
         mods: MOD_SUPER,
+        key: if i == 9 { 0x0030 } else { 0x0031 + i as u32 },
+    })
+}
+fn default_workspace_prev() -> KeyCombo {
+    KeyCombo {
+        mods: MOD_SUPER,
+        key: KEY_H,
+    }
+}
+fn default_workspace_next() -> KeyCombo {
+    KeyCombo {
+        mods: MOD_SUPER,
+        key: KEY_L,
+    }
+}
+/// Super+Shift+1..9 send to workspaces 1..9; index 9 (Super+Shift+0) sends to
+/// workspace 10 — identical numbering to `default_workspace` (D12).
+fn default_move_to_workspace() -> [KeyCombo; 10] {
+    std::array::from_fn(|i| KeyCombo {
+        mods: MOD_SUPER | MOD_SHIFT,
         key: if i == 9 { 0x0030 } else { 0x0031 + i as u32 },
     })
 }
@@ -777,11 +829,14 @@ mod tests {
 
     #[test]
     fn named_bindings_pairs_every_field_in_grab_order() {
-        // T-A: the exact 16-name sequence in registry (grab) order, and each
-        // pair's combo equals the field read through ITS OWN path — never the
-        // registry itself. This is the one test that can catch the D4 grab-
-        // order trap: `workspace` is Keybindings' 5th declared field but must
-        // land LAST here, after toggle_layout and launcher.
+        // T-A: the exact 28-name sequence in registry (grab) order (16 base +
+        // 12 new — workspace_prev/next + move_to_workspace, WU1
+        // tessera-navigation-bindings), and each pair's combo equals the field
+        // read through ITS OWN path — never the registry itself. This is the
+        // one test that can catch the D4 grab-order trap: `workspace` is
+        // Keybindings' 5th declared field but must land after toggle_layout,
+        // launcher, workspace_prev and workspace_next here, and
+        // `move_to_workspace` must land LAST of all.
         let k = Keybindings::default();
         let pairs = k.named_bindings();
         let expected_names: Vec<String> = [
@@ -791,25 +846,42 @@ mod tests {
             "close",
             "toggle_layout",
             "launcher",
+            "workspace_prev",
+            "workspace_next",
         ]
         .iter()
         .map(|n| (*n).to_string())
         .chain((1..=10).map(|i| format!("workspace-{i}")))
+        .chain((1..=10).map(|i| format!("move-to-workspace-{i}")))
         .collect();
         let names: Vec<String> = pairs.iter().map(|(n, _)| n.clone()).collect();
         assert_eq!(names, expected_names);
-        assert_eq!(pairs.len(), 16);
+        assert_eq!(pairs.len(), 28);
         assert_eq!(pairs[0], ("terminal".to_string(), k.terminal));
         assert_eq!(pairs[1], ("focus_next".to_string(), k.focus_next));
         assert_eq!(pairs[2], ("focus_prev".to_string(), k.focus_prev));
         assert_eq!(pairs[3], ("close".to_string(), k.close));
         assert_eq!(pairs[4], ("toggle_layout".to_string(), k.toggle_layout));
         assert_eq!(pairs[5], ("launcher".to_string(), k.launcher));
+        assert_eq!(pairs[6], ("workspace_prev".to_string(), k.workspace_prev));
+        assert_eq!(pairs[7], ("workspace_next".to_string(), k.workspace_next));
         for i in 0..10 {
             assert_eq!(
-                pairs[6 + i],
+                pairs[8 + i],
                 (format!("workspace-{}", i + 1), k.workspace[i]),
                 "workspace-{} must pair with k.workspace[{}], read directly from the field",
+                i + 1,
+                i
+            );
+        }
+        for i in 0..10 {
+            assert_eq!(
+                pairs[18 + i],
+                (
+                    format!("move-to-workspace-{}", i + 1),
+                    k.move_to_workspace[i]
+                ),
+                "move-to-workspace-{} must pair with k.move_to_workspace[{}], read directly from the field",
                 i + 1,
                 i
             );
@@ -828,6 +900,33 @@ mod tests {
         names.sort();
         names.dedup();
         assert_eq!(names.len(), before, "every binding name must be unique");
+    }
+
+    // === Workspace ring + move-to-workspace bindings — WU1 (tessera-navigation-bindings) ===
+
+    #[test]
+    fn named_bindings_names_the_workspace_step_and_move_bindings() {
+        // D12: workspace_prev/workspace_next are named SCALARS appended after
+        // launcher; move_to_workspace is GENERATED via enumerate and extended
+        // LAST (after the workspace extend), so calls[..8] (grab order) still
+        // resolves to the terminal binding (KBR-3 gotcha).
+        let k = Keybindings::default();
+        let pairs = k.named_bindings();
+        assert_eq!(pairs.len(), 28);
+        assert_eq!(pairs[6], ("workspace_prev".to_string(), k.workspace_prev));
+        assert_eq!(pairs[7], ("workspace_next".to_string(), k.workspace_next));
+        for i in 0..10 {
+            assert_eq!(
+                pairs[18 + i],
+                (
+                    format!("move-to-workspace-{}", i + 1),
+                    k.move_to_workspace[i]
+                ),
+                "move-to-workspace-{} must pair with k.move_to_workspace[{}]",
+                i + 1,
+                i
+            );
+        }
     }
 
     #[test]

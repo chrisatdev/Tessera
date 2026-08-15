@@ -22,7 +22,7 @@ pub struct KeyCombo {
     pub key: u32,
 }
 
-/// Committed keysym dictionary (NKB-3): 39 canonical names plus the
+/// Committed keysym dictionary (NKB-3): 41 canonical names plus the
 /// lowercase aliases `enter`/`esc`. Lookup is exact-case; any other name is
 /// an NKB-2 strict-parse error naming the field and the accepted list. The
 /// table covers every default binding and the keysyms the X layer names
@@ -39,6 +39,10 @@ pub(crate) const KEY_NAMES: &[(&str, u32)] = &[
     ("j", 0x006a),
     ("k", 0x006b),
     ("q", 0x0071),
+    // Workspace-ring keysyms (WS-1, D13): `h`/`l` back the default
+    // workspace_prev/workspace_next Super+H/Super+L bindings.
+    ("h", 0x0068),
+    ("l", 0x006c),
     ("1", 0x0031),
     ("2", 0x0032),
     ("3", 0x0033),
@@ -221,4 +225,21 @@ pub enum Event {
     Command(Command),
     ConfigReloaded(Arc<Config>),
     Shutdown,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_names_accept_h_and_l() {
+        // D13: u1's own `workspace_prev`/`workspace_next` default to
+        // Super+H/Super+L. Without `h`/`l` in KEY_NAMES those defaults would
+        // be an NKB-2 strict-parse error the moment a user tries to name them
+        // in TOML — a u1 failure, not a u2 concern.
+        let h: KeyCombo = toml::from_str("mods = 64\nkey = \"h\"\n").expect("h must parse");
+        assert_eq!(h.key, 0x0068);
+        let l: KeyCombo = toml::from_str("mods = 64\nkey = \"l\"\n").expect("l must parse");
+        assert_eq!(l.key, 0x006c);
+    }
 }

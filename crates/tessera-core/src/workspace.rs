@@ -76,6 +76,31 @@ impl WorkspaceManager {
             .find(|&m| m != id && self.workspaces.contains_key(&m))
     }
 
+    /// Live workspace ids in ascending NUMERIC order (WS-2, D11). `self.order`
+    /// is CREATION order and deliberately not used here: the user navigates
+    /// the numbers printed on the bar, not the order they happened to be
+    /// created.
+    fn sorted_ids(&self) -> Vec<WorkspaceId> {
+        let mut ids: Vec<WorkspaceId> = self.workspaces.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The workspace `step` places from the current one in ascending id
+    /// order, wrapping at both ends (WS-1, D11). `None` when fewer than two
+    /// live workspaces exist (single-workspace no-op) or when `current` is
+    /// not itself live.
+    pub fn relative_id(&self, step: i8) -> Option<WorkspaceId> {
+        let ids = self.sorted_ids();
+        if ids.len() < 2 {
+            return None;
+        }
+        let pos = ids.iter().position(|&id| id == self.current)?;
+        let n = ids.len() as i64;
+        let next = (pos as i64 + i64::from(step)).rem_euclid(n) as usize;
+        ids.get(next).copied()
+    }
+
     /// Creates a workspace with the next auto name and publishes
     /// `WorkspaceOpened`; the first one becomes current (REQ-ws-001).
     pub fn open(&mut self) -> WorkspaceId {
@@ -237,19 +262,38 @@ impl WorkspaceManager {
         true
     }
 
-    /// Removes `w` from its workspace (SC-ws-02..04). An empty unfocused
-    /// workspace is destroyed; an emptied focused workspace moves focus to the
-    /// nearest remaining workspace (or stays with no focus when it is the
-    /// sole one). EWMH `set_desktops` sync is deferred to the EWMH work unit.
-    pub fn detach(&mut self, w: WindowId) {
-        let Some(id) = self.workspace_of(w) else {
-            return;
-        };
-        let ws = self.workspaces.get_mut(&id).expect("workspace exists");
+    /// Removes `w` from its workspace and clears a focus that pointed at it.
+    /// Returns the workspace it left, or `None` when `w` is unmanaged.
+    ///
+    /// D9: this is the removal step ONLY. The emptied-workspace policy
+    /// (SC-ws-02 destroy / SC-ws-04 auto-switch) deliberately lives in
+    /// [`Self::detach`], NOT here, because [`Self::move_window`] must NOT
+    /// trigger it (MV-2) — a later refactor cannot "simplify" by routing the
+    /// move path through `detach`, because doing so would resurrect that
+    /// policy on a path that must never run it.
+    fn unlink(&mut self, w: WindowId) -> Option<WorkspaceId> {
+        let id = self.workspace_of(w)?;
+        let ws = self.workspaces.get_mut(&id)?;
         ws.windows.retain(|&x| x != w);
         if ws.focus == Some(w) {
             ws.focus = None;
         }
+        Some(id)
+    }
+
+    /// Removes `w` from its workspace (SC-ws-02..04). An empty unfocused
+    /// workspace is destroyed; an emptied focused workspace moves focus to the
+    /// nearest remaining workspace (or stays with no focus when it is the
+    /// sole one). EWMH `set_desktops` sync is deferred to the EWMH work unit.
+    ///
+    /// DO NOT call [`Self::unlink`] from [`Self::move_window`] and expect this
+    /// policy to follow: the auto-switch below is the destroy path's behavior
+    /// and MV-2 forbids it on the move path (D9).
+    pub fn detach(&mut self, w: WindowId) {
+        let Some(id) = self.unlink(w) else {
+            return;
+        };
+        let ws = self.workspaces.get(&id).expect("workspace exists");
         if !ws.windows.is_empty() {
             return;
         }
@@ -264,6 +308,39 @@ impl WorkspaceManager {
             // SC-ws-02: empty + unfocused -> destroy (clamp enforced inside).
             self.close(id);
         }
+    }
+
+    /// Moves `w` to workspace `to` WITHOUT following it (MV-1/2). `to` is
+    /// auto-created when absent, mirroring `switch`'s auto-create. Returns
+    /// false when `w` is unmanaged or already on `to`.
+    pub fn move_window(&mut self, w: WindowId, to: WorkspaceId) -> bool {
+        let Some(from) = self.workspace_of(w) else {
+            return false;
+        };
+        if from == to {
+            return false;
+        }
+        self.unlink(w);
+        // Source focus repair: `unlink` cleared `focus` when `w` held it, and
+        // `WindowManager::repair_focus` is private to window.rs and
+        // unreachable here. Re-express it the way `switch` already does:
+        // the MRU window is `windows[0]`.
+        if let Some(src) = self.workspaces.get_mut(&from)
+            && src.focus.is_none()
+        {
+            src.focus = src.windows.first().copied();
+        }
+        // MV-2: no auto-switch. `detach`'s SC-ws-04 is deliberately not on
+        // this path (D9) — an emptied source stays current and empty.
+        self.open_with_id(to);
+        let Some(dst) = self.workspaces.get_mut(&to) else {
+            return false;
+        };
+        if !dst.windows.contains(&w) {
+            dst.windows.insert(0, w); // most recent first, as `attach`
+        }
+        dst.focus = Some(w);
+        true
     }
 }
 
@@ -461,6 +538,132 @@ mod tests {
             rx.recv_timeout(Duration::from_millis(50)),
             Err(RecvTimeoutError::Timeout)
         );
+    }
+
+    #[test]
+    fn relative_id_steps_and_wraps_over_sorted_ids() {
+        // WS-1/D11: relative_id walks live ids in ASCENDING NUMERIC order and
+        // wraps at both ends, regardless of creation order.
+        let (_, _, mut wm) = setup();
+        let a = wm.open(); // 1
+        let b = wm.open(); // 2
+        let c = wm.open(); // 3
+        assert_eq!((a, b, c), (1, 2, 3));
+        assert_eq!(wm.current_id(), a);
+        assert_eq!(wm.relative_id(1), Some(2)); // step forward
+        assert!(wm.switch(3));
+        assert_eq!(wm.relative_id(1), Some(1)); // wrap forward at the top
+        assert!(wm.switch(1));
+        assert_eq!(wm.relative_id(-1), Some(3)); // wrap backward at the bottom
+    }
+
+    #[test]
+    fn relative_id_is_none_with_a_single_workspace() {
+        // WS-1 no-op scenario: fewer than two live workspaces -> None, so the
+        // caller never publishes WorkspaceChanged for a self-switch.
+        let (_, _, mut wm) = setup();
+        wm.open(); // sole workspace
+        assert_eq!(wm.relative_id(1), None);
+        assert_eq!(wm.relative_id(-1), None);
+    }
+
+    #[test]
+    fn relative_id_orders_by_numeric_id_not_creation_order() {
+        // WS-2: ids are sorted NUMERICALLY, not by `order` (creation) or `mru`
+        // (touch-recency). Create 5 first, then 2 — creation order is [5, 2],
+        // but the ring must still walk 2 -> 5 (numeric ascending).
+        let (_, _, mut wm) = setup();
+        wm.open(); // 1, current
+        assert!(wm.switch(5)); // auto-created out of sequence; mru = [5, 1]
+        assert!(wm.switch(2)); // auto-created; mru = [2, 5, 1]; order = [1, 5, 2]
+        assert_eq!(wm.current_id(), 2);
+        // Numeric order is [1, 2, 5]; from 2, next is 5 (not 1, which is what
+        // `order`-based or `mru`-based traversal would produce).
+        assert_eq!(wm.relative_id(1), Some(5));
+        assert_eq!(wm.relative_id(-1), Some(1));
+    }
+
+    #[test]
+    fn move_window_attaches_to_the_target_and_repairs_source_focus() {
+        // MV-1: the focused window moves to `to` WITHOUT following (current
+        // stays put). D9/D10: the source's remaining window regains focus,
+        // re-expressing the repair `switch` already does (windows[0] = MRU).
+        let (_, _, mut wm) = setup();
+        let a = wm.open();
+        let b = wm.open();
+        wm.switch(a);
+        wm.attach(1);
+        wm.attach(2); // a: windows [2, 1], focus 2
+        assert!(wm.move_window(2, b));
+        assert_eq!(wm.current_id(), a); // MV-1: view does not follow
+        assert_eq!(wm.workspace(a).unwrap().windows, vec![1]);
+        assert_eq!(wm.workspace(a).unwrap().focus, Some(1)); // repaired
+        assert_eq!(wm.workspace(b).unwrap().windows, vec![2]);
+        assert_eq!(wm.workspace(b).unwrap().focus, Some(2));
+    }
+
+    #[test]
+    fn move_window_of_the_last_window_leaves_the_user_on_the_empty_source() {
+        // D9 guard, half A (MATCHED with the destroy-path test below): moving
+        // the LAST window off the current workspace must NOT trigger the
+        // SC-ws-04 auto-switch. The bus assertion is load-bearing — any
+        // refactor that routes move_window through detach (or copies its
+        // policy) publishes WorkspaceChanged here and this test catches it,
+        // even if the id assertion alone would not.
+        let (_, rx, mut wm) = setup();
+        let a = wm.open();
+        let b = wm.open();
+        wm.switch(a);
+        wm.attach(1); // a's sole window
+        rx.try_recv().ok(); // drain WorkspaceOpened(1)
+        rx.try_recv().ok(); // drain WorkspaceOpened(2)
+        rx.try_recv().ok(); // drain the attach's implicit nothing (no-op safe)
+        assert!(wm.move_window(1, b));
+        assert_eq!(wm.current_id(), a); // stays on the now-empty source
+        assert!(wm.workspace(a).unwrap().windows.is_empty());
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout),
+            "MV-2: no WorkspaceChanged may publish on the move path"
+        );
+    }
+
+    #[test]
+    fn destroy_path_still_auto_switches_off_an_emptied_workspace() {
+        // D9 guard, half B (MATCHED with the move-path test above): the
+        // move-path suppression above applies ONLY to move_window. Destroying
+        // (detach) the last window on the current workspace must still
+        // auto-switch to the nearest remaining workspace, exactly as before
+        // this change (SC-ws-04, unchanged).
+        let (_, rx, mut wm) = setup();
+        let a = wm.open();
+        let b = wm.open();
+        wm.switch(a);
+        wm.attach(1); // a's sole window
+        wm.detach(1); // destroy path, not move
+        assert_eq!(wm.current_id(), b); // auto-switched
+        let events: Vec<_> = (0..3).map(|_| rx.recv()).collect::<Result<_, _>>().unwrap();
+        assert_eq!(
+            events,
+            vec![
+                Event::WorkspaceOpened(1),
+                Event::WorkspaceOpened(2),
+                Event::WorkspaceChanged(2), // SC-ws-04 auto-switch still fires
+            ]
+        );
+    }
+
+    #[test]
+    fn move_window_auto_creates_a_missing_target() {
+        // Mirrors `switch`'s auto-create: MoveToWorkspace to an id that does
+        // not exist yet creates it and attaches the window.
+        let (_, _, mut wm) = setup();
+        wm.attach(1); // sole workspace 1, focused
+        assert_eq!(wm.len(), 1);
+        assert!(wm.move_window(1, 5));
+        assert_eq!(wm.len(), 2);
+        assert_eq!(wm.workspace(5).unwrap().windows, vec![1]);
+        assert_eq!(wm.workspace(5).unwrap().focus, Some(1));
     }
 
     #[test]

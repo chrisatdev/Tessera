@@ -206,6 +206,28 @@ impl WindowManager {
             Command::SpawnLauncher => CommandEffect::SpawnLauncher,
             Command::CloseFocused => CommandEffect::CloseFocused,
             Command::ToggleLayout => CommandEffect::Unsupported,
+            Command::CycleWorkspace(step) => {
+                if let Some(id) = self.ws.relative_id(step) {
+                    if self.ws.switch(id) {
+                        CommandEffect::Applied
+                    } else {
+                        CommandEffect::Ignored
+                    }
+                } else {
+                    CommandEffect::Ignored
+                }
+            }
+            Command::MoveToWorkspace(id) => {
+                if let Some(f) = self.ws.focused_window() {
+                    if self.ws.move_window(f, id) {
+                        CommandEffect::Applied
+                    } else {
+                        CommandEffect::Ignored
+                    }
+                } else {
+                    CommandEffect::Ignored
+                }
+            }
         }
     }
 
@@ -597,6 +619,39 @@ mod tests {
         wm.focus_next(); // cycle on workspace 1: 2 -> 1
         assert_eq!(wm.focused_window(), Some(1));
         assert_eq!(wm.workspace(b).unwrap().focus, Some(9)); // untouched
+    }
+
+    #[test]
+    fn apply_command_cycle_workspace_wraps_and_move_to_workspace_applies() {
+        // D6/D10: CycleWorkspace steps/wraps the numeric ring; MoveToWorkspace
+        // sends the focused window without following (current unchanged).
+        let (_, _, mut wm) = setup();
+        let a = wm.open();
+        let b = wm.open();
+        assert_eq!((a, b), (1, 2));
+        assert_eq!(
+            wm.apply_command(Command::CycleWorkspace(1)),
+            CommandEffect::Applied
+        );
+        assert_eq!(wm.current_id(), b);
+        assert_eq!(
+            wm.apply_command(Command::CycleWorkspace(1)),
+            CommandEffect::Applied
+        );
+        assert_eq!(wm.current_id(), a); // wrapped
+        manage(&mut wm, 1); // lands on a, focused
+        assert_eq!(
+            wm.apply_command(Command::MoveToWorkspace(b)),
+            CommandEffect::Applied
+        );
+        assert_eq!(wm.current_id(), a); // MV-1: view does not follow
+        assert_eq!(wm.workspace(b).unwrap().windows, vec![1]);
+        // No focused window on a anymore (it emptied and moved on) -> Ignored,
+        // not a panic.
+        assert_eq!(
+            wm.apply_command(Command::MoveToWorkspace(b)),
+            CommandEffect::Ignored
+        );
     }
 
     #[test]

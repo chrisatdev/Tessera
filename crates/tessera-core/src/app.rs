@@ -330,9 +330,20 @@ pub fn command_for_key(cfg: &Config, combo: KeyCombo) -> Option<Command> {
     if combo == k.launcher {
         return Some(Command::SpawnLauncher);
     }
+    if combo == k.workspace_next {
+        return Some(Command::CycleWorkspace(1));
+    }
+    if combo == k.workspace_prev {
+        return Some(Command::CycleWorkspace(-1));
+    }
     for (i, bound) in k.workspace.iter().enumerate() {
         if *bound == combo {
             return Some(Command::SwitchWorkspace(i as WorkspaceId + 1));
+        }
+    }
+    for (i, bound) in k.move_to_workspace.iter().enumerate() {
+        if *bound == combo {
+            return Some(Command::MoveToWorkspace(i as WorkspaceId + 1));
         }
     }
     None
@@ -880,6 +891,31 @@ mod tests {
             Some(Command::SwitchWorkspace(10))
         );
         assert_eq!(command_for_key(&cfg, KeyCombo { mods: 0, key: 0 }), None);
+    }
+
+    #[test]
+    fn command_for_key_maps_the_workspace_step_and_move_bindings() {
+        // D7: workspace_next/workspace_prev resolve to CycleWorkspace(±1);
+        // move_to_workspace[i] resolves to MoveToWorkspace(i + 1), mirroring
+        // the existing `workspace` loop exactly.
+        let cfg = Config::default();
+        let k = &cfg.keybindings;
+        assert_eq!(
+            command_for_key(&cfg, k.workspace_next),
+            Some(Command::CycleWorkspace(1))
+        );
+        assert_eq!(
+            command_for_key(&cfg, k.workspace_prev),
+            Some(Command::CycleWorkspace(-1))
+        );
+        assert_eq!(
+            command_for_key(&cfg, k.move_to_workspace[0]),
+            Some(Command::MoveToWorkspace(1))
+        );
+        assert_eq!(
+            command_for_key(&cfg, k.move_to_workspace[9]),
+            Some(Command::MoveToWorkspace(10))
+        );
     }
 
     #[test]
