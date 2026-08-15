@@ -394,7 +394,11 @@ mod tests {
     /// `workspace` (only the mods differ, Super+Shift vs Super), so it needs
     /// no new fixture entry. `workspace_prev`/`workspace_next` (Super+H/L, D13)
     /// need their own two keycodes: 43/46 (`h`/`l`, unused elsewhere in this
-    /// fixture) so the healthy-mapping test resolves all 28 default bindings.
+    /// fixture). WU2's directional focus bindings (Super+Shift+h/j/k/l,
+    /// tessera-navigation-bindings) reuse the SAME four keycodes as
+    /// `focus_next`/`focus_prev` (44/45) and `workspace_prev`/`workspace_next`
+    /// (43/46) — only the mods differ again — so this fixture needs NO new
+    /// entries for u2 either; it now resolves all 32 default bindings.
     fn default_keymap() -> Keymap {
         keymap_with(&[
             (36, 0xff0d), // terminal (Super+Enter)
@@ -491,18 +495,20 @@ mod tests {
 
     #[test]
     fn grab_keybindings_grabs_every_default_binding_as_lock_variants() {
-        // KBR-1 (D1): each of the 28 default bindings (WU1
+        // KBR-1 (D1): each of the 32 default bindings (WU1
         // tessera-navigation-bindings adds workspace_prev/workspace_next + 10
-        // move_to_workspace, all pairwise disjoint on (mods, keysym)) is
-        // expanded into the 8 lock-variant masks (base | every subset of
-        // {2,16,32}), so 28 x 8 = 224 grabs land on the root. Super bindings
-        // use the {64,66,80,96,82,98,112,114} mask set; the launcher
-        // (Ctrl+Space) uses its disjoint {4,6,20,36,22,38,52,54} set.
+        // move_to_workspace; WU2 adds the 4 directional focus bindings —
+        // Super+Shift+{h,j,k,l} is a mod combo no other default uses, so all
+        // 32 stay pairwise disjoint on (mods, keysym)) is expanded into the
+        // 8 lock-variant masks (base | every subset of {2,16,32}), so
+        // 32 x 8 = 256 grabs land on the root. Super bindings use the
+        // {64,66,80,96,82,98,112,114} mask set; the launcher (Ctrl+Space)
+        // uses its disjoint {4,6,20,36,22,38,52,54} set.
         let fake = FakeKeyboardOps::new((8, 67), 2, vec![0u32; 120]);
         let keymap = default_keymap();
         let stats = grab_keybindings(&fake, &keymap, ROOT, &Config::default()).unwrap();
-        assert_eq!(stats.bindings, 28);
-        assert_eq!(stats.grabs, 224);
+        assert_eq!(stats.bindings, 32);
+        assert_eq!(stats.grabs, 256);
         assert!(
             stats.missing.is_empty(),
             "a healthy mapping resolves every binding — nothing may be missing"
@@ -558,15 +564,15 @@ mod tests {
         // D1: dedup happens on the EXPANDED (mods, keycode) pair. When two
         // bindings are identical (same mods + keysym -> same keycode), their
         // variant sets coincide, so only 8 grabs land for that keycode
-        // instead of 16 (216 grabs total: 27 distinct combos x 8 variants,
-        // 28 bindings still configured — WU1 tessera-navigation-bindings).
+        // instead of 16 (248 grabs total: 31 distinct combos x 8 variants,
+        // 32 bindings still configured — WU1+WU2 tessera-navigation-bindings).
         let fake = FakeKeyboardOps::new((8, 67), 2, vec![0u32; 120]);
         let keymap = default_keymap();
         let mut cfg = Config::default();
         cfg.keybindings.launcher = cfg.keybindings.terminal; // Super+Enter twice
         let stats = grab_keybindings(&fake, &keymap, ROOT, &cfg).unwrap();
-        assert_eq!(stats.bindings, 28);
-        assert_eq!(stats.grabs, 216); // 27 distinct combos x 8 variants
+        assert_eq!(stats.bindings, 32);
+        assert_eq!(stats.grabs, 248); // 31 distinct combos x 8 variants
         assert!(
             stats.missing.is_empty(),
             "identical-but-resolved combos are deduped, not missing"
@@ -585,20 +591,20 @@ mod tests {
     #[test]
     fn grab_keybindings_skips_bindings_without_a_keycode() {
         // A binding whose keysym exists nowhere in the mapping is skipped
-        // (nothing to grab, no error); the other 27 bindings still expand to
-        // their 8 lock variants (27 x 8 = 216). bindings still counts the
-        // CONFIGURED 28 — the stats keep the config-derived count visible
-        // when grabs < 224 (KBR-3, D6). This MUST keep breaking `terminal.key`
+        // (nothing to grab, no error); the other 31 bindings still expand to
+        // their 8 lock variants (31 x 8 = 248). bindings still counts the
+        // CONFIGURED 32 — the stats keep the config-derived count visible
+        // when grabs < 256 (KBR-3, D6). This MUST keep breaking `terminal.key`
         // (unshared): breaking a digit keysym instead would make it shared
-        // with `move-to-workspace-N`, dropping TWO bindings (26 x 8 = 208,
-        // not 216).
+        // with `move-to-workspace-N`, dropping TWO bindings (30 x 8 = 240,
+        // not 248).
         let fake = FakeKeyboardOps::new((8, 67), 2, vec![0u32; 120]);
         let keymap = default_keymap();
         let mut cfg = Config::default();
         cfg.keybindings.terminal.key = 0x9999; // keysym not in the mapping
         let stats = grab_keybindings(&fake, &keymap, ROOT, &cfg).unwrap();
-        assert_eq!(stats.bindings, 28);
-        assert_eq!(stats.grabs, 216);
+        assert_eq!(stats.bindings, 32);
+        assert_eq!(stats.grabs, 248);
         assert_eq!(
             stats.missing,
             vec![("terminal".to_string(), 0x9999)],

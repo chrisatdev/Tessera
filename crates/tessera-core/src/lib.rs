@@ -23,7 +23,7 @@ pub use command::Command;
 pub use config::{BarConfig, BarPosition, Config, GeneralConfig, Keybindings};
 pub use display::{DErr, DisplayServer, FrameId, spawn_program, spawn_program_args};
 pub use event::{Event, KeyCombo};
-pub use geometry::{LayoutKind, Placement, Rect, WindowId, WorkspaceId};
+pub use geometry::{Direction, LayoutKind, Placement, Rect, WindowId, WorkspaceId};
 pub use layout::{Layout, MasterStack};
 pub use theme::{Color, Theme};
 pub use window::{CommandEffect, WindowManager, WindowState};

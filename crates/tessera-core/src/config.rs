@@ -227,6 +227,19 @@ pub struct Keybindings {
     /// `i + 1`, mirroring `workspace` exactly.
     #[serde(default = "default_move_to_workspace")]
     pub move_to_workspace: [KeyCombo; 10],
+    /// Moves focus to the geometrically adjacent window in that direction
+    /// (DF-1, D6/D7/D8); with no candidate this is a silent no-op (DF-2 —
+    /// unlike workspace stepping, it never wraps). Reuses the `h`/`j`/`k`/`l`
+    /// keysyms u1 already made nameable and mapped (D13) — no new keysym, no
+    /// new keycode.
+    #[serde(default = "default_focus_left")]
+    pub focus_left: KeyCombo,
+    #[serde(default = "default_focus_down")]
+    pub focus_down: KeyCombo,
+    #[serde(default = "default_focus_up")]
+    pub focus_up: KeyCombo,
+    #[serde(default = "default_focus_right")]
+    pub focus_right: KeyCombo,
 }
 
 impl Default for Keybindings {
@@ -242,6 +255,10 @@ impl Default for Keybindings {
             workspace_prev: default_workspace_prev(),
             workspace_next: default_workspace_next(),
             move_to_workspace: default_move_to_workspace(),
+            focus_left: default_focus_left(),
+            focus_down: default_focus_down(),
+            focus_up: default_focus_up(),
+            focus_right: default_focus_right(),
         }
     }
 }
@@ -273,6 +290,12 @@ impl Keybindings {
     /// to the terminal binding's lock-variant masks. Workspace names are
     /// GENERATED from the array's own index (D5) via `enumerate`, never a
     /// second parallel list, so they cannot truncate or shift independently.
+    /// `focus_left`/`focus_down`/`focus_up`/`focus_right` (u2,
+    /// tessera-navigation-bindings) are appended as scalars right after
+    /// `workspace_next`, keeping the same "new scalars after the previous
+    /// last scalar" placement u1 used for `workspace_prev`/`workspace_next`
+    /// — `workspace` and `move_to_workspace` still extend last, in that
+    /// order, so `calls[..8]` (the terminal binding) is untouched.
     #[deny(unused_variables)]
     pub fn named_bindings(&self) -> Vec<(String, KeyCombo)> {
         let Keybindings {
@@ -286,6 +309,10 @@ impl Keybindings {
             workspace_prev,
             workspace_next,
             move_to_workspace,
+            focus_left,
+            focus_down,
+            focus_up,
+            focus_right,
         } = self;
         let mut pairs: Vec<(String, KeyCombo)> = vec![
             ("terminal".to_string(), *terminal),
@@ -296,6 +323,10 @@ impl Keybindings {
             ("launcher".to_string(), *launcher),
             ("workspace_prev".to_string(), *workspace_prev),
             ("workspace_next".to_string(), *workspace_next),
+            ("focus_left".to_string(), *focus_left),
+            ("focus_down".to_string(), *focus_down),
+            ("focus_up".to_string(), *focus_up),
+            ("focus_right".to_string(), *focus_right),
         ];
         pairs.extend(
             workspace
@@ -375,6 +406,34 @@ fn default_move_to_workspace() -> [KeyCombo; 10] {
         mods: MOD_SUPER | MOD_SHIFT,
         key: if i == 9 { 0x0030 } else { 0x0031 + i as u32 },
     })
+}
+/// Super+Shift+h/j/k/l (DF-1): reuses the same keysyms as `focus_prev`
+/// (`KEY_K`)/`focus_next` (`KEY_J`) and `workspace_prev`/`workspace_next`
+/// (`KEY_H`/`KEY_L`) — only the modifier mask differs, so u2 needs no new
+/// keysym and no new keycode (D13).
+fn default_focus_left() -> KeyCombo {
+    KeyCombo {
+        mods: MOD_SUPER | MOD_SHIFT,
+        key: KEY_H,
+    }
+}
+fn default_focus_down() -> KeyCombo {
+    KeyCombo {
+        mods: MOD_SUPER | MOD_SHIFT,
+        key: KEY_J,
+    }
+}
+fn default_focus_up() -> KeyCombo {
+    KeyCombo {
+        mods: MOD_SUPER | MOD_SHIFT,
+        key: KEY_K,
+    }
+}
+fn default_focus_right() -> KeyCombo {
+    KeyCombo {
+        mods: MOD_SUPER | MOD_SHIFT,
+        key: KEY_L,
+    }
 }
 
 /// Errors while reading or parsing the configuration file.
@@ -829,13 +888,14 @@ mod tests {
 
     #[test]
     fn named_bindings_pairs_every_field_in_grab_order() {
-        // T-A: the exact 28-name sequence in registry (grab) order (16 base +
-        // 12 new — workspace_prev/next + move_to_workspace, WU1
-        // tessera-navigation-bindings), and each pair's combo equals the field
-        // read through ITS OWN path — never the registry itself. This is the
-        // one test that can catch the D4 grab-order trap: `workspace` is
-        // Keybindings' 5th declared field but must land after toggle_layout,
-        // launcher, workspace_prev and workspace_next here, and
+        // T-A: the exact 32-name sequence in registry (grab) order (16 base +
+        // 12 WU1 [workspace_prev/next + move_to_workspace] + 4 WU2
+        // [focus_left/down/up/right], tessera-navigation-bindings), and each
+        // pair's combo equals the field read through ITS OWN path — never
+        // the registry itself. This is the one test that can catch the D4
+        // grab-order trap: `workspace` is Keybindings' 5th declared field but
+        // must land after toggle_layout, launcher, workspace_prev,
+        // workspace_next and the four focus_* scalars here, and
         // `move_to_workspace` must land LAST of all.
         let k = Keybindings::default();
         let pairs = k.named_bindings();
@@ -848,6 +908,10 @@ mod tests {
             "launcher",
             "workspace_prev",
             "workspace_next",
+            "focus_left",
+            "focus_down",
+            "focus_up",
+            "focus_right",
         ]
         .iter()
         .map(|n| (*n).to_string())
@@ -856,7 +920,7 @@ mod tests {
         .collect();
         let names: Vec<String> = pairs.iter().map(|(n, _)| n.clone()).collect();
         assert_eq!(names, expected_names);
-        assert_eq!(pairs.len(), 28);
+        assert_eq!(pairs.len(), 32);
         assert_eq!(pairs[0], ("terminal".to_string(), k.terminal));
         assert_eq!(pairs[1], ("focus_next".to_string(), k.focus_next));
         assert_eq!(pairs[2], ("focus_prev".to_string(), k.focus_prev));
@@ -865,9 +929,13 @@ mod tests {
         assert_eq!(pairs[5], ("launcher".to_string(), k.launcher));
         assert_eq!(pairs[6], ("workspace_prev".to_string(), k.workspace_prev));
         assert_eq!(pairs[7], ("workspace_next".to_string(), k.workspace_next));
+        assert_eq!(pairs[8], ("focus_left".to_string(), k.focus_left));
+        assert_eq!(pairs[9], ("focus_down".to_string(), k.focus_down));
+        assert_eq!(pairs[10], ("focus_up".to_string(), k.focus_up));
+        assert_eq!(pairs[11], ("focus_right".to_string(), k.focus_right));
         for i in 0..10 {
             assert_eq!(
-                pairs[8 + i],
+                pairs[12 + i],
                 (format!("workspace-{}", i + 1), k.workspace[i]),
                 "workspace-{} must pair with k.workspace[{}], read directly from the field",
                 i + 1,
@@ -876,7 +944,7 @@ mod tests {
         }
         for i in 0..10 {
             assert_eq!(
-                pairs[18 + i],
+                pairs[22 + i],
                 (
                     format!("move-to-workspace-{}", i + 1),
                     k.move_to_workspace[i]
@@ -886,6 +954,21 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[test]
+    fn named_bindings_names_the_directional_focus_bindings() {
+        // D12/D6/D7/D8 (u2, tessera-navigation-bindings): focus_left/down/
+        // up/right are named SCALARS appended right after workspace_next —
+        // the same "append after the previous last scalar" placement u1
+        // used, so `workspace`/`move_to_workspace` keep extending last.
+        let k = Keybindings::default();
+        let pairs = k.named_bindings();
+        assert_eq!(pairs.len(), 32);
+        assert_eq!(pairs[8], ("focus_left".to_string(), k.focus_left));
+        assert_eq!(pairs[9], ("focus_down".to_string(), k.focus_down));
+        assert_eq!(pairs[10], ("focus_up".to_string(), k.focus_up));
+        assert_eq!(pairs[11], ("focus_right".to_string(), k.focus_right));
     }
 
     #[test]
@@ -908,16 +991,17 @@ mod tests {
     fn named_bindings_names_the_workspace_step_and_move_bindings() {
         // D12: workspace_prev/workspace_next are named SCALARS appended after
         // launcher; move_to_workspace is GENERATED via enumerate and extended
-        // LAST (after the workspace extend), so calls[..8] (grab order) still
-        // resolves to the terminal binding (KBR-3 gotcha).
+        // LAST (after the workspace extend, and after u2's focus_* scalars),
+        // so calls[..8] (grab order) still resolves to the terminal binding
+        // (KBR-3 gotcha).
         let k = Keybindings::default();
         let pairs = k.named_bindings();
-        assert_eq!(pairs.len(), 28);
+        assert_eq!(pairs.len(), 32);
         assert_eq!(pairs[6], ("workspace_prev".to_string(), k.workspace_prev));
         assert_eq!(pairs[7], ("workspace_next".to_string(), k.workspace_next));
         for i in 0..10 {
             assert_eq!(
-                pairs[18 + i],
+                pairs[22 + i],
                 (
                     format!("move-to-workspace-{}", i + 1),
                     k.move_to_workspace[i]

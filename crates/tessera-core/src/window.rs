@@ -228,6 +228,13 @@ impl WindowManager {
                     CommandEffect::Ignored
                 }
             }
+            // D8: FocusDirection is resolved and applied entirely in
+            // `App::on_command` — geometry needs `layout`/`area`, neither of
+            // which `WindowManager` owns. This arm is unreachable through
+            // `App`; `Ignored` ("no state changed") is the truthful
+            // fail-safe for any other caller, where `Unsupported` would
+            // wrongly claim "not wired to any behavior yet".
+            Command::FocusDirection(_) => CommandEffect::Ignored,
         }
     }
 

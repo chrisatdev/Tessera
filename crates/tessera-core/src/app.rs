@@ -23,7 +23,7 @@ use crate::command::Command;
 use crate::config::Config;
 use crate::display::{DErr, DisplayServer, FrameId};
 use crate::event::{Event, KeyCombo};
-use crate::geometry::{Rect, WindowId, WorkspaceId};
+use crate::geometry::{Direction, Rect, WindowId, WorkspaceId, resolve_direction};
 use crate::layout::{Layout, MasterStack};
 use crate::theme::Theme;
 use crate::window::{CommandEffect, WindowManager, WindowState};
@@ -201,6 +201,14 @@ impl App {
     /// display; display-layer effects (U3-A's [`CommandEffect`]) are routed to
     /// the seam (Spawn -> `spawn`, Close -> `destroy_frame`, ...).
     fn on_command(&mut self, cmd: Command) -> Result<(), DErr> {
+        // D8: `FocusDirection` is the only command needing geometry.
+        // `Placement`s exist transiently inside `recompute`, and
+        // `WindowManager` has neither `layout` nor `area` — threading them
+        // through `apply_command` would pollute the pure core's signature
+        // for one command, so it is intercepted here instead.
+        if let Command::FocusDirection(dir) = cmd {
+            return self.focus_direction(dir);
+        }
         match self.wm.apply_command(cmd) {
             CommandEffect::Applied => self.recompute(),
             CommandEffect::Ignored | CommandEffect::Unsupported => Ok(()),
@@ -214,6 +222,28 @@ impl App {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// Resolves and applies a directional focus move (DF-1, D8): computes
+    /// placements the SAME way `recompute` would (same `arrange` call, same
+    /// focus index), resolves the pure geometry through
+    /// [`resolve_direction`], then moves focus WITHOUT reordering the MRU
+    /// ring (`WorkspaceManager::focus_window`) and re-tiles. With no
+    /// focused window, or no candidate in `dir` (DF-2), this is a silent
+    /// no-op — focus, placements and the workspace stay exactly as they
+    /// were; NO wrap, unlike workspace stepping (a plane has no defined
+    /// "next" window the way a ring has a defined successor).
+    fn focus_direction(&mut self, dir: Direction) -> Result<(), DErr> {
+        let Some(focused) = self.wm.focused_window() else {
+            return Ok(());
+        };
+        let windows = self.wm.visible_windows();
+        let focus_idx = windows.iter().position(|&w| w == focused).unwrap_or(0);
+        let placements = self.layout.arrange(&windows, self.area, focus_idx);
+        match resolve_direction(&placements, focused, dir) {
+            Some(target) if self.wm.focus_window(target) => self.recompute(),
+            _ => Ok(()), // DF-2: no candidate -> focus/placements/workspace unchanged
         }
     }
 
@@ -335,6 +365,18 @@ pub fn command_for_key(cfg: &Config, combo: KeyCombo) -> Option<Command> {
     }
     if combo == k.workspace_prev {
         return Some(Command::CycleWorkspace(-1));
+    }
+    if combo == k.focus_left {
+        return Some(Command::FocusDirection(Direction::Left));
+    }
+    if combo == k.focus_down {
+        return Some(Command::FocusDirection(Direction::Down));
+    }
+    if combo == k.focus_up {
+        return Some(Command::FocusDirection(Direction::Up));
+    }
+    if combo == k.focus_right {
+        return Some(Command::FocusDirection(Direction::Right));
     }
     for (i, bound) in k.workspace.iter().enumerate() {
         if *bound == combo {
@@ -915,6 +957,80 @@ mod tests {
         assert_eq!(
             command_for_key(&cfg, k.move_to_workspace[9]),
             Some(Command::MoveToWorkspace(10))
+        );
+    }
+
+    // === Directional focus — WU2 (tessera-navigation-bindings) ===
+
+    #[test]
+    fn focus_direction_moves_focus_and_recomputes() {
+        // D8: FocusDirection resolves through the SAME layout arrange() call
+        // recompute uses, moves focus without reordering the MRU ring, and
+        // triggers exactly one recompute pass. Window 2 is mapped first,
+        // then window 1 (attach-order MRU-first), so window 1 ends up
+        // master — matching the spec's "w1 x[2,398]..., w2 x[402,798]..."
+        // 2-window golden. FocusDirection(Right) from the master reaches the
+        // stack window (spec scenario "Right, single unambiguous candidate").
+        let (mut app, log) = app_with(
+            vec![
+                Event::WindowMapRequested(2),
+                Event::WindowMapRequested(1),
+                Event::Command(Command::FocusDirection(Direction::Right)),
+            ],
+            Config::default(),
+        );
+        app.run();
+        assert_eq!(app.wm().focused_window(), Some(2));
+        assert_eq!(calls(&log).last(), Some(&DisplayCall::Focus(2)));
+    }
+
+    #[test]
+    fn focus_direction_without_a_candidate_changes_nothing() {
+        // DF-2: no candidate in `dir` is a no-op — focus, placements and the
+        // workspace stay exactly as they were, and the command must NOT
+        // trigger a second recompute (no extra Configure/Focus calls beyond
+        // the initial map).
+        let (mut app, log) = app_with(
+            vec![
+                Event::WindowMapRequested(1),
+                Event::Command(Command::FocusDirection(Direction::Right)),
+            ],
+            Config::default(),
+        );
+        app.run();
+        assert_eq!(app.wm().focused_window(), Some(1));
+        assert_eq!(
+            calls(&log),
+            vec![
+                DisplayCall::Manage(1),
+                DisplayCall::Map(1),
+                DisplayCall::Configure(1, SOLO),
+                DisplayCall::Focus(1),
+            ],
+            "a directional focus with no candidate must not trigger a second recompute"
+        );
+    }
+
+    #[test]
+    fn command_for_key_maps_the_directional_focus_bindings() {
+        // D7: Super+Shift+{h,j,k,l} resolve to FocusDirection(Left/Down/Up/Right).
+        let cfg = Config::default();
+        let k = &cfg.keybindings;
+        assert_eq!(
+            command_for_key(&cfg, k.focus_left),
+            Some(Command::FocusDirection(Direction::Left))
+        );
+        assert_eq!(
+            command_for_key(&cfg, k.focus_down),
+            Some(Command::FocusDirection(Direction::Down))
+        );
+        assert_eq!(
+            command_for_key(&cfg, k.focus_up),
+            Some(Command::FocusDirection(Direction::Up))
+        );
+        assert_eq!(
+            command_for_key(&cfg, k.focus_right),
+            Some(Command::FocusDirection(Direction::Right))
         );
     }
 

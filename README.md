@@ -220,14 +220,33 @@ Keybindings (configurable):
 |---|---|
 | Super+Enter | spawn terminal |
 | Ctrl+Space | spawn launcher (`[general] launcher`) |
-| Super+J / Super+K | focus next / previous |
+| Super+J / Super+K | focus next / previous (MRU ring, wraps) |
 | Super+Q | close focused |
 | Super+1..9, Super+0 | switch to workspace 1..10 |
 | Super+Space | toggle layout |
+| Super+H / Super+L | step to the previous / next workspace, by numeric id, wraps |
+| Super+Shift+1..9, Super+Shift+0 | send focused window to workspace 1..10, without following it |
+| Super+Shift+H/J/K/L | move focus to the window left/down/up/right of the focused one, **does not wrap** |
 
 CapsLock, NumLock and ScrollLock states do not affect bindings: pressing a
 key with any lock modifier on still triggers its base binding (the WM
 matches the lock-variant grab and strips the lock bits before lookup).
+
+**Directional focus does not wrap, unlike everything else above.** The
+`Super+J`/`Super+K` MRU ring and the `Super+H`/`Super+L` workspace ring both
+wrap at their ends — a ring always has a well-defined "next" element, even at
+the boundary. Directional focus (`Super+Shift+H/J/K/L`) resolves against
+real on-screen geometry instead: it moves focus to whichever window's
+placement is nearest in that direction, and with no candidate at all it is a
+silent no-op. Window space is a plane, not a ring — there is no well-defined
+"next window to the right" once nothing is there, so inventing one would
+teleport focus across the screen. This is deliberate, not a bug, but it
+reads like one the first time: **from a full-height master window,
+`Super+Shift+J` and `Super+Shift+K` do nothing**, because with the default
+master-stack layout the stack sits to the *right* of the master, not below
+it — there is nothing above or below to focus. `Super+Shift+H`/`Super+Shift+L`
+(left/right) work as expected from the master. Discoverable beats
+surprising, hence this note.
 
 SIGHUP reloads the config; a bad file is rejected and the running config is
 kept.
