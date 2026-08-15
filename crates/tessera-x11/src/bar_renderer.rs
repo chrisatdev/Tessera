@@ -39,8 +39,12 @@ pub(crate) const DEFAULT_SIDE_THICKNESS: u16 = 6;
 const GLYPH_HEIGHT: i16 = 13;
 /// Advance width of one `fixed` glyph.
 const GLYPH_WIDTH: i16 = 8;
-/// Extra per-glyph padding the focused tag gets so its slot is visibly wider.
-const FOCUSED_EXTRA_PADDING: i16 = 1;
+/// Horizontal padding on EACH side of a tag's glyphs (D3 legibility): without
+/// it a one-character tag owns an 8px slot and the next tag starts at pixel 9,
+/// so the numbers butt against each other with no visible separation. It is
+/// deliberately focus-independent — a focused tag that is wider than its
+/// unfocused self shifts the whole strip sideways every time focus moves.
+const TAG_PADDING_X: i16 = 6;
 
 /// Position + thickness resolved into the rectangle the bar occupies.
 pub(crate) type BarGeometry = Rect;
@@ -439,10 +443,14 @@ impl<B: BarOps> BarRenderer<B> {
         })
     }
 
-    /// Paints the current tag strip: one slot per workspace, the focused tag
-    /// in the bar's own colors and every other tag inverted (D3). A font miss
-    /// (D7) renders slots as filled rectangles without text; an invisible bar
-    /// or an empty snapshot issues no X calls at all.
+    /// Paints the current tag strip: one slot per workspace, each glyph run
+    /// padded by [`TAG_PADDING_X`] per side so adjacent tags stay visibly
+    /// separated (D3). The focused tag is the highlighted one — filled with
+    /// the theme accent (the same colour the focused window border uses) and
+    /// its glyph drawn in the bar background; every other tag is plain bar
+    /// background with foreground text. A font miss (D7) renders slots as
+    /// filled rectangles without text; an invisible bar or an empty snapshot
+    /// issues no X calls at all.
     pub fn draw(&self, state: &WmState) -> Result<(), DErr> {
         if !self.config.visible || state.workspaces.is_empty() {
             return Ok(());
@@ -450,29 +458,43 @@ impl<B: BarOps> BarRenderer<B> {
         let focused = focused_tag_index(state);
         let fg = pixel(self.config.fg_color);
         let bg = pixel(self.config.bg_color);
+        // D3: the accent already marks the focused frame's border; reusing it
+        // here makes "where am I" one colour across the whole WM.
+        let accent = pixel(state.theme.active_border());
         let mut cursor: i16 = 0;
         for (i, ws) in state.workspaces.iter().enumerate() {
             let is_focused = focused == Some(i);
             let len = ws.name.len() as i16;
-            let glyph_w = (GLYPH_WIDTH + if is_focused { FOCUSED_EXTRA_PADDING } else { 0 }) * len;
+            let glyph_w = GLYPH_WIDTH * len;
+            // Slot width depends ONLY on the tag name's length, so focus
+            // moving never shifts any slot's width or x position.
             let slot = Rectangle {
                 x: cursor,
                 y: 0,
-                width: glyph_w as u16,
+                width: (glyph_w + 2 * TAG_PADDING_X) as u16,
                 height: self.geom.h,
             };
-            cursor += glyph_w;
-            // The focused tag inverts the palette; every other tag matches it.
-            let (fill, glyph) = if is_focused { (bg, fg) } else { (fg, bg) };
+            cursor += slot.width as i16;
+            // The focused tag is highlighted; every other tag is plain bar
+            // background so only ONE block ever stands out.
+            let (fill, glyph) = if is_focused { (accent, bg) } else { (bg, fg) };
             self.ops
                 .change_gc(self.gc, &ChangeGCAux::default().foreground(fill))?;
             self.ops.poly_fill_rectangle(self.win, self.gc, &[slot])?;
             if let Some(font) = self.font {
                 let text_x = slot.x + (slot.width as i16 - glyph_w) / 2;
                 let text_y = (self.geom.h as i32 + GLYPH_HEIGHT as i32) / 2;
+                // `image_text8` paints the glyph's bounding box with the GC's
+                // BACKGROUND (unlike `poly_text8`, which touches only the
+                // glyph). Leaving it unset drew every number inside a black
+                // box that did not match the tag it sat on, so the background
+                // must track the slot's own fill.
                 self.ops.change_gc(
                     self.gc,
-                    &ChangeGCAux::default().foreground(glyph).font(font),
+                    &ChangeGCAux::default()
+                        .foreground(glyph)
+                        .background(fill)
+                        .font(font),
                 )?;
                 self.ops.image_text8(
                     self.win,
@@ -526,6 +548,13 @@ mod tests {
     const BG_PIXEL: u32 = 0x0022_2222;
     /// `#eeeeee` (default `bar.fg_color`) packed into the low 24 bits.
     const FG_PIXEL: u32 = 0x00EE_EEEE;
+    /// `#ff8f40` (ayu_dark accent = `Theme::default().active_border()`, the
+    /// focused frame border colour) packed into the low 24 bits.
+    const ACCENT_PIXEL: u32 = 0x00FF_8F40;
+    /// Slot width of a 3-glyph tag: `3 * GLYPH_WIDTH + 2 * TAG_PADDING_X`.
+    const SLOT_3: u16 = 36;
+    /// Slot width of a 5-glyph tag: `5 * GLYPH_WIDTH + 2 * TAG_PADDING_X`.
+    const SLOT_5: u16 = 52;
 
     fn monitor() -> Rect {
         Rect {
@@ -608,6 +637,10 @@ mod tests {
         },
         ChangeGc {
             foreground: Option<u32>,
+            /// Recorded because `image_text8` paints the glyph box with the
+            /// GC's BACKGROUND: leaving this unrecorded is what let a black
+            /// box behind every tag glyph go unnoticed by the whole suite.
+            background: Option<u32>,
             font: Option<Fontable>,
         },
         PolyFillRectangle {
@@ -736,6 +769,7 @@ mod tests {
         fn change_gc(&self, gc: Gcontext, aux: &ChangeGCAux) -> Result<(), DErr> {
             self.calls.borrow_mut().push(BarCall::ChangeGc {
                 foreground: aux.foreground,
+                background: aux.background,
                 font: aux.font,
             });
             let _ = gc;
@@ -992,7 +1026,12 @@ mod tests {
     }
 
     #[test]
-    fn draw_paints_focused_tag_with_bar_colors_and_others_inverted() {
+    fn draw_highlights_the_focused_tag_and_leaves_the_others_on_the_bar_background() {
+        // D3 legibility: exactly ONE tag stands out — the focused one, filled
+        // with the theme accent and lettered in the bar background. Every
+        // other tag is plain bar background with foreground text (before this
+        // change the fill/glyph pair was inverted, so every workspace the
+        // user was NOT on rendered as a glaring solid block).
         let renderer = BarRenderer::new(
             FakeBarOps::new(Some(FONT_ID)),
             ROOT,
@@ -1008,9 +1047,10 @@ mod tests {
         assert_eq!(
             &renderer.ops.calls()[before..],
             &vec![
-                // focused tag "one": bar colors, its own (wider) slot
+                // focused tag "one": accent fill, bar-background glyphs
                 BarCall::ChangeGc {
-                    foreground: Some(BG_PIXEL),
+                    foreground: Some(ACCENT_PIXEL),
+                    background: None,
                     font: None
                 },
                 BarCall::PolyFillRectangle {
@@ -1019,70 +1059,75 @@ mod tests {
                     rectangles: vec![TestRect {
                         x: 0,
                         y: 0,
-                        width: 27,
+                        width: SLOT_3,
                         height: 22
                     }],
                 },
                 BarCall::ChangeGc {
-                    foreground: Some(FG_PIXEL),
+                    foreground: Some(BG_PIXEL),
+                    background: Some(ACCENT_PIXEL),
                     font: Some(FONT_ID)
                 },
                 BarCall::ImageText8 {
                     drawable: WIN,
                     gc: GC,
-                    x: 0,
+                    x: 6,
                     y: 17,
                     string: b"one".to_vec()
                 },
-                // unfocused tag "two": inverted colors
+                // unfocused tag "two": bar background, foreground glyphs
                 BarCall::ChangeGc {
-                    foreground: Some(FG_PIXEL),
+                    foreground: Some(BG_PIXEL),
+                    background: None,
                     font: None
                 },
                 BarCall::PolyFillRectangle {
                     drawable: WIN,
                     gc: GC,
                     rectangles: vec![TestRect {
-                        x: 27,
+                        x: 36,
                         y: 0,
-                        width: 24,
+                        width: SLOT_3,
                         height: 22
                     }],
                 },
                 BarCall::ChangeGc {
-                    foreground: Some(BG_PIXEL),
+                    foreground: Some(FG_PIXEL),
+                    background: Some(BG_PIXEL),
                     font: Some(FONT_ID)
                 },
                 BarCall::ImageText8 {
                     drawable: WIN,
                     gc: GC,
-                    x: 27,
+                    x: 42,
                     y: 17,
                     string: b"two".to_vec()
                 },
-                // unfocused tag "three": inverted colors
+                // unfocused tag "three": bar background, foreground glyphs
                 BarCall::ChangeGc {
-                    foreground: Some(FG_PIXEL),
+                    foreground: Some(BG_PIXEL),
+                    background: None,
                     font: None
                 },
                 BarCall::PolyFillRectangle {
                     drawable: WIN,
                     gc: GC,
                     rectangles: vec![TestRect {
-                        x: 51,
+                        x: 72,
                         y: 0,
-                        width: 40,
+                        width: SLOT_5,
                         height: 22
                     }],
                 },
                 BarCall::ChangeGc {
-                    foreground: Some(BG_PIXEL),
+                    foreground: Some(FG_PIXEL),
+                    background: Some(BG_PIXEL),
                     font: Some(FONT_ID)
                 },
                 BarCall::ImageText8 {
                     drawable: WIN,
                     gc: GC,
-                    x: 51,
+                    x: 78,
                     y: 17,
                     string: b"three".to_vec(),
                 },
@@ -1109,7 +1154,8 @@ mod tests {
             &renderer.ops.calls()[before..],
             &vec![
                 BarCall::ChangeGc {
-                    foreground: Some(BG_PIXEL),
+                    foreground: Some(ACCENT_PIXEL),
+                    background: None,
                     font: None
                 },
                 BarCall::PolyFillRectangle {
@@ -1118,21 +1164,22 @@ mod tests {
                     rectangles: vec![TestRect {
                         x: 0,
                         y: 0,
-                        width: 27,
+                        width: SLOT_3,
                         height: 22
                     }],
                 },
                 BarCall::ChangeGc {
-                    foreground: Some(FG_PIXEL),
+                    foreground: Some(BG_PIXEL),
+                    background: None,
                     font: None
                 },
                 BarCall::PolyFillRectangle {
                     drawable: WIN,
                     gc: GC,
                     rectangles: vec![TestRect {
-                        x: 27,
+                        x: 36,
                         y: 0,
-                        width: 24,
+                        width: SLOT_3,
                         height: 22
                     }],
                 },
@@ -1214,7 +1261,8 @@ mod tests {
             &renderer.ops.calls()[before..],
             &vec![
                 BarCall::ChangeGc {
-                    foreground: Some(BG_PIXEL),
+                    foreground: Some(ACCENT_PIXEL),
+                    background: None,
                     font: None
                 },
                 BarCall::PolyFillRectangle {
@@ -1223,45 +1271,206 @@ mod tests {
                     rectangles: vec![TestRect {
                         x: 0,
                         y: 0,
-                        width: 27,
+                        width: SLOT_3,
                         height: 22
                     }],
                 },
                 BarCall::ChangeGc {
-                    foreground: Some(FG_PIXEL),
+                    foreground: Some(BG_PIXEL),
+                    background: Some(ACCENT_PIXEL),
                     font: Some(FONT_ID)
                 },
                 BarCall::ImageText8 {
                     drawable: WIN,
                     gc: GC,
-                    x: 0,
+                    x: 6,
                     y: 17,
                     string: b"one".to_vec()
                 },
                 BarCall::ChangeGc {
-                    foreground: Some(FG_PIXEL),
+                    foreground: Some(BG_PIXEL),
+                    background: None,
                     font: None
                 },
                 BarCall::PolyFillRectangle {
                     drawable: WIN,
                     gc: GC,
                     rectangles: vec![TestRect {
-                        x: 27,
+                        x: 36,
                         y: 0,
-                        width: 24,
+                        width: SLOT_3,
                         height: 22
                     }],
                 },
                 BarCall::ChangeGc {
-                    foreground: Some(BG_PIXEL),
+                    foreground: Some(FG_PIXEL),
+                    background: Some(BG_PIXEL),
                     font: Some(FONT_ID)
                 },
                 BarCall::ImageText8 {
                     drawable: WIN,
                     gc: GC,
-                    x: 27,
+                    x: 42,
                     y: 17,
                     string: b"two".to_vec()
+                },
+                BarCall::Flush,
+            ]
+        );
+    }
+
+    /// One tag's painted geometry: its slot rectangle and the `x` of the text
+    /// call that followed it. Lets the padding/centring tests assert on
+    /// geometry alone, without restating the whole call sequence.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TagBox {
+        slot: TestRect,
+        text_x: Option<i16>,
+    }
+
+    /// Every tag `draw` painted in `calls`, in strip order.
+    fn tag_boxes(calls: &[BarCall]) -> Vec<TagBox> {
+        let mut out: Vec<TagBox> = Vec::new();
+        for call in calls {
+            match call {
+                BarCall::PolyFillRectangle { rectangles, .. } if rectangles.len() == 1 => {
+                    out.push(TagBox {
+                        slot: rectangles[0],
+                        text_x: None,
+                    });
+                }
+                BarCall::ImageText8 { x, .. } => {
+                    if let Some(last) = out.last_mut() {
+                        last.text_x = Some(*x);
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn drawn_tag_boxes(renderer: &BarRenderer<FakeBarOps>, state: &WmState) -> Vec<TagBox> {
+        let before = renderer.ops.calls().len();
+        renderer.draw(state).unwrap();
+        tag_boxes(&renderer.ops.calls()[before..])
+    }
+
+    fn top_bar_renderer() -> BarRenderer<FakeBarOps> {
+        BarRenderer::new(
+            FakeBarOps::new(Some(FONT_ID)),
+            ROOT,
+            DEPTH,
+            VISUAL,
+            monitor(),
+            &config(BarPosition::Top, None),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn draw_pads_every_tag_so_adjacent_tags_stay_separated() {
+        // D3 legibility: a slot is `name.len() * GLYPH_WIDTH + 2 *
+        // TAG_PADDING_X` wide and the next one starts exactly one slot width
+        // later, so consecutive tags never butt against each other. Before
+        // this change a one-character tag owned an 8px slot and its
+        // neighbour started at pixel 9. The glyphs sit centred inside their
+        // slot (one padding in from each edge).
+        let renderer = top_bar_renderer();
+        let boxes = drawn_tag_boxes(&renderer, &state(&["1", "22", "333"]));
+
+        let widths: Vec<u16> = boxes.iter().map(|b| b.slot.width).collect();
+        let expected_widths: Vec<u16> = ["1", "22", "333"]
+            .iter()
+            .map(|name| name.len() as u16 * GLYPH_WIDTH as u16 + 2 * TAG_PADDING_X as u16)
+            .collect();
+        assert_eq!(
+            widths, expected_widths,
+            "slot width must be the glyph run plus one padding per side"
+        );
+        // Consecutive slots start exactly one slot width apart: no overlap,
+        // no gap, and every tag carries its own visible breathing room.
+        let mut expected_x: i16 = 0;
+        for b in &boxes {
+            assert_eq!(b.slot.x, expected_x, "slots must tile the strip end to end");
+            // The centring expression is real work now: the glyph run is
+            // inset by exactly one padding from the slot's left edge.
+            let glyph_w = b.slot.width as i16 - 2 * TAG_PADDING_X;
+            assert_eq!(
+                b.text_x,
+                Some(b.slot.x + (b.slot.width as i16 - glyph_w) / 2),
+                "glyphs must be horizontally centred inside their slot"
+            );
+            assert_eq!(b.text_x, Some(b.slot.x + TAG_PADDING_X));
+            expected_x += b.slot.width as i16;
+        }
+    }
+
+    #[test]
+    fn moving_focus_never_shifts_a_slot_width_or_position() {
+        // The removed `FOCUSED_EXTRA_PADDING` made the focused tag one pixel
+        // per glyph wider, so the whole strip slid sideways every time focus
+        // moved. Slot geometry now depends ONLY on the tag names: the two
+        // draws below differ in `current` alone and must agree exactly.
+        let renderer = top_bar_renderer();
+        let mut first = state(&["one", "two", "three"]);
+        first.current = 1;
+        let mut second = state(&["one", "two", "three"]);
+        second.current = 3;
+
+        let with_first_focused: Vec<TestRect> = drawn_tag_boxes(&renderer, &first)
+            .into_iter()
+            .map(|b| b.slot)
+            .collect();
+        let with_third_focused: Vec<TestRect> = drawn_tag_boxes(&renderer, &second)
+            .into_iter()
+            .map(|b| b.slot)
+            .collect();
+
+        assert_eq!(
+            with_first_focused, with_third_focused,
+            "moving focus must not change any slot's width or x position"
+        );
+    }
+
+    #[test]
+    fn draw_paints_the_single_startup_workspace_as_the_focused_tag() {
+        // Startup legibility: `App::new` now opens workspace 1, so the very
+        // first snapshot the bar receives carries exactly one workspace and
+        // `current` matching it — it must render as the highlighted tag
+        // (accent fill, bar-background glyph), not as an unfocused block.
+        let renderer = top_bar_renderer();
+        let before = renderer.ops.calls().len();
+        renderer.draw(&state(&["1"])).unwrap();
+        assert_eq!(
+            &renderer.ops.calls()[before..],
+            &vec![
+                BarCall::ChangeGc {
+                    foreground: Some(ACCENT_PIXEL),
+                    background: None,
+                    font: None
+                },
+                BarCall::PolyFillRectangle {
+                    drawable: WIN,
+                    gc: GC,
+                    rectangles: vec![TestRect {
+                        x: 0,
+                        y: 0,
+                        width: 20, // 1 glyph + 6px padding per side
+                        height: 22
+                    }],
+                },
+                BarCall::ChangeGc {
+                    foreground: Some(BG_PIXEL),
+                    background: Some(ACCENT_PIXEL),
+                    font: Some(FONT_ID)
+                },
+                BarCall::ImageText8 {
+                    drawable: WIN,
+                    gc: GC,
+                    x: 6,
+                    y: 17,
+                    string: b"1".to_vec()
                 },
                 BarCall::Flush,
             ]

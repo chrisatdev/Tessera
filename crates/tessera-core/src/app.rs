@@ -7,13 +7,22 @@
 //! snapshot. [`WindowManager`] (U3-A) owns the pure lifecycle; the display
 //! seam owns every side effect (REQ-x11-003/005/006, SC-x11-05/07/08/09).
 //!
-//! # WmState sentinel convention (reconciled in T12)
+//! # WmState sentinel convention (reconciled in T12, narrowed here)
 //!
 //! A current workspace id of `0` means "no workspace yet" — the same
 //! convention as [`WorkspaceManager::current_id`]. The watch's initial
-//! snapshot published by [`EventBus::new`] agrees (U1 shipped `current: 1`
-//! as a placeholder; T12 aligned it with the manager's real sentinel). Once
-//! the first window auto-opens a workspace, both report the real id (>= 1).
+//! snapshot seeded by [`EventBus::new`] still carries that sentinel (U1
+//! shipped `current: 1` as a placeholder; T12 aligned it with the manager's
+//! real sentinel), but [`App::new`] now replaces it immediately: it opens
+//! workspace 1 during construction and publishes the resulting snapshot, so
+//! every consumer of an `App`-driven watch sees `current == 1` and one
+//! workspace from the start.
+//!
+//! The sentinel is therefore only ever observable on a bare `EventBus` that
+//! no `App` has published to. It exists so a state consumer that DOES draw
+//! the workspace strip (the bar) has something real to paint before the
+//! first client attaches, instead of an empty bar until the first window
+//! maps.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,7 +62,17 @@ pub struct App {
 
 impl App {
     /// Creates an app driving `display` over `area`, publishing on a fresh
-    /// bus seeded with `config` and the resolved `theme` (D4 seam).
+    /// bus seeded with `config` and the resolved `theme` (D4 seam), with
+    /// workspace 1 already open.
+    ///
+    /// Opening workspace 1 here (rather than waiting for the first client to
+    /// auto-open one through `WorkspaceManager::attach`) is what makes the
+    /// workspace strip visible at startup: a state consumer that draws the
+    /// snapshot has one real workspace to paint instead of the empty list
+    /// that `EventBus::new` seeds. `publish_state` runs right after, so the
+    /// watch reflects it before any event is handled — a consumer reading
+    /// `state_rx().borrow()` immediately after construction already sees
+    /// `current == 1`.
     pub fn new(
         display: Box<dyn DisplayServer>,
         config: Arc<Config>,
@@ -63,7 +82,7 @@ impl App {
         let bus = Arc::new(EventBus::new(Arc::clone(&config), Arc::clone(&theme)));
         let wm = WindowManager::new(Arc::clone(&bus));
         let layout = layout_for(&config);
-        App {
+        let mut app = App {
             bus,
             wm,
             display,
@@ -74,7 +93,13 @@ impl App {
             frames: HashMap::new(),
             mapped: Vec::new(),
             on_recompute: None,
-        }
+        };
+        // The first workspace becomes current (REQ-ws-001), so this replaces
+        // the bus's `0` sentinel with the real id 1. `WorkspaceOpened(1)` is
+        // published here, BEFORE any caller can subscribe.
+        app.wm.open();
+        app.publish_state();
+        app
     }
 
     /// The event bus; subscribe before [`App::run`] to observe the stream.
@@ -99,7 +124,16 @@ impl App {
     /// Runs the loop until the display reports no more events, a `Shutdown`
     /// event arrives, or the connection dies (logged and stopped). Display
     /// failures are logged; the loop keeps running (T13).
+    ///
+    /// The `on_recompute` hook fires ONCE before the first event is read, so
+    /// a consumer that draws on the hook paints the startup snapshot
+    /// (workspace 1, opened by [`App::new`]) instead of waiting for the
+    /// first window to map. Inside the loop the D4 contract is unchanged:
+    /// the hook fires once per recompute and never on idle event polling.
     pub fn run(&mut self) {
+        if let Some(cb) = self.on_recompute.as_mut() {
+            cb();
+        }
         loop {
             match self.display.next_event() {
                 Ok(Some(ev)) => {
@@ -629,8 +663,9 @@ mod tests {
         assert_eq!(
             drain(&rx),
             vec![
+                // `WorkspaceOpened(1)` is NOT here: `App::new` opens
+                // workspace 1 during construction, before `subscribe_all`.
                 Event::WindowMapRequested(1),
-                Event::WorkspaceOpened(1),
                 Event::WindowManaged(1),
                 Event::PlacementsChanged(
                     1,
@@ -649,7 +684,10 @@ mod tests {
         // D4 hook (bar drawing, design D4 / task 2.6): the binary redraws the
         // bar exactly once per recompute — never on idle event polling. A
         // MapRequest triggers one recompute; a following UnmapNotify does NOT
-        // (its handler never re-tiles), so the hook must fire exactly once.
+        // (its handler never re-tiles). `run` also fires the hook once up
+        // front so the startup snapshot is painted, so the total is two: the
+        // initial fire plus the one recompute, and the idle UnmapNotify adds
+        // nothing.
         let (mut app, _log) = app_with(
             vec![Event::WindowMapRequested(1), Event::WindowUnmapNotify(1)],
             Config::default(),
@@ -660,8 +698,56 @@ mod tests {
         app.run();
         assert_eq!(
             *fires.lock().unwrap(),
-            1,
-            "the hook must fire once per recompute, never on idle events"
+            2,
+            "one startup fire plus one per recompute, never on idle events"
+        );
+    }
+
+    #[test]
+    fn recompute_hook_fires_at_startup_before_any_event() {
+        // Startup visibility: a consumer that draws on the hook must paint
+        // the initial state instead of waiting for the first window. The
+        // script is EMPTY, so the only possible fire is the one `run` issues
+        // before entering the loop — and the snapshot it can read already
+        // carries workspace 1.
+        let (mut app, _log) = app_with(Vec::new(), Config::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let hook = Arc::clone(&seen);
+        let rx = app.bus().state_rx();
+        app.set_on_recompute(Box::new(move || {
+            hook.lock().unwrap().push(rx.borrow().current);
+        }));
+        app.run();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![1],
+            "the hook fires exactly once at startup, on a snapshot already \
+             carrying workspace 1"
+        );
+    }
+
+    #[test]
+    fn new_opens_workspace_one_and_publishes_it_before_any_event() {
+        // Startup visibility at the source: the bar's early return on an
+        // empty workspace list is correct, so the core must not hand it an
+        // empty snapshot. `App::new` opens workspace 1 and publishes, so
+        // both the manager and the watch report it before `run` is ever
+        // called.
+        let (mut app, _log) = app_with(Vec::new(), Config::default());
+        let state_rx = app.bus().state_rx();
+        assert_eq!(app.wm().current_id(), 1);
+        let s = state_rx.borrow();
+        assert_eq!(s.current, 1);
+        assert_eq!(
+            s.workspaces,
+            vec![WorkspaceState {
+                id: 1,
+                name: "1".to_string(),
+                layout: LayoutKind::MasterStack,
+                windows: Vec::new(),
+                focus: None,
+            }],
+            "exactly one workspace, empty, before any window maps"
         );
     }
 
@@ -681,14 +767,25 @@ mod tests {
     }
 
     #[test]
-    fn watch_starts_at_no_workspace_and_snapshots_lifecycle() {
-        // REQ-bus-004 at the loop level, plus the reconciled sentinel: the
-        // initial snapshot reports current 0 ("no workspace yet", matching
-        // WorkspaceManager), and after the first window a complete snapshot
-        // is published.
+    fn bus_seeds_the_no_workspace_sentinel_before_an_app_publishes() {
+        // The `0` = "no workspace yet" sentinel still exists exactly where
+        // T12 put it — on the bare bus. It is just no longer observable
+        // through an `App`, which replaces it during construction (see
+        // `watch_starts_at_workspace_one_and_snapshots_lifecycle`).
+        let bus = EventBus::new(Arc::new(Config::default()), Arc::new(Theme::default()));
+        assert_eq!(bus.state_rx().borrow().current, 0);
+        assert!(bus.state_rx().borrow().workspaces.is_empty());
+    }
+
+    #[test]
+    fn watch_starts_at_workspace_one_and_snapshots_lifecycle() {
+        // REQ-bus-004 at the loop level: the initial snapshot already
+        // reports workspace 1 (opened by `App::new`, replacing the bus's `0`
+        // sentinel), and after the first window a complete snapshot is
+        // published.
         let (mut app, _log) = app_with(vec![Event::WindowMapRequested(1)], Config::default());
         let state_rx = app.bus().state_rx();
-        assert_eq!(state_rx.borrow().current, 0); // sentinel, reconciled in T12
+        assert_eq!(state_rx.borrow().current, 1);
         app.run();
         let s = state_rx.borrow();
         assert_eq!(s.current, 1);
@@ -747,8 +844,9 @@ mod tests {
         // SC-x11-08 seam: a client mapping while workspace B is focused
         // attaches to B, not the workspace it visually appears on.
         let (mut app, log) = app_with(vec![Event::WindowMapRequested(9)], Config::default());
-        app.wm().open(); // workspace 1
-        let b = app.wm().open(); // workspace 2
+        // `App::new` already opened workspace 1; this adds workspace 2.
+        let b = app.wm().open();
+        assert_eq!(b, 2);
         assert!(app.wm().switch(b));
         app.run();
         assert_eq!(app.wm().workspace(b).unwrap().windows, vec![9]);
@@ -782,8 +880,9 @@ mod tests {
             ],
             Config::default(),
         );
-        app.wm().open();
+        // `App::new` already opened workspace 1; this adds workspace 2.
         let b = app.wm().open();
+        assert_eq!(b, 2);
         app.wm().switch(b);
         app.run();
         assert_eq!(
@@ -860,8 +959,8 @@ mod tests {
         assert_eq!(
             drain(&rx),
             vec![
+                // `WorkspaceOpened(1)` fired in `App::new`, before subscribe.
                 Event::WindowMapRequested(1),
-                Event::WorkspaceOpened(1),
                 Event::WindowManaged(1),
                 Event::PlacementsChanged(
                     1,
@@ -1287,8 +1386,14 @@ mod tests {
                 DisplayCall::Spawn(vec!["tessera-no-such-program-xyz".to_string()]),
             ]
         );
-        // Binding inert: no workspace was ever opened, no window managed.
-        assert_eq!(app.wm().current_id(), 0);
+        // Binding inert: the startup workspace is still the only one and it
+        // is still empty — the failed launcher changed no WM state.
+        assert_eq!(app.wm().current_id(), 1);
+        assert_eq!(app.wm().state_snapshots().len(), 1);
+        assert_eq!(
+            app.wm().workspace(1).unwrap().windows,
+            Vec::<WindowId>::new()
+        );
     }
 
     #[test]
@@ -1366,9 +1471,9 @@ mod tests {
         // The focus attempt was still made and recorded despite the
         // scripted failure.
         assert!(calls(&log).contains(&DisplayCall::Focus(1)));
-        // The bar hook still fires exactly once — a focus failure does not
-        // skip it.
-        assert_eq!(*fires.lock().unwrap(), 1);
+        // The bar hook still fires for the recompute — a focus failure does
+        // not skip it (the second fire; the first is `run`'s startup one).
+        assert_eq!(*fires.lock().unwrap(), 2);
         // A fresh WmState snapshot was still published.
         assert_eq!(state_rx.borrow().focused, Some(1));
         // PlacementsChanged was still published on the bus.
@@ -1570,7 +1675,9 @@ mod tests {
         // Spec "First-ever window is a notification": mapping an
         // ignore-but-map window as the very first window must not create a
         // workspace as a side effect — `recompute` (the only path that would
-        // touch workspace state indirectly) never runs for it.
+        // touch workspace state indirectly) never runs for it. `App::new`
+        // opens workspace 1 unconditionally, so the probe is "still exactly
+        // that one, still empty" rather than the old `0` sentinel.
         let (mut app, log) = app_with_kinds(
             vec![Event::WindowMapRequested(1)],
             Config::default(),
@@ -1578,7 +1685,12 @@ mod tests {
         );
         app.run();
         assert_eq!(calls(&log), vec![DisplayCall::MapUnmanaged(1)]);
-        assert_eq!(app.wm().current_id(), 0); // sentinel: no workspace opened
+        assert_eq!(app.wm().current_id(), 1);
+        assert_eq!(app.wm().state_snapshots().len(), 1);
+        assert_eq!(
+            app.wm().workspace(1).unwrap().windows,
+            Vec::<WindowId>::new()
+        );
     }
 
     #[test]
@@ -1624,7 +1736,14 @@ mod tests {
 
         assert!(matches!(result, Err(DErr::X(_))));
         assert_eq!(calls(&log), vec![DisplayCall::MapUnmanaged(1)]);
-        assert_eq!(app.wm().current_id(), 0);
+        // Zero residue: no workspace beyond the one `App::new` opened, and
+        // that one never gained the window.
+        assert_eq!(app.wm().current_id(), 1);
+        assert_eq!(app.wm().state_snapshots().len(), 1);
+        assert_eq!(
+            app.wm().workspace(1).unwrap().windows,
+            Vec::<WindowId>::new()
+        );
         assert!(app.frames.is_empty());
         assert!(app.mapped.is_empty());
     }
