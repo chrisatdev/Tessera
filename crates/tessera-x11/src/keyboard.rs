@@ -250,33 +250,15 @@ pub(crate) fn grab_keybindings(
     root: Window,
     cfg: &Config,
 ) -> Result<GrabStats, DErr> {
-    let k = &cfg.keybindings;
-    let fixed = [
-        k.terminal,
-        k.focus_next,
-        k.focus_prev,
-        k.close,
-        k.toggle_layout,
-        k.launcher,
-    ];
-    // The claim-log names for the fixed bindings and the workspace 1..10
-    // bindings (D4) — zipped against the combos below, so every missing
-    // entry is reported as `<name> (0x<keysym:x>)`.
-    let names: Vec<String> = [
-        "terminal",
-        "focus_next",
-        "focus_prev",
-        "close",
-        "toggle_layout",
-        "launcher",
-    ]
-    .iter()
-    .map(|name| (*name).to_string())
-    .chain((1..=10).map(|i| format!("workspace-{i}")))
-    .collect();
+    // The name<->combo pairing comes from the single compile-enforced
+    // registry (KBR-3, D6/D7) instead of a `fixed` array zipped against an
+    // independent `names` list — that zip used to truncate silently on any
+    // length mismatch, leaving a binding ungrabbed, unnamed, and still
+    // counted as healthy.
+    let bindings = cfg.keybindings.named_bindings();
     let mut missing = Vec::new();
     let mut grabbed: Vec<(u16, u8)> = Vec::new();
-    for (name, combo) in names.iter().zip(fixed.iter().chain(k.workspace.iter())) {
+    for (name, combo) in &bindings {
         let keycodes = keymap.keycodes_for_keysym(combo.key);
         if keycodes.is_empty() {
             // KBR-3 (D4): the binding's keysym exists nowhere in the mapping
@@ -294,7 +276,10 @@ pub(crate) fn grab_keybindings(
         }
     }
     Ok(GrabStats {
-        bindings: fixed.len() + k.workspace.len(),
+        // Derived from the very list that was iterated (D7) — it can no
+        // longer disagree with what was grabbed and named, because there is
+        // only one list to disagree with.
+        bindings: bindings.len(),
         grabs: grabbed.len(),
         missing,
     })
