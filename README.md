@@ -170,6 +170,8 @@ optional:
 | `bg_color` | `"#222222"` | Bar background (`#RRGGBB` only) |
 | `fg_color` | `"#eeeeee"` | Focused-tag foreground (`#RRGGBB` only) |
 | `visible` | `true` | `false` hides the bar; the full screen stays available for tiling |
+| `font` | `"/usr/share/fonts/TTF/HackNerdFontMono-Regular.ttf"` | **Absolute path** to a TTF/OTF file — not a family name. Glyphs are rasterised in the client and blitted, so a Nerd Font works; an unreadable or unparseable file warns once and falls back to the `fixed` X core font. |
+| `font_size` | `12.0` | Glyph size in pixels per em for `font` |
 
 Parsing is **strict** (like `general` and `keybindings`): an unknown `[bar]`
 key (e.g. `flavor = "cherry"`) or an invalid value (a position that is not a
@@ -185,10 +187,21 @@ thickness = 28
 bg_color = "#222222"
 fg_color = "#eeeeee"
 visible = true
+font = "/usr/share/fonts/TTF/HackNerdFontMono-Regular.ttf"
+font_size = 12.0
 ```
 
 The bar shows the workspace tags of the current `WmState`, highlighting the
 focused tag, and is redrawn exactly once per layout recompute.
+
+Tag glyphs are rasterised **client-side** and uploaded with `PutImage`: the X
+core font protocol only reaches bitmap fonts in the server's font path, so it
+cannot load a TTF/OTF Nerd Font at all. Because the tag background is a solid
+colour the bar itself just painted, each pixel is composited exactly against
+that fill — no XRender and no Xft. `font` is a path rather than a family name
+because resolving a family requires fontconfig (a C dependency) or shelling
+out to `fc-match`; `fc-match 'Hack Nerd Font Mono'` resolves to the default
+path above.
 
 ### Theming
 

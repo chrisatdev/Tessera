@@ -72,7 +72,8 @@ pub struct WorkspaceState {
 }
 
 /// Complete window-manager state consumed by e.g. a status bar.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: the embedded `Config` carries `bar.font_size: f32`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct WmState {
     pub current: WorkspaceId,
     pub focused: Option<WindowId>,

@@ -32,7 +32,8 @@ const KEY_SPACE: u32 = 0x0020;
 const KEY_H: u32 = 0x0068;
 const KEY_L: u32 = 0x006c;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+// No `Eq`: `bar.font_size` is an `f32` (see [`BarConfig`]).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -120,7 +121,14 @@ pub enum BarPosition {
 /// per-edge default (22px top/bottom, 6px left/right) from `position`; an
 /// explicit value is uniform and MUST be in `1..=200` (spec scenario
 /// "Thickness bounds").
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+///
+/// `font`/`font_size` are plain config keys here — the core never reads a
+/// font file and never links a rasteriser (design D1: `tessera-core` stays
+/// free of X AND of font code). `tessera-x11` owns the loading, the glyph
+/// cache and the fallback.
+///
+/// No `Eq`: `font_size` is an `f32`, so only `PartialEq` is derivable.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BarConfig {
     #[serde(default)]
@@ -133,6 +141,17 @@ pub struct BarConfig {
     pub fg_color: Color,
     #[serde(default = "default_bar_visible")]
     pub visible: bool,
+    /// ABSOLUTE path to a TTF/OTF file used for the tag glyphs — deliberately
+    /// a path and NOT a family name like `"Hack Nerd Font Mono"`. Resolving a
+    /// family needs fontconfig (a C dependency) or shelling out to `fc-match`
+    /// on every start; neither is worth it for one bar font, and a path is
+    /// also exactly reproducible. An unreadable or unparseable file never
+    /// aborts: the renderer warns once and falls back to the X core font.
+    #[serde(default = "default_bar_font")]
+    pub font: String,
+    /// Glyph size in pixels-per-em for `font`.
+    #[serde(default = "default_bar_font_size")]
+    pub font_size: f32,
 }
 
 impl Default for BarConfig {
@@ -143,6 +162,8 @@ impl Default for BarConfig {
             bg_color: default_bar_bg_color(),
             fg_color: default_bar_fg_color(),
             visible: default_bar_visible(),
+            font: default_bar_font(),
+            font_size: default_bar_font_size(),
         }
     }
 }
@@ -163,6 +184,15 @@ fn default_bar_fg_color() -> Color {
 }
 fn default_bar_visible() -> bool {
     true
+}
+/// The Nerd Font shipped as the bar default: `fc-match 'Hack Nerd Font Mono'`
+/// resolves to exactly this path, so the default is what a user asking for
+/// that family would get — without linking fontconfig to find out.
+fn default_bar_font() -> String {
+    "/usr/share/fonts/TTF/HackNerdFontMono-Regular.ttf".to_string()
+}
+fn default_bar_font_size() -> f32 {
+    12.0
 }
 
 /// Validates an explicit `[bar] thickness` at parse time.

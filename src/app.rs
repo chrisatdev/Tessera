@@ -136,6 +136,13 @@ key = "9"
 [[keybindings.workspace]]  # workspace-10 (Super+0)
 mods = "super"
 key = "0"
+
+[bar]
+# ABSOLUTE path to a TTF/OTF file (a Nerd Font by default) — NOT a family
+# name: resolving a family would need fontconfig or `fc-match`. The glyphs are
+# rasterised in the client; an unreadable file falls back to the X core font.
+font = "/usr/share/fonts/TTF/HackNerdFontMono-Regular.ttf"
+font_size = 12.0
 "#;
 
 /// Resolves the auto-detected config path (CFG-1, design D6): an absolute
@@ -637,7 +644,9 @@ mod tests {
         // CFG-6: the hand-written commented template (D6/D7) must parse
         // EXACTLY to Config::default() — [general] + the six nested
         // [keybindings.<name>] tables + the ten [[keybindings.workspace]]
-        // array-of-tables blocks, all carrying the default values.
+        // array-of-tables blocks + [bar]'s font keys, all carrying the
+        // default values. This is what keeps the template and the defaults
+        // moving together when a key is added.
         let parsed = Config::parse(DEFAULT_CONFIG_TEMPLATE)
             .expect("the default template must parse as strict TOML");
         assert_eq!(parsed, Config::default());

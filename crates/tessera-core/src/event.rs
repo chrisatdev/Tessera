@@ -206,7 +206,8 @@ where
 }
 
 /// Every event flowing through the bus (design D4, all 17 variants).
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: `ConfigReloaded` carries a `Config` with `bar.font_size: f32`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     WindowMapRequested(WindowId),
     WindowConfigureRequested(WindowId, Rect),

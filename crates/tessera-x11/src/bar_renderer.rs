@@ -20,14 +20,16 @@ use tessera_core::{BarConfig, DErr, Rect, WmState};
 pub use tessera_core::BarPosition;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    ChangeGCAux, CreateGCAux, CreateWindowAux, Drawable, Fontable, Gcontext, Pixmap, Rectangle,
-    Visualid, Window, WindowClass, change_gc, create_gc, create_pixmap, create_window, image_text8,
-    map_window, open_font, poly_fill_rectangle, query_font,
+    ChangeGCAux, CreateGCAux, CreateWindowAux, Drawable, Fontable, Gcontext, ImageFormat,
+    ImageOrder, Pixmap, Rectangle, Visualid, Window, WindowClass, change_gc, create_gc,
+    create_pixmap, create_window, image_text8, map_window, open_font, poly_fill_rectangle,
+    put_image, query_font,
 };
 use x11rb::rust_connection::RustConnection;
 
 use crate::display_server::{map_conn_error, map_reply_error};
 use crate::frames::pixel;
+use crate::glyphs::{GlyphCache, PixmapFormat};
 
 /// Per-edge default bar thickness (design D6): `thickness = None` resolves to
 /// this for `Top`/`Bottom` bars.
@@ -35,10 +37,17 @@ pub(crate) const DEFAULT_EDGE_THICKNESS: u16 = 22;
 /// Per-edge default bar thickness for `Left`/`Right` bars (design D6).
 pub(crate) const DEFAULT_SIDE_THICKNESS: u16 = 6;
 
+/// The X core font the bar falls back to when the configured TTF/OTF cannot
+/// be used. The core font protocol only reaches bitmap fonts registered in
+/// the server's font path, which is exactly why it cannot render a Nerd Font.
+const CORE_FONT: &str = "fixed";
 /// Vertical extent of one row of the `fixed` core font (a 8x13 bitmap).
-const GLYPH_HEIGHT: i16 = 13;
-/// Advance width of one `fixed` glyph.
-const GLYPH_WIDTH: i16 = 8;
+/// FALLBACK-ONLY: the glyph path takes its vertical placement from the loaded
+/// font's own ascent instead.
+const CORE_GLYPH_HEIGHT: i16 = 13;
+/// Advance width of one `fixed` glyph. FALLBACK-ONLY, for the same reason:
+/// slot widths on the glyph path come from the font's real advance widths.
+const CORE_GLYPH_WIDTH: i16 = 8;
 /// Horizontal padding on EACH side of a tag's glyphs (D3 legibility): without
 /// it a one-character tag owns an 8px slot and the next tag starts at pixel 9,
 /// so the numbers butt against each other with no visible separation. It is
@@ -180,6 +189,24 @@ pub trait BarOps {
         y: i16,
         string: &[u8],
     ) -> Result<(), DErr>;
+    /// Uploads a client-rasterised ZPixmap rectangle (`data` is already
+    /// packed for [`BarOps::pixmap_format`]'s layout).
+    #[allow(clippy::too_many_arguments)]
+    fn put_image(
+        &self,
+        drawable: Drawable,
+        gc: Gcontext,
+        width: u16,
+        height: u16,
+        dst_x: i16,
+        dst_y: i16,
+        depth: u8,
+        data: &[u8],
+    ) -> Result<(), DErr>;
+    /// The server's ZPixmap layout for `depth`, read from the connection
+    /// setup. `None` means no packable layout exists and the bar must fall
+    /// back to the core font rather than guess a byte order.
+    fn pixmap_format(&self, depth: u8) -> Result<Option<PixmapFormat>, DErr>;
     /// Maps (shows) the bar window.
     fn map_window(&self, window: Window) -> Result<(), DErr>;
     /// Probes the core font `name`; `None` means the font is unavailable and
@@ -253,6 +280,48 @@ impl BarOps for RustConnection {
     ) -> Result<(), DErr> {
         let cookie = image_text8(self, drawable, gc, x, y, string).map_err(map_conn_error)?;
         cookie.check().map_err(map_reply_error)
+    }
+    fn put_image(
+        &self,
+        drawable: Drawable,
+        gc: Gcontext,
+        width: u16,
+        height: u16,
+        dst_x: i16,
+        dst_y: i16,
+        depth: u8,
+        data: &[u8],
+    ) -> Result<(), DErr> {
+        let cookie = put_image(
+            self,
+            ImageFormat::Z_PIXMAP,
+            drawable,
+            gc,
+            width,
+            height,
+            dst_x,
+            dst_y,
+            0,
+            depth,
+            data,
+        )
+        .map_err(map_conn_error)?;
+        cookie.check().map_err(map_reply_error)
+    }
+    fn pixmap_format(&self, depth: u8) -> Result<Option<PixmapFormat>, DErr> {
+        // Read the layout from the server instead of assuming BGRX
+        // little-endian: `image_byte_order` decides the byte order and the
+        // `pixmap_formats` entry for THIS depth decides bits_per_pixel and
+        // scanline_pad. A wrong guess silently swaps red and blue.
+        let setup = Connection::setup(self);
+        let lsb_first = setup.image_byte_order == ImageOrder::LSB_FIRST;
+        Ok(setup
+            .pixmap_formats
+            .iter()
+            .find(|format| format.depth == depth)
+            .and_then(|format| {
+                PixmapFormat::new(depth, format.bits_per_pixel, format.scanline_pad, lsb_first)
+            }))
     }
     fn map_window(&self, window: Window) -> Result<(), DErr> {
         let cookie = map_window(self, window).map_err(map_conn_error)?;
@@ -339,6 +408,32 @@ impl BarOps for Arc<RustConnection> {
     ) -> Result<(), DErr> {
         BarOps::image_text8(self.as_ref(), drawable, gc, x, y, string)
     }
+    fn put_image(
+        &self,
+        drawable: Drawable,
+        gc: Gcontext,
+        width: u16,
+        height: u16,
+        dst_x: i16,
+        dst_y: i16,
+        depth: u8,
+        data: &[u8],
+    ) -> Result<(), DErr> {
+        BarOps::put_image(
+            self.as_ref(),
+            drawable,
+            gc,
+            width,
+            height,
+            dst_x,
+            dst_y,
+            depth,
+            data,
+        )
+    }
+    fn pixmap_format(&self, depth: u8) -> Result<Option<PixmapFormat>, DErr> {
+        BarOps::pixmap_format(self.as_ref(), depth)
+    }
     fn map_window(&self, window: Window) -> Result<(), DErr> {
         BarOps::map_window(self.as_ref(), window)
     }
@@ -362,6 +457,97 @@ fn warn_font_miss_once() {
     });
 }
 
+/// Warns once when `bar.font` cannot back the client-side glyph path — a
+/// missing/unparseable file, or a server with no packable ZPixmap layout.
+/// Once, not per draw: the bar redraws on every recompute and a per-draw
+/// warning would flood the log for a condition that never changes.
+static GLYPH_FALLBACK_WARNED: Once = Once::new();
+fn warn_glyph_fallback_once(reason: &DErr) {
+    GLYPH_FALLBACK_WARNED.call_once(|| {
+        eprintln!(
+            "tessera: warning: {reason:?}; bar tags fall back to the \
+             '{CORE_FONT}' X core font"
+        );
+    });
+}
+
+/// How [`BarRenderer::draw`] puts tag glyphs on the bar.
+enum TextBackend {
+    /// The configured TTF/OTF, rasterised client-side and blitted with
+    /// `PutImage`. The only path that can render a Nerd Font. The cache is
+    /// boxed because it carries the whole parsed font — inline it would make
+    /// every `TextBackend`, including the two empty fallbacks, 270 bytes.
+    Glyphs {
+        cache: Box<GlyphCache>,
+        format: PixmapFormat,
+    },
+    /// The `fixed` X core font via `image_text8` (design D7 fallback).
+    Core(Fontable),
+    /// Neither: tags render as filled rectangles only (D7 last resort).
+    None,
+}
+
+impl TextBackend {
+    /// Selects the backend once, at construction: the configured font first,
+    /// the core font second, rectangles-only last. Never fails — the bar must
+    /// always draw something.
+    fn select<B: BarOps>(ops: &B, depth: u8, bar: &BarConfig) -> Self {
+        match load_glyphs(ops, depth, bar) {
+            Ok((cache, format)) => {
+                return TextBackend::Glyphs {
+                    cache: Box::new(cache),
+                    format,
+                };
+            }
+            Err(reason) => warn_glyph_fallback_once(&reason),
+        }
+        match ops.query_font(CORE_FONT) {
+            Ok(Some(font)) => TextBackend::Core(font),
+            Ok(None) => TextBackend::None,
+            Err(_) => {
+                warn_font_miss_once();
+                TextBackend::None
+            }
+        }
+    }
+
+    /// The core-font id the GC is created with; `None` on the glyph path,
+    /// which never uses a server-side font at all.
+    fn core_font(&self) -> Option<Fontable> {
+        match self {
+            TextBackend::Core(font) => Some(*font),
+            _ => None,
+        }
+    }
+
+    /// Width of `name`'s glyph run in pixels: the loaded font's REAL summed
+    /// advances, or the `fixed` 8px cell on the fallback paths.
+    fn run_width(&self, name: &str) -> i16 {
+        match self {
+            TextBackend::Glyphs { cache, .. } => cache.run_width(name).min(i16::MAX as u16) as i16,
+            TextBackend::Core(_) | TextBackend::None => {
+                CORE_GLYPH_WIDTH * name.chars().count().min(i16::MAX as usize) as i16
+            }
+        }
+    }
+}
+
+/// Loads `bar.font` and the server's ZPixmap layout for `depth`. Either one
+/// missing is an `Err` carrying the reason the caller warns with.
+fn load_glyphs<B: BarOps>(
+    ops: &B,
+    depth: u8,
+    bar: &BarConfig,
+) -> Result<(GlyphCache, PixmapFormat), DErr> {
+    let cache = GlyphCache::load(&bar.font, bar.font_size)?;
+    let format = ops.pixmap_format(depth)?.ok_or_else(|| {
+        DErr::X(format!(
+            "the X server has no ZPixmap layout this bar can pack at depth {depth}"
+        ))
+    })?;
+    Ok((cache, format))
+}
+
 /// Draws one workspace tag per `WmState` workspace onto the bar window.
 ///
 /// Design D3: [`BarRenderer::draw`] consumes a snapshot; the binary owns the
@@ -371,7 +557,7 @@ pub struct BarRenderer<B> {
     ops: B,
     win: Window,
     gc: Gcontext,
-    font: Option<Fontable>,
+    text: TextBackend,
     geom: BarGeometry,
     config: BarConfig,
 }
@@ -389,15 +575,11 @@ impl<B: BarOps> BarRenderer<B> {
         bar: &BarConfig,
     ) -> Result<Self, DErr> {
         let geom = bar_geometry(monitor, bar);
-        // D7: probe the core font up front; a miss (or a failed probe) only
-        // drops the text, never aborts startup.
-        let font = match ops.query_font("fixed") {
-            Ok(font) => font,
-            Err(_) => {
-                warn_font_miss_once();
-                None
-            }
-        };
+        // D7: resolve the text backend up front; every miss (unreadable font,
+        // unpackable server layout, absent core font) only degrades the text,
+        // never aborts startup.
+        let text = TextBackend::select(&ops, depth, bar);
+        let font = text.core_font();
         // D11: one window, one reused pixmap + GC, allocated once at startup.
         let win = ops.generate_id()?;
         let pixmap = ops.generate_id()?;
@@ -437,7 +619,7 @@ impl<B: BarOps> BarRenderer<B> {
             ops,
             win,
             gc,
-            font,
+            text,
             geom,
             config: bar.clone(),
         })
@@ -464,10 +646,11 @@ impl<B: BarOps> BarRenderer<B> {
         let mut cursor: i16 = 0;
         for (i, ws) in state.workspaces.iter().enumerate() {
             let is_focused = focused == Some(i);
-            let len = ws.name.len() as i16;
-            let glyph_w = GLYPH_WIDTH * len;
-            // Slot width depends ONLY on the tag name's length, so focus
-            // moving never shifts any slot's width or x position.
+            // The glyph run's REAL width — summed font advances on the glyph
+            // path, the 8px `fixed` cell only when falling back. Slot width
+            // depends ONLY on the tag name, so focus moving never shifts any
+            // slot's width or x position.
+            let glyph_w = self.text.run_width(&ws.name);
             let slot = Rectangle {
                 x: cursor,
                 y: 0,
@@ -481,33 +664,69 @@ impl<B: BarOps> BarRenderer<B> {
             self.ops
                 .change_gc(self.gc, &ChangeGCAux::default().foreground(fill))?;
             self.ops.poly_fill_rectangle(self.win, self.gc, &[slot])?;
-            if let Some(font) = self.font {
-                let text_x = slot.x + (slot.width as i16 - glyph_w) / 2;
-                let text_y = (self.geom.h as i32 + GLYPH_HEIGHT as i32) / 2;
-                // `image_text8` paints the glyph's bounding box with the GC's
-                // BACKGROUND (unlike `poly_text8`, which touches only the
-                // glyph). Leaving it unset drew every number inside a black
-                // box that did not match the tag it sat on, so the background
-                // must track the slot's own fill.
+            self.draw_tag_text(&ws.name, &slot, glyph_w, fill, glyph)?;
+        }
+        // The event loop's reads do not flush the shared write buffer; push
+        // this recompute's requests explicitly so the server paints now.
+        self.ops.flush()
+    }
+
+    /// Draws one tag's text inside its already-filled `slot`, inset by
+    /// [`TAG_PADDING_X`] on each side.
+    ///
+    /// Both paths must land the glyph box on the SAME base colour as the slot
+    /// itself: `image_text8` paints the glyph box with the GC background, and
+    /// the glyph path composites each pixel against `fill`. Getting that base
+    /// wrong is what once drew every tag number inside a black box.
+    fn draw_tag_text(
+        &self,
+        name: &str,
+        slot: &Rectangle,
+        glyph_w: i16,
+        fill: u32,
+        glyph: u32,
+    ) -> Result<(), DErr> {
+        let text_x = slot.x + (slot.width as i16 - glyph_w) / 2;
+        match &self.text {
+            TextBackend::Glyphs { cache, format } => {
+                // Vertical placement comes from the font's own line box, not
+                // from a hardcoded bitmap-font height.
+                let box_h = cache.line_height() as i32;
+                let text_y = ((self.geom.h as i32 - box_h) / 2).max(0) as i16;
+                let clip = (
+                    (self.geom.w as i32 - text_x as i32).clamp(0, u16::MAX as i32) as u16,
+                    (self.geom.h as i32 - text_y as i32).clamp(0, u16::MAX as i32) as u16,
+                );
+                let Some(image) = cache.render_run(name, fill, glyph, clip, format) else {
+                    return Ok(());
+                };
+                // Only the glyph run's bounding box is uploaded; the rest of
+                // the slot is already the server-side `poly_fill_rectangle`.
+                self.ops.put_image(
+                    self.win,
+                    self.gc,
+                    image.width,
+                    image.height,
+                    text_x,
+                    text_y,
+                    format.depth,
+                    &image.data,
+                )
+            }
+            TextBackend::Core(font) => {
+                let text_y = (self.geom.h as i32 + CORE_GLYPH_HEIGHT as i32) / 2;
                 self.ops.change_gc(
                     self.gc,
                     &ChangeGCAux::default()
                         .foreground(glyph)
                         .background(fill)
-                        .font(font),
+                        .font(*font),
                 )?;
-                self.ops.image_text8(
-                    self.win,
-                    self.gc,
-                    text_x,
-                    text_y as i16,
-                    ws.name.as_bytes(),
-                )?;
+                self.ops
+                    .image_text8(self.win, self.gc, text_x, text_y as i16, name.as_bytes())
             }
+            TextBackend::None => Ok(()),
         }
-        // The event loop's reads do not flush the shared write buffer; push
-        // this recompute's requests explicitly so the server paints now.
-        self.ops.flush()
     }
 
     /// The mapped bar window id.
@@ -530,11 +749,13 @@ fn focused_tag_index(state: &WmState) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::path::Path;
     use std::sync::Arc;
 
     use tessera_core::{Config, LayoutKind, Theme, WmState, WorkspaceId, WorkspaceState};
 
     use super::*;
+    use crate::glyphs::blend;
 
     const ROOT: Window = 0x0000_0010;
     const DEPTH: u8 = 24;
@@ -565,12 +786,31 @@ mod tests {
         }
     }
 
+    /// A path no machine has, so `config()` deterministically exercises the
+    /// CORE-FONT fallback: without it these tests would take the glyph path
+    /// on any machine that happens to have the default Nerd Font installed,
+    /// and skip it everywhere else.
+    const MISSING_FONT: &str = "/nonexistent/tessera-test-missing-font.ttf";
+    /// The default `bar.font`. Glyph-path tests SKIP when it is absent.
+    const NERD_FONT: &str = "/usr/share/fonts/TTF/HackNerdFontMono-Regular.ttf";
+
     fn config(position: BarPosition, thickness: Option<u16>) -> BarConfig {
         BarConfig {
             position,
             thickness,
+            font: MISSING_FONT.to_string(),
             ..BarConfig::default()
         }
+    }
+
+    /// The glyph-path config, or `None` when the default Nerd Font is not
+    /// installed — the caller then returns and the suite still passes.
+    fn nerd_config(font_size: f32) -> Option<BarConfig> {
+        Path::new(NERD_FONT).exists().then(|| BarConfig {
+            font: NERD_FONT.to_string(),
+            font_size,
+            ..BarConfig::default()
+        })
     }
 
     /// A `WmState` with `current = 1` and one workspace per name (id = i + 1),
@@ -602,6 +842,9 @@ mod tests {
     struct FakeBarOps {
         font: Option<u32>,
         font_err: bool,
+        /// The layout `pixmap_format` reports; `None` models a server with no
+        /// packable ZPixmap layout.
+        format: Option<PixmapFormat>,
         next_id: Cell<u32>,
         calls: RefCell<Vec<BarCall>>,
     }
@@ -655,6 +898,20 @@ mod tests {
             y: i16,
             string: Vec<u8>,
         },
+        /// The FULL blit, pixels included. A defect in this file survived the
+        /// whole suite once because the double recorded only `foreground` and
+        /// `font`; the composited pixels are the only evidence that the glyph
+        /// box was blended against the right base colour, so they are kept.
+        PutImage {
+            drawable: Drawable,
+            gc: Gcontext,
+            x: i16,
+            y: i16,
+            width: u16,
+            height: u16,
+            depth: u8,
+            data: Vec<u8>,
+        },
         MapWindow(Window),
         Flush,
     }
@@ -685,6 +942,9 @@ mod tests {
             FakeBarOps {
                 font,
                 font_err: false,
+                // A packable layout by default, so a fallback in these tests
+                // can only be caused by the FONT, never by the format.
+                format: PixmapFormat::new(DEPTH, 32, 32, true),
                 next_id: Cell::new(FIRST_ID),
                 calls: RefCell::new(Vec::new()),
             }
@@ -693,6 +953,12 @@ mod tests {
         /// Simulates a failed font probe (the server has no `fixed` font).
         fn font_error(mut self) -> Self {
             self.font_err = true;
+            self
+        }
+
+        /// Simulates a server whose ZPixmap layout the blitter cannot pack.
+        fn no_pixmap_format(mut self) -> Self {
+            self.format = None;
             self
         }
 
@@ -804,6 +1070,32 @@ mod tests {
                 string: string.to_vec(),
             });
             Ok(())
+        }
+        fn put_image(
+            &self,
+            drawable: Drawable,
+            gc: Gcontext,
+            width: u16,
+            height: u16,
+            dst_x: i16,
+            dst_y: i16,
+            depth: u8,
+            data: &[u8],
+        ) -> Result<(), DErr> {
+            self.calls.borrow_mut().push(BarCall::PutImage {
+                drawable,
+                gc,
+                x: dst_x,
+                y: dst_y,
+                width,
+                height,
+                depth,
+                data: data.to_vec(),
+            });
+            Ok(())
+        }
+        fn pixmap_format(&self, _depth: u8) -> Result<Option<PixmapFormat>, DErr> {
+            Ok(self.format)
         }
         fn map_window(&self, window: Window) -> Result<(), DErr> {
             self.calls.borrow_mut().push(BarCall::MapWindow(window));
@@ -1370,19 +1662,20 @@ mod tests {
 
     #[test]
     fn draw_pads_every_tag_so_adjacent_tags_stay_separated() {
-        // D3 legibility: a slot is `name.len() * GLYPH_WIDTH + 2 *
-        // TAG_PADDING_X` wide and the next one starts exactly one slot width
-        // later, so consecutive tags never butt against each other. Before
-        // this change a one-character tag owned an 8px slot and its
-        // neighbour started at pixel 9. The glyphs sit centred inside their
-        // slot (one padding in from each edge).
+        // D3 legibility: a slot is `glyph run + 2 * TAG_PADDING_X` wide and
+        // the next one starts exactly one slot width later, so consecutive
+        // tags never butt against each other. Before this change a
+        // one-character tag owned an 8px slot and its neighbour started at
+        // pixel 9. The glyphs sit centred inside their slot (one padding in
+        // from each edge). This renderer is on the CORE-FONT fallback, so the
+        // run width here is the `fixed` 8px cell.
         let renderer = top_bar_renderer();
         let boxes = drawn_tag_boxes(&renderer, &state(&["1", "22", "333"]));
 
         let widths: Vec<u16> = boxes.iter().map(|b| b.slot.width).collect();
         let expected_widths: Vec<u16> = ["1", "22", "333"]
             .iter()
-            .map(|name| name.len() as u16 * GLYPH_WIDTH as u16 + 2 * TAG_PADDING_X as u16)
+            .map(|name| name.len() as u16 * CORE_GLYPH_WIDTH as u16 + 2 * TAG_PADDING_X as u16)
             .collect();
         assert_eq!(
             widths, expected_widths,
@@ -1431,6 +1724,260 @@ mod tests {
             with_first_focused, with_third_focused,
             "moving focus must not change any slot's width or x position"
         );
+    }
+
+    /// A renderer on the CLIENT-SIDE GLYPH path, or `None` when the default
+    /// Nerd Font is not installed on this machine.
+    fn glyph_renderer(font_size: f32) -> Option<BarRenderer<FakeBarOps>> {
+        let bar = nerd_config(font_size)?;
+        BarRenderer::new(
+            FakeBarOps::new(Some(FONT_ID)),
+            ROOT,
+            DEPTH,
+            VISUAL,
+            monitor(),
+            &bar,
+        )
+        .ok()
+    }
+
+    /// Every `PutImage` blit `draw` emitted, in strip order.
+    fn blits(calls: &[BarCall]) -> Vec<&BarCall> {
+        calls
+            .iter()
+            .filter(|c| matches!(c, BarCall::PutImage { .. }))
+            .collect()
+    }
+
+    /// Decodes a recorded ZPixmap blit back into pixels. Mirrors the fake's
+    /// layout (32bpp, 32-bit scanline pad, LSB-first).
+    fn pixels(call: &BarCall) -> Vec<u32> {
+        match call {
+            BarCall::PutImage {
+                width,
+                height,
+                data,
+                ..
+            } => {
+                let stride = *width as usize * 4;
+                assert_eq!(
+                    data.len(),
+                    stride * *height as usize,
+                    "blit size must match"
+                );
+                (0..*height as usize)
+                    .flat_map(|y| {
+                        (0..*width as usize).map(move |x| {
+                            let o = y * stride + x * 4;
+                            u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]])
+                        })
+                    })
+                    .collect()
+            }
+            other => panic!("expected a PutImage call, got {other:?}"),
+        }
+    }
+
+    /// `true` when `pixel` can only have come from compositing `ink` over
+    /// `fill` — the exact 256-step ramp the blitter produces.
+    fn on_ramp(fill: u32, ink: u32, pixel: u32) -> bool {
+        (0..=255u8).any(|coverage| blend(fill, ink, coverage) == pixel)
+    }
+
+    /// Asserts a blit was composited against `fill` with `ink` glyphs, and
+    /// could NOT have come from the other tag state's colour pair.
+    fn assert_composited(call: &BarCall, fill: u32, ink: u32, other_fill: u32, other_ink: u32) {
+        let pixels = pixels(call);
+        assert!(!pixels.is_empty(), "a blit must carry pixels");
+        for pixel in &pixels {
+            assert!(
+                on_ramp(fill, ink, *pixel),
+                "pixel {pixel:#08x} is not on the {fill:#08x} -> {ink:#08x} ramp: \
+                 the glyph box was composited against the wrong base colour"
+            );
+        }
+        assert!(
+            pixels.contains(&fill),
+            "the glyph box must keep the slot's own fill where there is no ink"
+        );
+        assert!(
+            pixels.iter().any(|p| *p != fill),
+            "the glyph box must actually carry ink"
+        );
+        assert!(
+            pixels.iter().any(|p| !on_ramp(other_fill, other_ink, *p)),
+            "these pixels are indistinguishable from the other tag state's ramp"
+        );
+    }
+
+    #[test]
+    fn slot_width_comes_from_the_real_font_advances_not_the_fixed_8px_cell() {
+        // The 8px `fixed` cell is gone from the glyph path: the slot is the
+        // summed REAL advances of the tag name plus one padding per side, and
+        // it tracks the configured font size.
+        let Some(renderer) = glyph_renderer(24.0) else {
+            return;
+        };
+        let Ok(cache) = GlyphCache::load(NERD_FONT, 24.0) else {
+            return;
+        };
+        let names = ["1", "22", "333"];
+        let boxes = drawn_tag_boxes(&renderer, &state(&names));
+
+        for (b, name) in boxes.iter().zip(names) {
+            let run = cache.run_width(name);
+            assert_eq!(
+                b.slot.width,
+                run + 2 * TAG_PADDING_X as u16,
+                "slot width must be the real glyph run plus one padding per side"
+            );
+            assert_ne!(
+                b.slot.width,
+                name.len() as u16 * CORE_GLYPH_WIDTH as u16 + 2 * TAG_PADDING_X as u16,
+                "at 24px the slot must NOT match the old hardcoded 8px cell"
+            );
+        }
+        // The slots still tile the strip end to end.
+        let mut expected_x: i16 = 0;
+        for b in &boxes {
+            assert_eq!(b.slot.x, expected_x);
+            expected_x += b.slot.width as i16;
+        }
+    }
+
+    #[test]
+    fn the_glyph_run_is_blitted_inset_and_vertically_centred_on_the_font_ascent() {
+        let Some(renderer) = glyph_renderer(12.0) else {
+            return;
+        };
+        let Ok(cache) = GlyphCache::load(NERD_FONT, 12.0) else {
+            return;
+        };
+        let before = renderer.ops.calls().len();
+        renderer.draw(&state(&["1", "22"])).unwrap();
+        let calls = renderer.ops.calls();
+        let blits = blits(&calls[before..]);
+        assert_eq!(blits.len(), 2, "one blit per tag");
+        let mut slot_x: i16 = 0;
+        for (call, name) in blits.iter().zip(["1", "22"]) {
+            let run = cache.run_width(name);
+            let BarCall::PutImage {
+                drawable,
+                gc,
+                x,
+                y,
+                width,
+                height,
+                depth,
+                data,
+            } = *call
+            else {
+                unreachable!("blits() only yields PutImage calls")
+            };
+            assert_eq!((*drawable, *gc, *depth), (WIN, GC, DEPTH));
+            // Only the glyph run's bounding box is uploaded, inset by one
+            // padding and centred on the font's OWN line box (not a
+            // hardcoded bitmap-font height).
+            assert_eq!(*x, slot_x + TAG_PADDING_X);
+            assert_eq!(*y, ((22 - cache.line_height() as i32) / 2) as i16);
+            assert_eq!((*width, *height), (run, cache.line_height()));
+            assert_eq!(data.len(), run as usize * 4 * cache.line_height() as usize);
+            slot_x += (run + 2 * TAG_PADDING_X as u16) as i16;
+        }
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, BarCall::ImageText8 { .. })),
+            "the glyph path must never fall back to the core-font text call"
+        );
+    }
+
+    #[test]
+    fn every_tag_glyph_box_is_composited_against_its_own_slot_fill() {
+        // The client-side twin of the old black-box bug: the focused tag's
+        // glyphs must be blended against the ACCENT it was just filled with,
+        // and every other tag's against the bar background — never against a
+        // shared or assumed base colour.
+        let Some(renderer) = glyph_renderer(12.0) else {
+            return;
+        };
+        let before = renderer.ops.calls().len();
+        renderer.draw(&state(&["1", "2"])).unwrap();
+        let calls = renderer.ops.calls();
+        let blits = blits(&calls[before..]);
+        assert_eq!(blits.len(), 2);
+        assert_composited(blits[0], ACCENT_PIXEL, BG_PIXEL, BG_PIXEL, FG_PIXEL);
+        assert_composited(blits[1], BG_PIXEL, FG_PIXEL, ACCENT_PIXEL, BG_PIXEL);
+    }
+
+    #[test]
+    fn a_missing_font_file_falls_back_to_the_core_font_and_warns_once() {
+        // D7: an unreadable `bar.font` degrades to `fixed` + image_text8 and
+        // warns ONCE, without panicking — the bar always draws something.
+        let missing = BarConfig {
+            font: MISSING_FONT.to_string(),
+            ..BarConfig::default()
+        };
+        let renderer = BarRenderer::new(
+            FakeBarOps::new(Some(FONT_ID)),
+            ROOT,
+            DEPTH,
+            VISUAL,
+            monitor(),
+            &missing,
+        )
+        .unwrap();
+        renderer.draw(&state(&["one"])).unwrap();
+        let calls = renderer.ops.calls();
+        assert!(
+            calls.contains(&BarCall::QueryFont(CORE_FONT.to_string())),
+            "a missing font file must probe the core font"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, BarCall::ImageText8 { .. })),
+            "the fallback must render text through the core-font path"
+        );
+        assert!(blits(&calls).is_empty(), "the fallback never blits pixels");
+        // A second renderer must also fall back, and the warning stays a
+        // one-shot for the whole process.
+        let second = BarRenderer::new(
+            FakeBarOps::new(Some(FONT_ID)),
+            ROOT,
+            DEPTH,
+            VISUAL,
+            monitor(),
+            &missing,
+        )
+        .unwrap();
+        second.draw(&state(&["one"])).unwrap();
+        assert!(GLYPH_FALLBACK_WARNED.is_completed(), "warned exactly once");
+    }
+
+    #[test]
+    fn a_server_without_a_packable_pixmap_format_falls_back_to_the_core_font() {
+        // Never guess a byte order: a server whose ZPixmap layout the blitter
+        // cannot pack exactly takes the core-font path instead.
+        let Some(bar) = nerd_config(12.0) else { return };
+        let renderer = BarRenderer::new(
+            FakeBarOps::new(Some(FONT_ID)).no_pixmap_format(),
+            ROOT,
+            DEPTH,
+            VISUAL,
+            monitor(),
+            &bar,
+        )
+        .unwrap();
+        renderer.draw(&state(&["one"])).unwrap();
+        let calls = renderer.ops.calls();
+        assert!(calls.contains(&BarCall::QueryFont(CORE_FONT.to_string())));
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, BarCall::ImageText8 { .. }))
+        );
+        assert!(blits(&calls).is_empty());
     }
 
     #[test]

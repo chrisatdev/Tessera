@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+fontdue = "0.9"
 tessera-core = { path = "../tessera-core" }
 # "xtest" is only used by the gated integration test (T21) for the XTEST
 # keypress fallback; "randr" backs the bar monitor resolution (task 2.3,

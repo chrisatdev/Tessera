@@ -10,6 +10,7 @@ pub mod display_server;
 pub mod event_loop;
 pub mod ewmh;
 pub mod frames;
+pub mod glyphs;
 pub mod keyboard;
 pub mod translate;
 pub mod window_type;
