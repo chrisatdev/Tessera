@@ -16,7 +16,7 @@
 //! integration tests in U5.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Once, OnceLock};
 
 use tessera_core::{
     Config, DErr, DisplayServer, Event, FrameId, Rect, Theme, WindowId, WindowKind,
@@ -300,6 +300,36 @@ fn bar_monitor_rect(conn: &RustConnection, root: Window) -> Result<Option<Rect>,
     }))
 }
 
+/// Whether `TESSERA_DEBUG_KEYS` asked for per-press key logging. Read once:
+/// the env cannot change under a running WM, and the event loop must not pay
+/// for a lookup on every key.
+static DEBUG_KEYS: OnceLock<bool> = OnceLock::new();
+
+/// Logs one KeyPress that reached the WM, when `TESSERA_DEBUG_KEYS` is set.
+///
+/// This exists to answer ONE diagnostic question that nothing else can: when
+/// a binding "does nothing", did the passive grab even deliver the press?
+/// A press that never appears here never reached the WM (a grab that does not
+/// cover the modifier state in effect); a press that appears but changes
+/// nothing failed later, in the keysym -> command lookup. `raw.mods` is the
+/// state as the server sent it, BEFORE the lock bits are stripped, so an
+/// unexpected modifier bit is visible rather than silently discarded.
+fn log_key_press(raw: tessera_core::KeyCombo, translated: Option<&Event>) {
+    if !*DEBUG_KEYS.get_or_init(|| std::env::var_os("TESSERA_DEBUG_KEYS").is_some()) {
+        return;
+    }
+    match translated {
+        Some(Event::KeyPressed(combo)) => eprintln!(
+            "tessera: key: keycode {} raw_mods {} -> keysym {:#x} mods {}",
+            raw.key, raw.mods, combo.key, combo.mods
+        ),
+        _ => eprintln!(
+            "tessera: key: keycode {} raw_mods {} -> NoSymbol (dropped)",
+            raw.key, raw.mods
+        ),
+    }
+}
+
 /// Warns once when the bar falls back to the full screen because no usable
 /// RandR monitor could be resolved (D10: never refuses to start).
 static BAR_FALLBACK_WARNED: Once = Once::new();
@@ -485,12 +515,17 @@ impl DisplayServer for X11Display {
                     // to the bound keysym through the cached keymap so the
                     // core's command_for_key can match it (T18, SC-x11-12).
                     Some(keymap) => {
-                        if let Some(ev) = keyboard::translate_key_press(keymap, raw) {
+                        let translated = keyboard::translate_key_press(keymap, raw);
+                        log_key_press(raw, translated.as_ref());
+                        if let Some(ev) = translated {
                             return Ok(Some(ev));
                         }
                         // NoSymbol (unbound) key: skip it, keep waiting.
                     }
-                    None => return Ok(Some(Event::KeyPressed(raw))),
+                    None => {
+                        log_key_press(raw, None);
+                        return Ok(Some(Event::KeyPressed(raw)));
+                    }
                 },
                 other => return Ok(other),
             }
